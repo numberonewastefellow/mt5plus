@@ -74,3 +74,7 @@ foreach ($name in $targets) {
 }
 
 Write-Host "Done. In MT5: enable Algo Trading and (re)attach the EA to a chart." -ForegroundColor Cyan
+
+# metaeditor64.exe returns a non-zero exit code even on a clean compile; the
+# per-strategy "Result:" line above is the real status. Exit clean.
+exit 0
