@@ -1,0 +1,1330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>XAU / XAG Scalper</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="XAU">
+  <meta name="theme-color" content="#000000">
+  <style>
+    :root {
+      --bg: #000;
+      --panel: #111317;
+      --panel-2: #16191f;
+      --border: #23262d;
+      --text: #f4f4f5;
+      --muted: #8a8f99;
+      --dim: #5b606a;
+      --up: #4ade80;
+      --down: #f87171;
+      --accent: #fbbf24;
+      --accent-dim: #b48820;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior: contain;
+    }
+    body {
+      padding: var(--safe-top) 12px var(--safe-bottom);
+      min-height: 100vh;
+      max-width: 560px;
+      margin: 0 auto;
+      overflow-x: hidden;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 0;
+    }
+    .toggle {
+      flex: 1 1 0;
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 3px;
+    }
+    .toggle button {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      padding: 8px 0;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+    .toggle button.active {
+      background: var(--panel-2);
+      color: var(--text);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    }
+    .icon-btn {
+      width: 36px;
+      height: 36px;
+      flex: 0 0 36px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--muted);
+      font-size: 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .icon-btn.spin { animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .settings-drawer {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    .settings-drawer[hidden] { display: none; }
+    .settings-drawer label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      margin-bottom: 6px;
+    }
+    .settings-drawer input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 17px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-family: inherit;
+      -webkit-appearance: none;
+    }
+    .settings-drawer .row { display: flex; gap: 8px; margin-top: 10px; }
+    .settings-drawer button {
+      flex: 1;
+      background: var(--accent);
+      color: #000;
+      border: none;
+      font-weight: 700;
+      padding: 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .settings-drawer button.secondary {
+      background: var(--panel-2);
+      color: var(--text);
+    }
+    .settings-drawer .hint {
+      font-size: 11px;
+      color: var(--dim);
+      margin-top: 10px;
+      line-height: 1.4;
+    }
+
+    .price-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 22px 18px;
+      margin-bottom: 14px;
+      text-align: center;
+    }
+    .price-main {
+      font-size: 42px;
+      font-weight: 700;
+      letter-spacing: -1px;
+      transition: color 0.6s;
+      font-variant-numeric: tabular-nums;
+    }
+    .price-main.up { color: var(--up); }
+    .price-main.down { color: var(--down); }
+    .price-change {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .price-change .pos { color: var(--up); }
+    .price-change .neg { color: var(--down); }
+    .price-aed {
+      margin-top: 10px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 15px;
+      color: var(--accent);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .price-aed .label { color: var(--muted); font-weight: 500; margin-right: 6px; }
+    .price-status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 14px;
+      font-size: 11px;
+      color: var(--dim);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .price-status .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--dim);
+    }
+    .price-status .dot.live { background: var(--up); box-shadow: 0 0 6px rgba(74,222,128,0.5); }
+    .price-status .dot.stale { background: var(--accent); }
+    .price-status .dot.offline { background: var(--down); }
+    .price-time {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.4px;
+    }
+    .price-time .sep { color: var(--dim); margin: 0 6px; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    .panel-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 10px;
+    }
+    .nearest-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 10px;
+      padding: 8px 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .nearest-row + .nearest-row { border-top: 1px solid var(--border); }
+    .nearest-row .arr { font-size: 16px; flex: 0 0 auto; }
+    .nearest-row.res .arr { color: var(--up); }
+    .nearest-row.sup .arr { color: var(--down); }
+    .nearest-row .meta {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 13px;
+      color: var(--text);
+      font-weight: 500;
+    }
+    .nearest-row .tf {
+      color: var(--muted);
+      font-size: 11px;
+      margin-left: 6px;
+      text-transform: uppercase;
+    }
+    .nearest-row .value {
+      flex: 0 0 auto;
+      text-align: right;
+      font-weight: 600;
+    }
+    .nearest-row .delta {
+      flex-basis: 100%;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: right;
+      margin-top: -2px;
+    }
+
+    .pivot-row {
+      display: grid;
+      grid-template-columns: 44px 1fr 1fr 1fr;
+      gap: 6px;
+      padding: 9px 4px;
+      border-top: 1px solid var(--border);
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .pivot-row:first-of-type { border-top: none; }
+    .pivot-row .pv-tf {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      align-self: center;
+    }
+    .pivot-row .pv-p { color: var(--text); }
+    .pivot-row .pv-r1 { color: var(--up); }
+    .pivot-row .pv-s1 { color: var(--down); }
+    .pivot-row .pv-detail {
+      display: none;
+      grid-column: 1 / -1;
+      flex-wrap: wrap;
+      gap: 4px 14px;
+      padding: 6px 4px 2px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .pivot-row.expanded .pv-detail { display: flex; }
+    .pivot-row .pv-detail .key { color: var(--dim); margin-right: 3px; }
+    .pivot-header {
+      display: grid;
+      grid-template-columns: 44px 1fr 1fr 1fr;
+      gap: 6px;
+      padding: 0 4px 6px;
+      font-size: 10px;
+      color: var(--dim);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      font-weight: 600;
+    }
+
+    .candle-row {
+      display: grid;
+      grid-template-columns: 52px 1fr auto auto;
+      gap: 8px;
+      padding: 8px 4px;
+      border-top: 1px solid var(--border);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+      align-items: center;
+    }
+    .candle-row:first-of-type { border-top: none; }
+    .candle-row .c-time { color: var(--muted); font-size: 12px; }
+    .candle-row .c-close { font-weight: 600; }
+    .candle-row .c-arr { width: 14px; text-align: center; font-size: 12px; }
+    .candle-row .c-pct { font-size: 12px; color: var(--muted); min-width: 56px; text-align: right; }
+    .candle-row.up .c-arr, .candle-row.up .c-pct { color: var(--up); }
+    .candle-row.down .c-arr, .candle-row.down .c-pct { color: var(--down); }
+
+    .setup-banner {
+      background: rgba(251,191,36,0.12);
+      border: 1px solid rgba(251,191,36,0.3);
+      color: var(--accent);
+      padding: 12px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.45;
+      margin-bottom: 14px;
+    }
+    .setup-banner code {
+      background: rgba(0,0,0,0.4);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    footer {
+      text-align: center;
+      color: var(--dim);
+      font-size: 10px;
+      padding: 20px 0 14px;
+      line-height: 1.5;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .icon-btn.spin { animation: none; }
+      .price-main { transition: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="toggle" role="tablist">
+      <button id="btn-gold" class="active" type="button">Gold</button>
+      <button id="btn-silver" type="button">Silver</button>
+    </div>
+    <button id="btn-refresh" class="icon-btn" type="button" title="Refresh now" aria-label="Refresh">↻</button>
+    <button id="btn-settings" class="icon-btn" type="button" title="Settings" aria-label="Settings">⚙</button>
+  </header>
+
+  <section class="settings-drawer" id="settings" hidden>
+    <label for="offset-input">Broker offset for <span id="offset-metal">Gold</span> (USD)</label>
+    <input id="offset-input" type="number" step="0.01" inputmode="decimal" placeholder="0.00">
+    <div class="row">
+      <button id="btn-save-offset" type="button">Save</button>
+      <button id="btn-close-settings" class="secondary" type="button">Close</button>
+    </div>
+    <p class="hint">Type the difference between your MT5 broker and this feed. Added to every displayed price and pivot. Stored on this device only.</p>
+  </section>
+
+  <div class="setup-banner" id="setup-banner" hidden>
+    Add your free API keys to <code>config.js</code>: <a href="https://twelvedata.com/pricing" style="color:inherit">TwelveData</a> (gold) and <a href="https://finnhub.io/register" style="color:inherit">Finnhub</a> (silver + fallback). Then reload.
+  </div>
+
+  <section class="price-card">
+    <div class="price-main" id="price-main">—</div>
+    <div class="price-change" id="price-change">—</div>
+    <div class="price-aed"><span class="label">AED / g</span><span id="price-aed">—</span></div>
+    <div class="price-status">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">connecting</span>
+      <span id="status-meta"></span>
+    </div>
+    <div class="price-time" id="price-time">—</div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">Nearest</div>
+    <div class="nearest-row res" id="nearest-res">
+      <span class="arr">▲</span>
+      <span class="meta">Resistance<span class="tf" id="nearest-res-tf"></span></span>
+      <span class="value" id="nearest-res-val">—</span>
+      <span class="delta" id="nearest-res-delta"></span>
+    </div>
+    <div class="nearest-row sup" id="nearest-sup">
+      <span class="arr">▼</span>
+      <span class="meta">Support<span class="tf" id="nearest-sup-tf"></span></span>
+      <span class="value" id="nearest-sup-val">—</span>
+      <span class="delta" id="nearest-sup-delta"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">Pivot Levels</div>
+    <div class="pivot-header">
+      <span>TF</span><span>P</span><span>R1</span><span>S1</span>
+    </div>
+    <div id="pivot-list"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">Last 10 × 5m Bars</div>
+    <div id="candle-list"></div>
+  </section>
+
+  <footer>
+    Data via TwelveData, Finnhub &amp; ExchangeRate-API.<br>
+    Personal use only. Not financial advice.
+  </footer>
+
+  <script src="config.js"></script>
+  <script>
+  (() => {
+    'use strict';
+
+    const TD_KEY = (window.APP_CONFIG && window.APP_CONFIG.twelveDataApiKey) || '';
+    const FH_KEY = (window.APP_CONFIG && window.APP_CONFIG.finnhubApiKey) || '';
+    const cfg = {
+      tdBase: 'https://api.twelvedata.com',
+      fhBase: 'https://finnhub.io/api/v1',
+      aedApi: 'https://open.er-api.com/v6/latest/USD',
+      tdSymbols: { gold: 'XAU/USD', silver: 'XAG/USD' },
+      fhSymbols: { gold: 'OANDA:XAU_USD', silver: 'OANDA:XAG_USD' },
+      labels: { gold: 'Gold', silver: 'Silver' },
+      pivotTfs: ['5min', '15min', '30min', '1h', '2h'],
+      displayTfs: ['5min', '10min', '15min', '30min', '1h', '2h'],
+      // Finnhub resolution codes
+      fhResolution: { '5min': '5', '15min': '15', '30min': '30', '1h': '60', '2h': '60' },
+      pollMs: 60_000,
+      quoteRefreshMs: 5 * 60_000,
+      aedRefreshMs: 60 * 60_000,
+      sourceRetryMs: 5 * 60_000,   // re-try TwelveData this often after a failure
+      tfMs: {
+        '5min': 5 * 60_000,
+        '15min': 15 * 60_000,
+        '30min': 30 * 60_000,
+        '1h': 60 * 60_000,
+        '2h': 120 * 60_000
+      },
+      tfSec: {
+        '5min': 5 * 60,
+        '15min': 15 * 60,
+        '30min': 30 * 60,
+        '1h': 60 * 60,
+        '2h': 120 * 60
+      },
+      tfLabel: { '5min':'5m', '10min':'10m', '15min':'15m', '30min':'30m', '1h':'1h', '2h':'2h' },
+      troyOzGrams: 31.1034768,
+      aedFallback: 3.6725
+    };
+
+    function emptyMetal() {
+      return {
+        bars5m: [],
+        pivotBars: {},
+        pivots: {},
+        nearest: { res: null, sup: null },
+        quote: null,
+        lastFetch: {},
+        lastUpdate: 0,
+        lastPriceDir: 0
+      };
+    }
+
+    const state = {
+      active: localStorage.getItem('xau.active') || 'gold',
+      offset: {
+        gold: parseFloat(localStorage.getItem('xau.offset.gold') || '0') || 0,
+        silver: parseFloat(localStorage.getItem('xau.offset.silver') || '0') || 0
+      },
+      aedRate: parseFloat(localStorage.getItem('xau.aedRate') || '') || cfg.aedFallback,
+      aedFetchedAt: parseInt(localStorage.getItem('xau.aedFetchedAt') || '0') || 0,
+      // Per-metal preferred data source. 'td' = TwelveData, 'fh' = Finnhub.
+      // Falls back to 'fh' automatically on TD error; periodically retries TD.
+      source: {
+        gold: localStorage.getItem('xau.source.gold') || 'td',
+        silver: localStorage.getItem('xau.source.silver') || 'td'
+      },
+      sourceRetryAt: { gold: 0, silver: 0 },
+      data: { gold: emptyMetal(), silver: emptyMetal() },
+      polling: false,
+      online: navigator.onLine,
+      lastErrorAt: 0,
+      lastError: null,
+      pollMs: 60_000,
+      nextPollAt: 0
+    };
+
+    // -- API: TwelveData ----------------------------------------------------
+
+    async function tdGet(path, params) {
+      if (!TD_KEY || TD_KEY === 'YOUR_TD_KEY_HERE' || TD_KEY === 'YOUR_KEY_HERE') {
+        const err = new Error('NO_KEY');
+        err.kind = 'NO_KEY';
+        throw err;
+      }
+      const qs = new URLSearchParams({ ...params, apikey: TD_KEY });
+      const url = `${cfg.tdBase}/${path}?${qs}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status}`);
+        err.kind = res.status === 429 ? 'RATE_LIMIT' : 'HTTP';
+        err.status = res.status;
+        throw err;
+      }
+      const data = await res.json();
+      if (data && data.status === 'error') {
+        const err = new Error(data.message || `code ${data.code}`);
+        err.kind = data.code === 429 ? 'RATE_LIMIT' : 'API';
+        err.status = data.code;
+        throw err;
+      }
+      return data;
+    }
+
+    function parseBarTD(v) {
+      return {
+        t: v.datetime,
+        o: parseFloat(v.open),
+        h: parseFloat(v.high),
+        l: parseFloat(v.low),
+        c: parseFloat(v.close)
+      };
+    }
+
+    async function tdBars(symbol, interval, n) {
+      const data = await tdGet('time_series', {
+        symbol, interval, outputsize: n, timezone: 'UTC'
+      });
+      return ((data && data.values) || []).map(parseBarTD);
+    }
+
+    async function tdQuote(symbol) {
+      const data = await tdGet('quote', { symbol });
+      return {
+        price: parseFloat(data.close),
+        change: parseFloat(data.change),
+        percentChange: parseFloat(data.percent_change),
+        dayHigh: parseFloat(data.high),
+        dayLow: parseFloat(data.low)
+      };
+    }
+
+    // -- API: Finnhub -------------------------------------------------------
+
+    function fhFormatTime(unixSec) {
+      const d = new Date(unixSec * 1000);
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+    }
+
+    async function fhBars(symbol, interval, n) {
+      if (!FH_KEY || FH_KEY === 'YOUR_FH_KEY_HERE') {
+        const err = new Error('NO_FH_KEY');
+        err.kind = 'NO_KEY';
+        throw err;
+      }
+      const resolution = cfg.fhResolution[interval];
+      if (!resolution) throw Object.assign(new Error('bad interval'), { kind: 'API' });
+      // For 2h: Finnhub doesn't have native 2h, we fetch 60m and the caller synthesizes.
+      const tfSec = (interval === '2h') ? 60 * 60 : cfg.tfSec[interval];
+      const fetchCount = (interval === '2h') ? (n * 2 + 2) : (n + 2);
+      const now = Math.floor(Date.now() / 1000);
+      const from = now - (fetchCount * tfSec * 1.5); // 1.5x padding for weekend/market-closed gaps
+      const qs = new URLSearchParams({
+        symbol, resolution, from: String(Math.floor(from)), to: String(now), token: FH_KEY
+      });
+      const res = await fetch(`${cfg.fhBase}/forex/candle?${qs}`);
+      if (!res.ok) {
+        const err = new Error(`HTTP ${res.status}`);
+        err.kind = res.status === 429 ? 'RATE_LIMIT' : 'HTTP';
+        err.status = res.status;
+        throw err;
+      }
+      const data = await res.json();
+      if (data.s === 'no_data' || !data.t || !data.t.length) {
+        return [];
+      }
+      if (data.s !== 'ok') {
+        const err = new Error(`FH: ${data.s || 'unknown'}`);
+        err.kind = 'API';
+        throw err;
+      }
+      // Finnhub returns oldest-first column arrays. Convert + reverse for newest-first.
+      const bars = [];
+      for (let i = data.t.length - 1; i >= 0; i--) {
+        bars.push({
+          t: fhFormatTime(data.t[i]),
+          o: data.o[i],
+          h: data.h[i],
+          l: data.l[i],
+          c: data.c[i]
+        });
+      }
+
+      // Synthesize 2h bars from 60m pairs when interval === '2h'.
+      if (interval === '2h') {
+        const synth = [];
+        for (let i = 0; i + 1 < bars.length; i += 2) {
+          const newer = bars[i];
+          const older = bars[i + 1];
+          synth.push({
+            t: older.t,
+            o: older.o,
+            h: Math.max(newer.h, older.h),
+            l: Math.min(newer.l, older.l),
+            c: newer.c
+          });
+        }
+        return synth.slice(0, n);
+      }
+
+      return bars.slice(0, n);
+    }
+
+    // -- API: routing layer (TD primary, FH fallback per metal) -------------
+
+    function preferredSource(metal) {
+      const now = Date.now();
+      if (state.source[metal] === 'fh' && now >= state.sourceRetryAt[metal]) {
+        // Time to retry TD.
+        return 'td';
+      }
+      return state.source[metal];
+    }
+
+    function markSource(metal, src, sticky) {
+      if (state.source[metal] !== src) {
+        state.source[metal] = src;
+        localStorage.setItem(`xau.source.${metal}`, src);
+      }
+      if (src === 'fh' && sticky) {
+        state.sourceRetryAt[metal] = Date.now() + cfg.sourceRetryMs;
+      }
+    }
+
+    function shouldFallback(err) {
+      // Fall back on API errors (subscription, symbol-not-found, etc.) and rate-limits.
+      // Don't fall back on NO_KEY (user has to fix config).
+      return err && (err.kind === 'API' || err.kind === 'RATE_LIMIT' || err.kind === 'HTTP');
+    }
+
+    async function loadBars(metal, interval, n) {
+      const want = preferredSource(metal);
+      if (want === 'td') {
+        try {
+          const bars = await tdBars(cfg.tdSymbols[metal], interval, n);
+          markSource(metal, 'td');
+          return bars;
+        } catch (e) {
+          if (!shouldFallback(e)) throw e;
+          console.warn(`TD ${metal} ${interval} failed (${e.message}); falling back to FH.`);
+          markSource(metal, 'fh', true);
+          // fall through to FH
+        }
+      }
+      return await fhBars(cfg.fhSymbols[metal], interval, n);
+    }
+
+    async function loadQuote(metal) {
+      if (preferredSource(metal) === 'td') {
+        try {
+          const q = await tdQuote(cfg.tdSymbols[metal]);
+          return q;
+        } catch (e) {
+          if (!shouldFallback(e)) throw e;
+          markSource(metal, 'fh', true);
+        }
+      }
+      // Finnhub doesn't provide day-change directly on free /forex/quote.
+      // Synthesize from the bars we already have if available.
+      const md = state.data[metal];
+      const newest = md.bars5m[0];
+      if (!newest) return null;
+      // Find a bar ~24h ago to compute day change.
+      const dayAgoBar = md.bars5m[md.bars5m.length - 1] || newest;
+      const change = newest.c - dayAgoBar.o;
+      return {
+        price: newest.c,
+        change,
+        percentChange: dayAgoBar.o ? (change / dayAgoBar.o) * 100 : 0,
+        dayHigh: Math.max(...md.bars5m.map(b => b.h)),
+        dayLow: Math.min(...md.bars5m.map(b => b.l))
+      };
+    }
+
+    async function fetchAed() {
+      const res = await fetch(cfg.aedApi);
+      if (!res.ok) throw new Error(`AED HTTP ${res.status}`);
+      const data = await res.json();
+      const rate = data && data.rates && data.rates.AED;
+      if (!rate) throw new Error('AED missing in response');
+      return rate;
+    }
+
+    // -- Calc ---------------------------------------------------------------
+
+    function pivots(bar) {
+      const { h, l, c } = bar;
+      const P = (h + l + c) / 3;
+      const range = h - l;
+      return {
+        P,
+        R1: 2 * P - l, S1: 2 * P - h,
+        R2: P + range, S2: P - range,
+        R3: h + 2 * (P - l), S3: l - 2 * (h - P)
+      };
+    }
+
+    function synth10mBar(b0, b1) {
+      // b0 = newer 5m bar, b1 = older 5m bar (newest-first ordering)
+      return {
+        t: b1.t,
+        o: b1.o,
+        h: Math.max(b0.h, b1.h),
+        l: Math.min(b0.l, b1.l),
+        c: b0.c
+      };
+    }
+
+    function applyOffset(metal, value) {
+      if (value == null || !isFinite(value)) return value;
+      return value + (state.offset[metal] || 0);
+    }
+
+    function nearestLevels(price, levelsByTf) {
+      let nearestRes = null, nearestSup = null;
+      for (const [tf, lv] of Object.entries(levelsByTf)) {
+        if (!lv) continue;
+        for (const key of ['P','R1','R2','R3','S1','S2','S3']) {
+          const v = lv[key];
+          if (v == null || !isFinite(v)) continue;
+          if (v > price) {
+            if (!nearestRes || v < nearestRes.value) {
+              nearestRes = { value: v, tf, key };
+            }
+          } else if (v < price) {
+            if (!nearestSup || v > nearestSup.value) {
+              nearestSup = { value: v, tf, key };
+            }
+          }
+        }
+      }
+      return { res: nearestRes, sup: nearestSup };
+    }
+
+    // -- Render -------------------------------------------------------------
+
+    function fmtPrice(v, d = 2) {
+      if (v == null || !isFinite(v)) return '—';
+      return v.toFixed(d);
+    }
+    function fmtUsd(v, d = 2) {
+      if (v == null || !isFinite(v)) return '—';
+      return '$' + v.toFixed(d);
+    }
+    function fmtPct(v, d = 2) {
+      if (v == null || !isFinite(v)) return '—';
+      const sign = v > 0 ? '+' : '';
+      return sign + v.toFixed(d) + '%';
+    }
+
+    function priceDecimals(metal) {
+      return metal === 'silver' ? 3 : 2;
+    }
+
+    function renderActiveToggle() {
+      document.getElementById('btn-gold').classList.toggle('active', state.active === 'gold');
+      document.getElementById('btn-silver').classList.toggle('active', state.active === 'silver');
+      document.getElementById('offset-metal').textContent = cfg.labels[state.active];
+      document.getElementById('offset-input').value = state.offset[state.active] || '';
+    }
+
+    function renderPrice() {
+      const m = state.active;
+      const md = state.data[m];
+      const d = priceDecimals(m);
+      const newest = md.bars5m[0];
+      const rawPrice = newest ? newest.c : (md.quote && md.quote.price);
+      const displayPrice = rawPrice != null ? applyOffset(m, rawPrice) : null;
+
+      const el = document.getElementById('price-main');
+      el.textContent = displayPrice != null ? '$' + displayPrice.toFixed(d) : '—';
+
+      // Flash direction
+      el.classList.remove('up', 'down');
+      if (md.lastPriceDir > 0) el.classList.add('up');
+      else if (md.lastPriceDir < 0) el.classList.add('down');
+      setTimeout(() => el.classList.remove('up', 'down'), 800);
+
+      const changeEl = document.getElementById('price-change');
+      if (md.quote && isFinite(md.quote.change)) {
+        const c = md.quote.change;
+        const pc = md.quote.percentChange;
+        const cls = c >= 0 ? 'pos' : 'neg';
+        const sign = c >= 0 ? '+' : '';
+        changeEl.innerHTML = `<span class="${cls}">${sign}$${Math.abs(c).toFixed(d)} (${sign}${pc.toFixed(2)}%)</span> <span style="color:var(--dim);margin-left:4px">day</span>`;
+      } else {
+        changeEl.textContent = '—';
+      }
+
+      const aedEl = document.getElementById('price-aed');
+      if (displayPrice != null) {
+        const aedPerGram = (displayPrice * state.aedRate) / cfg.troyOzGrams;
+        aedEl.textContent = aedPerGram.toFixed(2);
+      } else {
+        aedEl.textContent = '—';
+      }
+    }
+
+    function renderNearest() {
+      const m = state.active;
+      const md = state.data[m];
+      const d = priceDecimals(m);
+      const newest = md.bars5m[0];
+      const rawPrice = newest ? newest.c : null;
+      const { res, sup } = md.nearest;
+
+      const resVal = document.getElementById('nearest-res-val');
+      const resTf = document.getElementById('nearest-res-tf');
+      const resDelta = document.getElementById('nearest-res-delta');
+      if (res && rawPrice != null) {
+        const display = applyOffset(m, res.value);
+        const diff = res.value - rawPrice;
+        const pct = (diff / rawPrice) * 100;
+        resVal.textContent = '$' + display.toFixed(d);
+        resTf.textContent = cfg.tfLabel[res.tf] + ' ' + res.key;
+        resDelta.textContent = `+$${diff.toFixed(d)}  (+${pct.toFixed(2)}%)`;
+      } else {
+        resVal.textContent = '—';
+        resTf.textContent = '';
+        resDelta.textContent = '';
+      }
+
+      const supVal = document.getElementById('nearest-sup-val');
+      const supTf = document.getElementById('nearest-sup-tf');
+      const supDelta = document.getElementById('nearest-sup-delta');
+      if (sup && rawPrice != null) {
+        const display = applyOffset(m, sup.value);
+        const diff = sup.value - rawPrice;
+        const pct = (diff / rawPrice) * 100;
+        supVal.textContent = '$' + display.toFixed(d);
+        supTf.textContent = cfg.tfLabel[sup.tf] + ' ' + sup.key;
+        supDelta.textContent = `−$${Math.abs(diff).toFixed(d)}  (${pct.toFixed(2)}%)`;
+      } else {
+        supVal.textContent = '—';
+        supTf.textContent = '';
+        supDelta.textContent = '';
+      }
+    }
+
+    function renderPivots() {
+      const m = state.active;
+      const md = state.data[m];
+      const d = priceDecimals(m);
+      const list = document.getElementById('pivot-list');
+      list.innerHTML = '';
+
+      for (const tf of cfg.displayTfs) {
+        const pv = md.pivots[tf];
+        const row = document.createElement('div');
+        row.className = 'pivot-row';
+        row.dataset.tf = tf;
+
+        const tfSpan = document.createElement('span');
+        tfSpan.className = 'pv-tf';
+        tfSpan.textContent = cfg.tfLabel[tf];
+        row.appendChild(tfSpan);
+
+        const pSpan = document.createElement('span');
+        pSpan.className = 'pv-p';
+        pSpan.textContent = pv ? fmtPrice(applyOffset(m, pv.P), d) : '—';
+        row.appendChild(pSpan);
+
+        const r1Span = document.createElement('span');
+        r1Span.className = 'pv-r1';
+        r1Span.textContent = pv ? fmtPrice(applyOffset(m, pv.R1), d) : '—';
+        row.appendChild(r1Span);
+
+        const s1Span = document.createElement('span');
+        s1Span.className = 'pv-s1';
+        s1Span.textContent = pv ? fmtPrice(applyOffset(m, pv.S1), d) : '—';
+        row.appendChild(s1Span);
+
+        const detail = document.createElement('div');
+        detail.className = 'pv-detail';
+        if (pv) {
+          for (const k of ['R3','R2','S2','S3']) {
+            const cell = document.createElement('span');
+            cell.innerHTML = `<span class="key">${k}</span>${fmtPrice(applyOffset(m, pv[k]), d)}`;
+            detail.appendChild(cell);
+          }
+        }
+        row.appendChild(detail);
+
+        row.addEventListener('click', () => row.classList.toggle('expanded'));
+        list.appendChild(row);
+      }
+    }
+
+    function renderCandles() {
+      const m = state.active;
+      const md = state.data[m];
+      const d = priceDecimals(m);
+      const list = document.getElementById('candle-list');
+      list.innerHTML = '';
+
+      const bars = md.bars5m.slice(0, 10);
+      for (const b of bars) {
+        const row = document.createElement('div');
+        row.className = 'candle-row';
+        const dir = b.c >= b.o ? 'up' : 'down';
+        row.classList.add(dir);
+
+        const time = document.createElement('span');
+        time.className = 'c-time';
+        time.textContent = formatBarTime(b.t);
+        row.appendChild(time);
+
+        const close = document.createElement('span');
+        close.className = 'c-close';
+        close.textContent = fmtPrice(applyOffset(m, b.c), d);
+        row.appendChild(close);
+
+        const arr = document.createElement('span');
+        arr.className = 'c-arr';
+        arr.textContent = dir === 'up' ? '▲' : '▼';
+        row.appendChild(arr);
+
+        const pct = document.createElement('span');
+        pct.className = 'c-pct';
+        const change = b.o ? ((b.c - b.o) / b.o) * 100 : 0;
+        pct.textContent = fmtPct(change);
+        row.appendChild(pct);
+
+        list.appendChild(row);
+      }
+
+      if (!bars.length) {
+        const empty = document.createElement('div');
+        empty.style.color = 'var(--dim)';
+        empty.style.fontSize = '13px';
+        empty.style.padding = '8px 4px';
+        empty.textContent = 'No data yet.';
+        list.appendChild(empty);
+      }
+    }
+
+    const gstFmt = new Intl.DateTimeFormat('en-GB', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      timeZone: 'Asia/Dubai', hour12: false
+    });
+    function gstTime(date) { return gstFmt.format(date); }
+
+    function formatBarTime(ts) {
+      // ts is "YYYY-MM-DD HH:MM:SS" in UTC; show HH:MM in local time
+      const d = new Date(ts.replace(' ', 'T') + 'Z');
+      if (isNaN(d.getTime())) return ts;
+      const h = String(d.getHours()).padStart(2, '0');
+      const m = String(d.getMinutes()).padStart(2, '0');
+      return `${h}:${m}`;
+    }
+
+    function renderStatus() {
+      const dot = document.getElementById('status-dot');
+      const text = document.getElementById('status-text');
+      const meta = document.getElementById('status-meta');
+      const md = state.data[state.active];
+      const last = md.lastUpdate;
+      const now = Date.now();
+
+      dot.classList.remove('live', 'stale', 'offline');
+
+      if (!state.online) {
+        dot.classList.add('offline');
+        text.textContent = 'offline';
+      } else if (state.lastError && (now - state.lastErrorAt) < 30_000) {
+        dot.classList.add('stale');
+        text.textContent = state.lastError;
+      } else if (!last) {
+        text.textContent = (!TD_KEY || TD_KEY === 'YOUR_TD_KEY_HERE') ? 'set api key' : 'connecting';
+      } else if ((now - last) > 180_000) {
+        dot.classList.add('stale');
+        text.textContent = 'stale';
+      } else {
+        dot.classList.add('live');
+        text.textContent = 'live';
+      }
+
+      if (last) {
+        const ago = Math.max(0, Math.floor((now - last) / 1000));
+        const nextIn = Math.max(0, Math.ceil((state.nextPollAt - now) / 1000));
+        meta.textContent = ` · updated ${ago}s ago · next ${nextIn}s`;
+      } else {
+        meta.textContent = '';
+      }
+
+      const timeEl = document.getElementById('price-time');
+      const nowStr = gstTime(new Date(now));
+      const src = state.source[state.active] === 'fh' ? 'Finnhub' : 'TwelveData';
+      const srcLabel = `<span class="sep">·</span>src <strong style="color:var(--text)">${src}</strong>`;
+      if (last) {
+        timeEl.innerHTML = `now <strong style="color:var(--text)">${nowStr}</strong><span class="sep">·</span>last <strong style="color:var(--text)">${gstTime(new Date(last))}</strong> GST${srcLabel}`;
+      } else {
+        timeEl.innerHTML = `<strong style="color:var(--text)">${nowStr}</strong> GST${srcLabel}`;
+      }
+    }
+
+    function renderAll() {
+      renderActiveToggle();
+      renderPrice();
+      renderNearest();
+      renderPivots();
+      renderCandles();
+      renderStatus();
+    }
+
+    // -- Compute aggregates -------------------------------------------------
+
+    function recompute(metal) {
+      const md = state.data[metal];
+
+      // 5m pivot = previous closed 5m bar (index 1, since 0 is current/in-progress)
+      if (md.bars5m.length >= 2) {
+        md.pivots['5min'] = pivots(md.bars5m[1]);
+      }
+
+      // 10m synth = combine bars[1] and bars[2] (two prior closed 5m bars)
+      if (md.bars5m.length >= 3) {
+        const synth = synth10mBar(md.bars5m[1], md.bars5m[2]);
+        md.pivots['10min'] = pivots(synth);
+      }
+
+      // Higher TFs from cached pivotBars
+      for (const tf of ['15min','30min','1h','2h']) {
+        const bar = md.pivotBars[tf];
+        if (bar) md.pivots[tf] = pivots(bar);
+      }
+
+      // Nearest levels
+      const newest = md.bars5m[0];
+      if (newest) {
+        md.nearest = nearestLevels(newest.c, md.pivots);
+      }
+    }
+
+    // -- Persistence --------------------------------------------------------
+
+    function persistMetalCache(metal) {
+      const md = state.data[metal];
+      try {
+        localStorage.setItem(`xau.cache.${metal}`, JSON.stringify({
+          bars5m: md.bars5m.slice(0, 10),
+          pivotBars: md.pivotBars,
+          quote: md.quote,
+          lastFetch: md.lastFetch,
+          lastUpdate: md.lastUpdate
+        }));
+      } catch (_) { /* quota */ }
+    }
+
+    function hydrateMetalCache(metal) {
+      try {
+        const raw = localStorage.getItem(`xau.cache.${metal}`);
+        if (!raw) return;
+        const obj = JSON.parse(raw);
+        const md = state.data[metal];
+        md.bars5m = obj.bars5m || [];
+        md.pivotBars = obj.pivotBars || {};
+        md.quote = obj.quote || null;
+        md.lastFetch = obj.lastFetch || {};
+        md.lastUpdate = obj.lastUpdate || 0;
+        recompute(metal);
+      } catch (_) { /* ignore */ }
+    }
+
+    // -- Poll loop ----------------------------------------------------------
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    function classifyError(e) {
+      if (!e) return null;
+      if (e.kind === 'NO_KEY') return 'set api key';
+      if (e.kind === 'RATE_LIMIT') return 'rate limited';
+      if (e.kind === 'API') return 'api error';
+      if (e.kind === 'HTTP') return 'http err';
+      return 'network err';
+    }
+
+    async function poll(force = false) {
+      if (state.polling) return;
+      state.polling = true;
+      document.getElementById('btn-refresh').classList.add('spin');
+
+      const metal = state.active;
+      const md = state.data[metal];
+      const now = Date.now();
+      let rateLimited = false;
+      let noKey = false;
+      let primaryOk = false;
+      let firstErr = null;
+      const trackErr = (e) => {
+        if (!firstErr) firstErr = e;
+        if (e.kind === 'RATE_LIMIT') rateLimited = true;
+        if (e.kind === 'NO_KEY') noKey = true;
+      };
+
+      // 1) Primary: 5m bars. Critical — gives current price, candle list, 5m pivot, 10m synth.
+      try {
+        const bars = await loadBars(metal, '5min', 10);
+        if (bars.length) {
+          const prev = md.bars5m[0];
+          md.lastPriceDir = (prev && bars[0].c !== prev.c)
+            ? Math.sign(bars[0].c - prev.c) : 0;
+          md.bars5m = bars;
+          md.lastFetch['5min'] = now;
+          primaryOk = true;
+        }
+      } catch (e) {
+        trackErr(e);
+      }
+
+      // 2) Higher-TF pivot bars: staggered, individually handled.
+      //    TD free tier is 8/min; spacing prevents burst from blowing the cap on cold start.
+      //    On the Finnhub path this stagger is also fine (FH free is 60/min).
+      const higherTasks = [];
+      for (const tf of ['15min','30min','1h','2h']) {
+        const last = md.lastFetch[tf] || 0;
+        if (force || (now - last) >= cfg.tfMs[tf]) {
+          higherTasks.push(tf);
+        }
+      }
+      for (let i = 0; i < higherTasks.length; i++) {
+        const tf = higherTasks[i];
+        if (i > 0) await sleep(180);
+        try {
+          const bars = await loadBars(metal, tf, 2);
+          if (bars.length >= 2) md.pivotBars[tf] = bars[1];
+          else if (bars.length === 1) md.pivotBars[tf] = bars[0];
+          md.lastFetch[tf] = now;
+        } catch (e) {
+          trackErr(e);
+          if (e.kind === 'RATE_LIMIT') break;
+        }
+      }
+
+      // 3) Quote — non-critical. Skip if we're already rate-limited.
+      const lastQuote = md.lastFetch['quote'] || 0;
+      if (!rateLimited && (force || (now - lastQuote) >= cfg.quoteRefreshMs)) {
+        await sleep(150);
+        try {
+          const q = await loadQuote(metal);
+          if (q) {
+            md.quote = q;
+            md.lastFetch['quote'] = now;
+          }
+        } catch (e) {
+          trackErr(e);
+        }
+      }
+
+      // 4) AED — separate host, doesn't count against TwelveData.
+      if (force || (now - state.aedFetchedAt) >= cfg.aedRefreshMs) {
+        try {
+          const r = await fetchAed();
+          state.aedRate = r;
+          state.aedFetchedAt = now;
+          localStorage.setItem('xau.aedRate', String(r));
+          localStorage.setItem('xau.aedFetchedAt', String(now));
+        } catch (e) {
+          console.warn('AED fetch failed', e);
+        }
+      }
+
+      if (primaryOk) {
+        md.lastUpdate = Date.now();
+        recompute(metal);
+        persistMetalCache(metal);
+      }
+
+      // Status: prefer "live" if primary succeeded, even with partial higher-TF failures.
+      if (noKey) {
+        state.lastError = 'set api key';
+        state.lastErrorAt = Date.now();
+      } else if (!primaryOk && firstErr) {
+        state.lastError = classifyError(firstErr);
+        state.lastErrorAt = Date.now();
+      } else {
+        state.lastError = null;
+      }
+
+      // Back off if rate-limited; recover on a clean run.
+      if (rateLimited) {
+        state.pollMs = Math.min(state.pollMs * 1.5, 180_000);
+      } else if (primaryOk && state.pollMs > 60_000) {
+        state.pollMs = Math.max(60_000, state.pollMs / 1.5);
+      }
+
+      document.getElementById('setup-banner').hidden = !noKey;
+
+      state.polling = false;
+      document.getElementById('btn-refresh').classList.remove('spin');
+      state.nextPollAt = Date.now() + state.pollMs;
+      renderAll();
+    }
+
+    let pollTimer = null;
+    let tickTimer = null;
+    function startPolling() {
+      stopPolling();
+      state.nextPollAt = Date.now() + state.pollMs;
+      pollTimer = setInterval(() => {
+        if (document.visibilityState === 'visible' && state.online) poll();
+      }, state.pollMs);
+      tickTimer = setInterval(renderStatus, 1000);
+    }
+    function stopPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      if (tickTimer) clearInterval(tickTimer);
+      pollTimer = tickTimer = null;
+    }
+
+    // -- Wiring -------------------------------------------------------------
+
+    function setActive(metal) {
+      if (metal === state.active) return;
+      state.active = metal;
+      localStorage.setItem('xau.active', metal);
+      renderAll();
+      poll(true);
+    }
+
+    function openSettings() {
+      const d = document.getElementById('settings');
+      d.hidden = false;
+      document.getElementById('offset-input').value = state.offset[state.active] || '';
+      document.getElementById('offset-metal').textContent = cfg.labels[state.active];
+    }
+    function closeSettings() {
+      document.getElementById('settings').hidden = true;
+    }
+    function saveOffset() {
+      const raw = document.getElementById('offset-input').value;
+      const v = parseFloat(raw);
+      state.offset[state.active] = isFinite(v) ? v : 0;
+      localStorage.setItem(`xau.offset.${state.active}`, String(state.offset[state.active]));
+      closeSettings();
+      renderAll();
+    }
+
+    function registerSW() {
+      if (!('serviceWorker' in navigator)) return;
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost') return;
+      navigator.serviceWorker.register('sw.js').catch((e) => console.warn('sw register failed', e));
+    }
+
+    function boot() {
+      // Hydrate cached data so first paint isn't bare
+      hydrateMetalCache('gold');
+      hydrateMetalCache('silver');
+
+      const tdMissing = !TD_KEY || TD_KEY === 'YOUR_TD_KEY_HERE' || TD_KEY === 'YOUR_KEY_HERE';
+      const fhMissing = !FH_KEY || FH_KEY === 'YOUR_FH_KEY_HERE';
+      if (tdMissing && fhMissing) {
+        document.getElementById('setup-banner').hidden = false;
+      }
+      // Silver always falls back to Finnhub (TD free has no XAG/USD).
+      // Pre-mark it so we don't waste a TD request on every silver poll.
+      if (state.source.silver === 'td' && !fhMissing) {
+        state.source.silver = 'fh';
+        localStorage.setItem('xau.source.silver', 'fh');
+      }
+
+      renderAll();
+
+      // Wire events
+      document.getElementById('btn-gold').addEventListener('click', () => setActive('gold'));
+      document.getElementById('btn-silver').addEventListener('click', () => setActive('silver'));
+      document.getElementById('btn-refresh').addEventListener('click', () => poll(true));
+      document.getElementById('btn-settings').addEventListener('click', () => {
+        const d = document.getElementById('settings');
+        if (d.hidden) openSettings(); else closeSettings();
+      });
+      document.getElementById('btn-close-settings').addEventListener('click', closeSettings);
+      document.getElementById('btn-save-offset').addEventListener('click', saveOffset);
+
+      window.addEventListener('online', () => {
+        state.online = true;
+        renderStatus();
+        poll();
+      });
+      window.addEventListener('offline', () => {
+        state.online = false;
+        renderStatus();
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && state.online) {
+          poll();
+        }
+      });
+
+      registerSW();
+      poll(true);
+      startPolling();
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+    } else {
+      boot();
+    }
+  })();
+  </script>
+</body>
+</html>
