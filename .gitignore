@@ -1,1 +1,6 @@
 config.js
+
+# Python
+.venv/
+__pycache__/
+*.pyc

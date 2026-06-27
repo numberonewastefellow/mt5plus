@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XAU Order Pad</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="pad" tabindex="0">
+    <header class="topbar">
+      <div class="sym" id="symbol">XAUUSD</div>
+      <div class="health" id="health">
+        <span class="dot" id="healthDot"></span>
+        <span id="healthText">connecting…</span>
+      </div>
+    </header>
+
+    <section class="prices">
+      <div class="price sell" id="bidBox">
+        <div class="lbl">BID (sell)</div>
+        <div class="val" id="bid">--</div>
+      </div>
+      <div class="spread" id="spread">--</div>
+      <div class="price buy" id="askBox">
+        <div class="lbl">ASK (buy)</div>
+        <div class="val" id="ask">--</div>
+      </div>
+    </section>
+
+    <section class="inputs">
+      <label>Volume (lots)
+        <input id="volume" type="number" step="0.01" min="0.01" value="0.01" inputmode="decimal" />
+      </label>
+      <label>SL
+        <input id="sl" type="number" step="0.01" min="0" placeholder="0 = none" inputmode="decimal" />
+      </label>
+      <label>TP
+        <input id="tp" type="number" step="0.01" min="0" placeholder="0 = none" inputmode="decimal" />
+      </label>
+      <label>SL/TP mode
+        <select id="mode">
+          <option value="points">points</option>
+          <option value="price">price</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="actions">
+      <button id="btnSell" class="btn sell">SELL<small>Backspace</small></button>
+      <button id="btnBuy" class="btn buy">BUY<small>Space / Enter</small></button>
+      <button id="btnClose" class="btn close">CLOSE ALL<small>Esc</small></button>
+    </section>
+
+    <section class="positions">
+      <div class="posline">
+        <span>Open: <b id="posCount">0</b></span>
+        <span>Net: <b id="netLots">0</b> lots</span>
+        <span>Float P/L: <b id="floatPl">0</b></span>
+        <span>Equity: <b id="equity">--</b></span>
+      </div>
+    </section>
+
+    <section class="log">
+      <div class="log-head">Activity</div>
+      <ul id="log"></ul>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
