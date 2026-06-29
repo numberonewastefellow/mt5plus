@@ -114,6 +114,18 @@
     </div>
   </section>
 
+  <!-- ===================== AUTO-TEST FAIL BANNER =====================
+       Shown only on FAIL verdicts. Persistent: stays visible across modal
+       opens/closes AND page reloads (localStorage flag) until the user
+       explicitly clicks DISMISS. PASS / REVIEW verdicts do NOT show it.
+       See setFailBanner / clearFailBanner in app.js. -->
+  <div class="autotest-fail-banner" id="atFailBanner" hidden>
+    <span class="atfb-icon">⚠</span>
+    <span class="atfb-text" id="atFailBannerText">AUTO-TEST FAILED</span>
+    <button class="atfb-btn" id="atFailBannerView" type="button">VIEW REPORT</button>
+    <button class="atfb-btn ghost" id="atFailBannerDismiss" type="button">DISMISS</button>
+  </div>
+
   <!-- ===================== MAIN ===================== -->
   <main class="main">
 
@@ -191,26 +203,39 @@
       <div class="place-hint" id="placeHint"><span class="hint-key">␣ Space</span> buy now · <span class="hint-key">⌫ Backspace</span> sell now — instant market</div>
     </section>
 
-    <!-- POSITIONS -->
-    <section class="positions">
-      <div class="panel-head">
-        <span class="panel-title">OPEN POSITIONS</span>
-        <span class="panel-meta">total <span id="posTotal" class="num">0.00</span></span>
-      </div>
-      <div class="grid-wrap">
-        <table class="grid">
-          <thead>
-            <tr>
-              <th>SIDE</th><th class="r">LOT</th><th class="r">ENTRY</th>
-              <th class="r">CURRENT</th><th class="r">SL</th><th class="r">TP</th>
-              <th class="r">P&amp;L</th><th></th>
-            </tr>
-          </thead>
-          <tbody id="positionsBody"></tbody>
-        </table>
-        <div class="empty" id="posEmpty">No open positions — arm a side and fire.</div>
-      </div>
-    </section>
+    <!-- POSITIONS + LIVE CHART (two columns; chart collapses to give positions full width) -->
+    <div class="rightpane" id="rightpane">
+      <!-- POSITIONS -->
+      <section class="positions">
+        <div class="panel-head">
+          <span class="panel-title">OPEN POSITIONS</span>
+          <span class="panel-meta">total <span id="posTotal" class="num">0.00</span></span>
+        </div>
+        <div class="grid-wrap">
+          <table class="grid">
+            <thead>
+              <tr>
+                <th>SIDE</th><th class="r">LOT</th><th class="r">ENTRY</th>
+                <th class="r">CURRENT</th><th class="r">SL</th><th class="r">TP</th>
+                <th class="r">P&amp;L</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="positionsBody"></tbody>
+          </table>
+          <div class="empty" id="posEmpty">No open positions — arm a side and fire.</div>
+        </div>
+      </section>
+
+      <!-- LIVE TICK CHART -->
+      <section class="chartpanel" id="chartPanel">
+        <div class="panel-head">
+          <span class="panel-title">TICK CHART</span>
+          <span class="panel-meta">price · volume</span>
+          <button class="chart-toggle" id="chartToggle" title="Collapse / expand chart" aria-label="Collapse or expand chart">⮜</button>
+        </div>
+        <div class="chart-wrap" id="chartWrap"></div>
+      </section>
+    </div>
   </main>
 
   <!-- ===================== EXECUTION LOG ===================== -->
@@ -413,6 +438,8 @@
   </div>
 </div>
 
+<script src="vendor/lightweight-charts.standalone.production.js" defer></script>
+<script src="chart.js" defer></script>
 <script src="app.js" defer></script>
 </body>
 </html>

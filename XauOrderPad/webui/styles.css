@@ -266,7 +266,7 @@ kbd{
 .order[data-type="limit"] .act-key{display:none}
 
 /* ---------- POSITIONS ---------- */
-.positions,.log{
+.positions,.log,.chartpanel{
   background:var(--panel); border:1px solid var(--border);
   border-radius:var(--r); display:flex; flex-direction:column; min-height:0;
 }
@@ -277,6 +277,31 @@ kbd{
 .panel-title{font-size:11px; font-weight:800; letter-spacing:1px; color:var(--text-dim)}
 .panel-meta{font-size:10px; color:var(--text-faint); font-family:var(--font-mono)}
 .panel-meta .num{color:var(--text)}
+
+/* RIGHT PANE: open positions + live tick chart as two columns.
+   Collapsing the chart hands the full width back to the positions table. */
+.rightpane{display:grid; grid-template-columns:1fr 1fr; gap:7px; min-height:0}
+.rightpane > .positions{min-width:0}      /* allow the table to shrink in its column */
+
+/* Collapsed → the chart shrinks to a thin rail that STILL shows the expand
+   button (so it can be brought back); the positions table takes the rest. */
+.rightpane.collapsed{grid-template-columns:1fr 34px}
+.rightpane.collapsed .chart-wrap{display:none}
+.rightpane.collapsed .chartpanel .panel-meta{display:none}
+.rightpane.collapsed .chartpanel .panel-head{
+  flex-direction:column-reverse; gap:10px; padding:9px 0; border-bottom:0; justify-content:flex-start;
+}
+.rightpane.collapsed .chartpanel .panel-title{
+  writing-mode:vertical-rl; transform:rotate(180deg); letter-spacing:1px; white-space:nowrap;
+}
+.rightpane.collapsed .chart-toggle{margin:0}
+
+.chart-wrap{flex:1; min-height:0; position:relative}
+.chart-toggle{
+  margin-left:8px; background:none; border:0; color:var(--text-dim);
+  cursor:pointer; font-size:13px; line-height:1; padding:2px 4px; border-radius:4px;
+}
+.chart-toggle:hover{color:var(--text); background:var(--grid-head)}
 
 .grid-wrap{flex:1; overflow:auto; position:relative}
 .grid{width:100%; border-collapse:collapse; font-family:var(--font-mono)}
@@ -511,6 +536,38 @@ kbd{
 .autotest-verdict.pass  {color:var(--good); background:rgba(25,201,138,.08); border-color:var(--good)}
 .autotest-verdict.review{color:var(--warn); background:rgba(255,176,32,.08); border-color:var(--warn)}
 .autotest-verdict.fail  {color:var(--bad);  background:rgba(255,77,82,.08);  border-color:var(--bad)}
+
+/* ---- Persistent FAIL banner ----
+   Shown above the main content area only on Auto-Test FAIL verdict.
+   Stays visible across modal opens/closes AND page reloads (state in
+   localStorage). Two buttons: VIEW REPORT (opens modal showing the
+   FAIL block) and DISMISS (hides + clears localStorage).
+   PASS / REVIEW verdicts do NOT use this banner. */
+.autotest-fail-banner{
+  display:flex; align-items:center; gap:12px;
+  padding:10px 14px; margin:0 0 8px 0;
+  background:rgba(255,77,82,.14);
+  border:1px solid var(--bad);
+  border-left:4px solid var(--bad);
+  color:var(--bad);
+  font-weight:700; font-size:13px;
+  letter-spacing:.02em;
+}
+.autotest-fail-banner .atfb-icon{font-size:18px; line-height:1}
+.autotest-fail-banner .atfb-text{flex:1; min-width:0; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.autotest-fail-banner .atfb-btn{
+  background:var(--bad); color:#fff; border:none;
+  padding:5px 12px; border-radius:4px;
+  font:700 11px var(--font-mono); letter-spacing:.06em;
+  cursor:pointer;
+}
+.autotest-fail-banner .atfb-btn:hover{filter:brightness(1.15)}
+.autotest-fail-banner .atfb-btn.ghost{
+  background:transparent; color:var(--bad);
+  border:1px solid var(--bad);
+}
+.autotest-fail-banner .atfb-btn.ghost:hover{background:rgba(255,77,82,.10)}
 
 /* ---- AUTO-TEST top-bar button ----
    Same look as the existing .tb-btn (themeBtn / settingsBtn); just

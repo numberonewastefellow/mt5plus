@@ -26,6 +26,13 @@ PORT = 8765
 POLL_HZ = 15                 # backend MT5 poll + UI push rate
 API_TOKEN = ""               # optional shared token; blank disables the check
 
+# --- Auto-launch browser --------------------------------------------------
+# On startup, open the UI in a Chrome/Edge "app-mode" window (no address bar,
+# no tabs) so it feels like a native desktop app. Prefers Chrome, falls back to
+# Edge. Set LAUNCH_BROWSER = False to disable (e.g. running headless on a box).
+LAUNCH_BROWSER = True
+BROWSER_MODE = "app"         # "app" = standalone window (no address bar); "kiosk" = fullscreen
+
 # --- MT5 terminal connection ---------------------------------------------
 # Leave MT5_PATH blank to attach to the running terminal. Leave MT5_LOGIN = 0
 # to use whatever account is already logged in (recommended). Fill these in

@@ -9,6 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 )
 
-start "" http://127.0.0.1:8765
+REM The server itself opens the UI in a Chrome/Edge app-mode window on startup
+REM (see config.LAUNCH_BROWSER), so we no longer open the default browser here.
 ".venv\Scripts\python.exe" server.py
 pause

@@ -9,6 +9,7 @@ ticks and orders never race and state can never half-update.
 from __future__ import annotations
 
 import datetime
+import logging
 import queue
 import threading
 import time
@@ -18,6 +19,12 @@ from typing import Any
 import MetaTrader5 as mt5
 
 import config
+
+
+# Logger for every worker-side event. Configured by logger_setup.setup_logging()
+# at server boot; if setup wasn't called (e.g. running the worker in isolation
+# during tests), Python's default handler safely swallows the calls.
+log = logging.getLogger("XauOrderPad.worker")
 
 
 # MetaTrader5 symbol filling-mode flags (bitmask on symbol_info.filling_mode)
@@ -46,6 +53,10 @@ class Mt5Worker:
         self._initialized = False
         self._poll_count = 0
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        # Health-transition tracking: log only when these flip, not on every poll.
+        self._last_healthy: bool | None = None
+        # Account snapshot throttle: log a snapshot at most once per N polls.
+        self._snapshot_every_n_polls = max(1, config.POLL_HZ) * 60  # ~once/minute
         self._thread = threading.Thread(target=self._run, name="mt5-worker",
                                         daemon=True)
 
@@ -95,12 +106,22 @@ class Mt5Worker:
             self._poll_state()
 
     def _ensure_connected(self) -> bool:
+        """Make sure the MT5 terminal is initialised and connected.
+
+        Emits one `mt5_disconnected` event the first time we notice a drop,
+        and one `mt5_connected` event the first time we successfully attach.
+        Suppresses spam: only logs on state transitions, not on every poll.
+        """
         if self._initialized:
             ti = mt5.terminal_info()
             if ti is not None and ti.connected:
                 return True
             # lost connection -> drop and re-init below
             self._initialized = False
+            log.warning(
+                "MT5 terminal connection lost",
+                extra={"event": "mt5_disconnected"},
+            )
         kwargs: dict[str, Any] = {}
         if config.MT5_PATH:
             kwargs["path"] = config.MT5_PATH
@@ -109,9 +130,29 @@ class Mt5Worker:
                           password=config.MT5_PASSWORD, server=config.MT5_SERVER)
         ok = mt5.initialize(**kwargs)
         if not ok:
+            code, msg = mt5.last_error()
+            log.warning(
+                "MT5 initialize failed",
+                extra={"event": "mt5_init_failed",
+                       "code": code, "mt5_last_error_msg": msg},
+            )
             return False
         self._initialized = True
         self._resolve_symbol()
+        # Log the now-current account identity so we can attribute later events.
+        acc = mt5.account_info()
+        ti = mt5.terminal_info()
+        log.info(
+            "MT5 terminal connected",
+            extra={
+                "event": "mt5_connected",
+                "login": getattr(acc, "login", None),
+                "server": getattr(acc, "server", None),
+                "trade_mode": getattr(acc, "trade_mode", None),
+                "path": getattr(ti, "path", None) if ti else None,
+                "symbol": self._symbol,
+            },
+        )
         return True
 
     def _resolve_symbol(self) -> None:
@@ -156,6 +197,8 @@ class Mt5Worker:
                 st["bid"] = tick.bid
                 st["ask"] = tick.ask
                 st["spread"] = round((tick.ask - tick.bid), 6)
+                st["volume"] = int(getattr(tick, "volume", 0) or 0)   # tick volume for live chart
+                st["tick_time"] = int(getattr(tick, "time", 0) or 0)  # broker tick timestamp (s)
             # account stats (daily realized / wins / losses) are heavy -> ~1 Hz
             self._poll_count += 1
             if self._poll_count % max(1, config.POLL_HZ) == 1:
@@ -223,7 +266,45 @@ class Mt5Worker:
                 st["error"] = "trading not allowed"
         except Exception as exc:
             st.update(connected=False, healthy=False, error=f"poll error: {exc}")
+            log.exception("poll_state crashed",
+                          extra={"event": "poll_state_exception"})
         self._swap(st)
+
+        # --- Structured event emission (post-swap, deliberately throttled) ---
+        # We poll 15 times/sec; we do NOT want one log line every 67ms. Instead:
+        #   1) Health-transition events only fire when the bit flips.
+        #   2) Account snapshots fire once per ~minute (POLL_HZ × 60 polls).
+        new_healthy = bool(st.get("healthy"))
+        if self._last_healthy is None or new_healthy != self._last_healthy:
+            log.log(
+                logging.INFO if new_healthy else logging.WARNING,
+                "health changed",
+                extra={"event": "health_changed",
+                       "healthy": new_healthy,
+                       "connected": bool(st.get("connected")),
+                       "trade_allowed": bool(st.get("trade_allowed")),
+                       "symbol_ok": bool(st.get("symbol_ok")),
+                       "error": st.get("error")},
+            )
+            self._last_healthy = new_healthy
+        if (st.get("account") is not None
+                and self._poll_count % self._snapshot_every_n_polls == 0):
+            acc = st["account"]
+            log.info("account snapshot",
+                     extra={"event": "account_snapshot",
+                            "login": acc.get("login"),
+                            "server": acc.get("server"),
+                            "balance": acc.get("balance"),
+                            "equity": acc.get("equity"),
+                            "currency": acc.get("currency"),
+                            "daily_realized": acc.get("daily_realized"),
+                            "wins": acc.get("wins"),
+                            "losses": acc.get("losses"),
+                            "trade_mode": acc.get("trade_mode"),
+                            "is_demo": acc.get("is_demo"),
+                            "open_positions": len(st.get("positions") or []),
+                            "net_lots": st.get("net_lots"),
+                            "floating_pl": st.get("floating_pl")})
 
     def _swap(self, st: dict) -> None:
         with self._lock:
@@ -377,26 +458,53 @@ class Mt5Worker:
             return {"daily_realized": 0.0, "wins": 0, "losses": 0}
 
     def _market_order(self, cmd: dict) -> dict:
+        """Send a market order and return a structured result.
+
+        The result dict ALWAYS contains:
+            ok               -- bool
+            requested_price  -- the bid/ask we computed at the moment of send
+            fill_price       -- the broker's actual fill price (None on failure)
+            slippage         -- abs(fill - requested) when both are present
+            side             -- "BUY" | "SELL"
+            volume           -- lot size sent
+            retcode/comment  -- MT5 broker response (when available)
+            sl/tp            -- absolute prices we asked for (0 if not set)
+
+        Logs `order_request` before send, then either `order_filled` (with
+        slippage) or `order_failed` (with retcode). The `auto_test` flag from
+        the inbound command is propagated to every log line so post-hoc
+        analysis can filter "auto-test orders only" with one pandas predicate.
+        """
+        auto_test = bool(cmd.get("auto_test"))
         if not self._ensure_connected():
+            log.error("order rejected: terminal not connected",
+                      extra={"event": "order_failed",
+                             "reason": "terminal_not_connected",
+                             "auto_test": auto_test})
             return {"ok": False, "error": "terminal not connected"}
         si = mt5.symbol_info(self._symbol)
         tick = mt5.symbol_info_tick(self._symbol)
         if si is None or tick is None:
+            log.error("order rejected: symbol unavailable",
+                      extra={"event": "order_failed",
+                             "reason": "symbol_unavailable",
+                             "symbol": self._symbol,
+                             "auto_test": auto_test})
             return {"ok": False, "error": f"symbol {self._symbol} unavailable"}
 
         is_buy = cmd["action"] == "buy"
         volume = float(cmd.get("volume") or config.DEFAULT_VOLUME)
-        price = tick.ask if is_buy else tick.bid
+        requested_price = tick.ask if is_buy else tick.bid
         otype = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
 
-        sl_price, tp_price = self._sl_tp_prices(cmd, si, is_buy, price)
+        sl_price, tp_price = self._sl_tp_prices(cmd, si, is_buy, requested_price)
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self._symbol,
             "volume": volume,
             "type": otype,
-            "price": price,
+            "price": requested_price,
             "deviation": int(config.DEFAULT_DEVIATION),
             "magic": int(config.MAGIC),
             "comment": "XauOrderPad",
@@ -408,18 +516,80 @@ class Mt5Worker:
         if tp_price:
             request["tp"] = tp_price
 
+        log.info("order request",
+                 extra={"event": "order_request",
+                        "symbol": self._symbol,
+                        "side": "BUY" if is_buy else "SELL",
+                        "volume": volume,
+                        "requested_price": requested_price,
+                        "sl": sl_price, "tp": tp_price,
+                        "magic": int(config.MAGIC),
+                        "auto_test": auto_test})
+
         res = mt5.order_send(request)
         if res is None:
             code, msg = mt5.last_error()
-            return {"ok": False, "error": f"order_send failed ({code}: {msg})"}
+            log.error("order_send returned None",
+                      extra={"event": "order_failed",
+                             "reason": "order_send_returned_none",
+                             "mt5_error_code": code,
+                             "mt5_last_error_msg": msg,
+                             "symbol": self._symbol,
+                             "side": "BUY" if is_buy else "SELL",
+                             "volume": volume,
+                             "requested_price": requested_price,
+                             "auto_test": auto_test})
+            return {"ok": False, "error": f"order_send failed ({code}: {msg})",
+                    "requested_price": requested_price,
+                    "fill_price": None, "slippage": None,
+                    "side": "BUY" if is_buy else "SELL",
+                    "volume": volume}
+
         ok = res.retcode == mt5.TRADE_RETCODE_DONE
-        return {
+        # Slippage = |actual fill price − requested price|. Only meaningful
+        # when the broker actually filled at a price (ok == True).
+        fill_price = getattr(res, "price", None) if ok else None
+        slippage = (abs(fill_price - requested_price)
+                    if fill_price is not None and requested_price is not None
+                    else None)
+        result = {
             "ok": ok, "retcode": res.retcode, "comment": res.comment,
             "ticket": getattr(res, "order", 0), "deal": getattr(res, "deal", 0),
-            "price": getattr(res, "price", price), "volume": volume,
+            "price": fill_price if fill_price is not None else requested_price,
+            "requested_price": requested_price,
+            "fill_price": fill_price,
+            "slippage": slippage,
+            "volume": volume,
             "side": "BUY" if is_buy else "SELL",
             "sl": sl_price, "tp": tp_price,
         }
+        if ok:
+            log.info("order filled",
+                     extra={"event": "order_filled",
+                            "ticket": result["ticket"],
+                            "deal": result["deal"],
+                            "symbol": self._symbol,
+                            "side": result["side"],
+                            "volume": volume,
+                            "requested_price": requested_price,
+                            "fill_price": fill_price,
+                            "slippage": slippage,
+                            "retcode": res.retcode,
+                            "comment": res.comment,
+                            "magic": int(config.MAGIC),
+                            "auto_test": auto_test})
+        else:
+            log.warning("order failed",
+                        extra={"event": "order_failed",
+                               "reason": "retcode_not_done",
+                               "symbol": self._symbol,
+                               "side": result["side"],
+                               "volume": volume,
+                               "requested_price": requested_price,
+                               "retcode": res.retcode,
+                               "comment": res.comment,
+                               "auto_test": auto_test})
+        return result
 
     def _sl_tp_prices(self, cmd, si, is_buy, ref_price):
         mode = cmd.get("sl_tp_mode") or config.SL_TP_MODE
@@ -445,8 +615,17 @@ class Mt5Worker:
         return to_price(sl, True), to_price(tp, False)
 
     def _close_all(self) -> dict:
+        """Flatten every open position for the active symbol (optionally
+        restricted to this app's magic). Up to 5 retry passes; logs both
+        the request and the final result so the broker round-trip is
+        independently reconstructable from disk.
+        """
         if not self._ensure_connected():
             return {"ok": False, "error": "terminal not connected"}
+        log.info("close-all requested",
+                 extra={"event": "close_all_request",
+                        "symbol": self._symbol,
+                        "restrict_to_magic": bool(config.RESTRICT_CLOSE_TO_MAGIC)})
         results = []
         for _ in range(5):  # retry loop until flat
             positions = mt5.positions_get(symbol=self._symbol) or []
@@ -460,14 +639,25 @@ class Mt5Worker:
         remaining = mt5.positions_get(symbol=self._symbol) or []
         if config.RESTRICT_CLOSE_TO_MAGIC:
             remaining = [p for p in remaining if p.magic == config.MAGIC]
+        closed_count = len([r for r in results if r.get("ok")])
+        log.info("close-all completed",
+                 extra={"event": "close_all_completed",
+                        "symbol": self._symbol,
+                        "closed_count": closed_count,
+                        "remaining_count": len(remaining),
+                        "attempts": len(results),
+                        "flat": len(remaining) == 0})
         return {
             "ok": len(remaining) == 0,
-            "closed": len([r for r in results if r.get("ok")]),
+            "closed": closed_count,
             "remaining": len(remaining),
             "results": results,
         }
 
     def _close_one(self, p) -> dict:
+        """Close a single open position. Logs `position_closed` (or `position_close_failed`)
+        with profit / swap / commission breakdown so realised P&L is reconstructable
+        from the log alone."""
         si = mt5.symbol_info(self._symbol)
         tick = mt5.symbol_info_tick(self._symbol)
         is_buy = p.type == mt5.POSITION_TYPE_BUY
@@ -490,8 +680,27 @@ class Mt5Worker:
         res = mt5.order_send(request)
         if res is None:
             code, msg = mt5.last_error()
+            log.warning("close failed (order_send None)",
+                        extra={"event": "position_close_failed",
+                               "ticket": p.ticket,
+                               "mt5_error_code": code,
+                               "mt5_last_error_msg": msg})
             return {"ok": False, "ticket": p.ticket,
                     "error": f"{code}: {msg}"}
-        return {"ok": res.retcode == mt5.TRADE_RETCODE_DONE,
-                "ticket": p.ticket, "retcode": res.retcode,
-                "comment": res.comment}
+        ok = res.retcode == mt5.TRADE_RETCODE_DONE
+        log.info("position closed" if ok else "close retcode not DONE",
+                 extra={"event": "position_closed" if ok
+                                  else "position_close_failed",
+                        "ticket": p.ticket,
+                        "side_opened": "BUY" if is_buy else "SELL",
+                        "volume": p.volume,
+                        "entry_price": p.price_open,
+                        "close_price": price,
+                        "profit": getattr(p, "profit", None),  # floating at moment of close
+                        "swap": getattr(p, "swap", None),
+                        "commission": getattr(p, "commission", None),
+                        "retcode": res.retcode,
+                        "comment": res.comment,
+                        "magic": getattr(p, "magic", None)})
+        return {"ok": ok, "ticket": p.ticket,
+                "retcode": res.retcode, "comment": res.comment}

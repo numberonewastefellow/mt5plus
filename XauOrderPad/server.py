@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,21 +25,55 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import config
+from logger_setup import setup_logging
 from mt5_worker import Mt5Worker
 
 STATIC_DIR = Path(__file__).parent / "static"
 WEBUI_DIR = Path(__file__).parent / "webui"
+
+# Initialise the JSONL daily logger BEFORE constructing the worker, so any
+# logging calls inside the worker's __init__ / start path land in the file
+# from the very first line.
+setup_logging("XauOrderPad")
+log = logging.getLogger("XauOrderPad.server")
 
 worker = Mt5Worker()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # `server_started` is the first event of the run. Subsequent events
+    # (orders, account snapshots, etc.) can be filtered against this line's
+    # `pid` field to attribute everything to the right process instance.
+    try:
+        import MetaTrader5 as _mt5_for_version
+        mt5_pkg_ver = getattr(_mt5_for_version, "__version__", "unknown")
+    except Exception:
+        mt5_pkg_ver = "unknown"
+    log.info("server started", extra={
+        "event": "server_started",
+        "host": config.HOST,
+        "port": config.PORT,
+        "pid": os.getpid(),
+        "python_version": sys.version.split()[0],
+        "mt5_package_version": mt5_pkg_ver,
+        "magic": int(config.MAGIC),
+        "symbol_config": config.SYMBOL,
+    })
     worker.start()
+    # Convenience: pop the UI in a Chrome/Edge "app-mode" window (no address
+    # bar / tabs) once the server is accepting. Runs on a daemon thread and is
+    # fully fail-safe -- a missing browser never affects the trading server.
+    if getattr(config, "LAUNCH_BROWSER", False):
+        from browser_launch import launch_when_ready
+        url = f"http://{config.HOST}:{config.PORT}/"
+        launch_when_ready(url, config.HOST, config.PORT,
+                          getattr(config, "BROWSER_MODE", "app"))
     try:
         yield
     finally:
         worker.stop()
+        log.info("server stopped", extra={"event": "server_stopped"})
 
 
 app = FastAPI(title="XauOrderPad", lifespan=lifespan)
@@ -134,6 +171,12 @@ async def order(req: PlaceReq, x_token: str | None = Header(default=None)):
     exec, forged curl requests, or a swapped MT5 login between page-load and
     order-send. The flag is set ONLY by the browser's AutoTest engine; manual
     orders never carry it and bypass the check entirely.
+
+    Error shape: 400 responses use a STRUCTURED detail dict so the browser
+    can populate the auto-test retcode histogram without text-parsing:
+        { "message": "...", "retcode": 10018, "comment": "Market closed" }
+    `detail.message` preserves the original human-readable string so existing
+    UI toasts (which read `.detail`) remain backward-compatible.
     """
     _check_token(x_token)
 
@@ -142,6 +185,14 @@ async def order(req: PlaceReq, x_token: str | None = Header(default=None)):
         st = worker.get_state()
         acc = st.get("account") or {}
         if not bool(acc.get("is_demo")):
+            log.error("auto_test order refused on non-demo account", extra={
+                "event": "auto_test_refused_live_account",
+                "login": acc.get("login"),
+                "server": acc.get("server"),
+                "trade_mode": acc.get("trade_mode"),
+                "side": req.side,
+                "volume": req.volume,
+            })
             raise HTTPException(
                 status_code=403,
                 detail=(
@@ -152,10 +203,29 @@ async def order(req: PlaceReq, x_token: str | None = Header(default=None)):
                 ),
             )
 
+    # Log every order request at HTTP-handler boundary so the file shows both
+    # what the browser asked for AND what the worker actually did (the worker
+    # also logs `order_request` / `order_filled` / `order_failed` independently).
+    log.info("order request received", extra={
+        "event": "order_request_http",
+        "symbol": req.symbol,
+        "side": req.side,
+        "volume": req.volume,
+        "type": req.type,
+        "price": req.price,
+        "sl": req.sl,
+        "tp": req.tp,
+        "auto_test": req.auto_test,
+    })
+
     res = await _do({"action": "order", **req.model_dump()})
     if not res.get("ok"):
-        detail = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"
-        raise HTTPException(status_code=400, detail=detail)
+        message = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"
+        raise HTTPException(status_code=400, detail={
+            "message": message,
+            "retcode": res.get("retcode"),
+            "comment": res.get("comment"),
+        })
     return {"ticket": res.get("ticket"), "price": res.get("price"),
             "state": res.get("state", "open")}
 

@@ -81,7 +81,29 @@ const API = {
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify(body),
     });
-    if(!r.ok) throw new Error((await r.json()).detail || 'order rejected');
+    if(!r.ok){
+      // Backend returns a STRUCTURED 400 detail: {message, retcode, comment}
+      // (old string-detail kept as a fallback for any legacy proxy in front).
+      // We throw an Error whose .message preserves the human-readable string
+      // (so existing toast/log code works unchanged) AND attach .retcode /
+      // .comment as properties so AutoTest's burst loop can build a per-retcode
+      // histogram without text-parsing.
+      let detail = null;
+      try { detail = (await r.json()).detail; } catch(_e) {}
+      let message = 'order rejected', retcode = null, comment = null;
+      if(typeof detail === 'string'){
+        message = detail;
+      } else if(detail && typeof detail === 'object'){
+        message = detail.message || message;
+        retcode = (detail.retcode != null) ? Number(detail.retcode) : null;
+        comment = detail.comment || null;
+      }
+      const err = new Error(message);
+      err.retcode = retcode;
+      err.comment = comment;
+      err.httpStatus = r.status;
+      throw err;
+    }
     return r.json();   // expect {ticket, price}
   },
   async closePosition(ticket){
@@ -414,9 +436,18 @@ async function openOrder(side, vol, type, override){
     renderPositions(); renderMetrics(); saveBook();
     return { ok:true, ticket:res.ticket, price:res.price };
   }catch(err){
+    // Preserve structured fields that API.order attached to the Error
+    // (.retcode / .comment from the backend's 400 detail dict). The
+    // Auto-Test burst loop uses these to populate the per-retcode histogram
+    // in the audit JSON without any text parsing of err.message.
     logLine(side.toUpperCase(), `${useVol} ${state.symbol} — ${err.message}`, false);
     toast('fail','Order rejected', err.message); beep('fail');
-    return { ok:false, error: err.message };
+    return {
+      ok: false,
+      error: err.message,
+      retcode: (err && err.retcode != null) ? err.retcode : null,
+      comment: (err && err.comment) || null,
+    };
   }
 }
 
@@ -1058,10 +1089,18 @@ const AutoTest = {
     achievedRate: 0,
     abort: null,          // null | 'reason string'
     healthyMissCount: 0,
-    placedTickets: new Map(),   // ticket → {placedAt, side, confirmed, latencyMs, lost}
+    placedTickets: new Map(),   // ticket → {placedAt, side, confirmed, latencyMs, lost, requested_price, fill_price, slippage}
     cycleStats: [],       // appended at the end of each sub-cycle for the audit log
     runId: null,
     startedAt: null,
+    // Audit fields: starting/ending balance & realised P&L (snapshotted from /ws state.account).
+    startAccount: null,   // {balance, equity, daily_realized}  at start()
+    endAccount: null,     // {balance, equity, daily_realized}  at _finish()
+    // Per-cycle retcode histogram: {cycleLabel: {retcode: count}}.
+    // Populated by _burst's failure handler from err.retcode on the thrown Error.
+    retcodeHistogram: { LONG: {}, SHORT: {} },
+    // Per-cycle slippage observations: arrays of |fill - requested|.
+    slippages: { LONG: [], SHORT: [] },
     // burst timing — for achieved-rate display
     _t0: 0, _sentT0: 0,
     // direction-sanity tracking for the burst phase
@@ -1088,7 +1127,10 @@ const AutoTest = {
     API.autoTestActive = true;                              // bug #2: backend now sees auto_test
     this.st.startedAt = new Date().toISOString();
     this.st.runId = this._mkRunId();
-    logLine('AUTO-TEST', `run ${this.st.runId} START · rate=${this.cfg.rate}/s × ${this.cfg.burstCount} × 2 cycles · lot=${this.cfg.lot}`, true);
+    // Snapshot starting account state from the most recent /ws frame.
+    // Used by _buildAudit to compute realized_pnl + balance_delta for the run.
+    this.st.startAccount = this._snapshotAccount();
+    logLine('AUTO-TEST', `run ${this.st.runId} START · rate=${this.cfg.rate}/s × ${this.cfg.burstCount} × 2 cycles · lot=${this.cfg.lot} · start_balance=${this.st.startAccount?.balance ?? '?'}`, true);
 
     // UX fix: close the modal so the user can see the main UI (positions,
     // floating P&L, price ticker) while the run executes. The compact
@@ -1173,22 +1215,55 @@ const AutoTest = {
         continue;
       }
       this.st.inFlight++; this.st.sent++; done++;
+      // Snapshot the reference price RIGHT BEFORE firing — used downstream
+      // to compute slippage when the broker reports the actual fill price.
+      const requestedPrice = (side === 'buy') ? state.ask : state.bid;
+      const cycleLabel = this.st.cycle;   // 'LONG' | 'SHORT'
 
       // Fire-and-track: do NOT await, so the loop maintains its tick rate.
+      // `placeOrder` was refactored to ALWAYS resolve (never reject) — the
+      // failure path returns {ok:false, error, retcode, comment}. So all
+      // counting happens in .then; .catch is reserved for defensive logging
+      // of any unexpected JS error in the callback itself.
       placeOrder(side, true, override).then(r => {
         if (r && r.ok) {
           this.st.ok++;
           this.st.consecFail = 0;
           if (r.ticket != null) {
+            // Slippage = |fill_price − requested_price|. r.price is the
+            // broker-reported fill price; if null we record null and skip
+            // the slippage aggregation for this order (rare path).
+            const fillPrice = (r.price != null) ? Number(r.price) : null;
+            const slippage = (fillPrice != null && requestedPrice != null)
+              ? Math.abs(fillPrice - requestedPrice) : null;
             this.st.placedTickets.set(r.ticket, {
               placedAt: performance.now(),
               side, confirmed: false, latencyMs: null, lost: false,
+              requested_price: requestedPrice,
+              fill_price: fillPrice,
+              slippage: slippage,
             });
+            if (slippage != null && cycleLabel && this.st.slippages[cycleLabel]) {
+              this.st.slippages[cycleLabel].push(slippage);
+            }
           }
         } else {
+          // Failure path: bucket the broker retcode into the per-cycle
+          // histogram for the audit JSON. `r.retcode` comes from API.order's
+          // structured Error → openOrder's catch block (see app.js).
           this.st.failed++;
           this.st.consecFail++;
+          const rc = (r && r.retcode != null) ? String(r.retcode) : 'unknown';
+          if (cycleLabel && this.st.retcodeHistogram[cycleLabel]) {
+            const h = this.st.retcodeHistogram[cycleLabel];
+            h[rc] = (h[rc] || 0) + 1;
+          }
         }
+      }).catch(err => {
+        // Defensive: if the .then callback itself threw (logic bug), still
+        // count the failure so the run can't silently look successful.
+        console.warn('AutoTest _burst .then crashed', err);
+        this.st.failed++; this.st.consecFail++;
       }).finally(() => {
         this.st.inFlight--;
         this._updateAchievedRate();
@@ -1376,8 +1451,32 @@ const AutoTest = {
       placedTickets: new Map(),
       cycleStats: [],
       runId: null, startedAt: null,
+      // Audit-only fields
+      startAccount: null, endAccount: null,
+      retcodeHistogram: { LONG: {}, SHORT: {} },
+      slippages: { LONG: [], SHORT: [] },
+      // Internal timing / direction state
       _t0: 0, _sentT0: 0,
       _prevNetLots: null, _wrongDirFrames: 0,
+    };
+  },
+
+  /* Pull the most recent account snapshot from the latest /ws state. The
+   * webui's existing `state` global keeps the live broker numbers; we copy
+   * the three fields we need so they don't change under us mid-run. Returns
+   * `null` if no /ws frame has arrived yet (test will degrade gracefully). */
+  _snapshotAccount(){
+    if(typeof state === 'undefined') return null;
+    return {
+      balance:        (typeof state.balance        === 'number') ? state.balance        : null,
+      // `state.equity` is not stored on the global state object by the existing
+      // applyAccount — but `floating_pl + balance` reconstructs equity well
+      // enough for audit. We capture floating separately below.
+      floating_pl:    (typeof state.floating_pl    === 'number') ? state.floating_pl    : null,
+      daily_realized: (typeof state.dailyRealized  === 'number') ? state.dailyRealized  : null,
+      wins:           (typeof state.wins           === 'number') ? state.wins           : null,
+      losses:         (typeof state.losses         === 'number') ? state.losses         : null,
+      ts: new Date().toISOString(),
     };
   },
 
@@ -1422,18 +1521,31 @@ const AutoTest = {
    * grid one more time so the Phase cell catches up to "idle" (fixing the
    * "phase still shows B_OPEN after done" bug), flash the topbar pill in the
    * verdict colour, then auto-open the modal so the user sees the verdict
-   * block + audit-download button immediately — no risk of missing the result. */
+   * block + audit-download button immediately — no risk of missing the result.
+   * On FAIL also raises the persistent top-of-page banner that survives
+   * modal close + page reloads until explicitly dismissed. */
   _finish(){
     this.st.phase = 'idle';
     this.st.cycle = null;
+    // Snapshot ending account state for the audit (paired with startAccount).
+    this.st.endAccount = this._snapshotAccount();
     const verdict = this._computeVerdict();
     const summary = this._renderVerdict(verdict);
     this._lastAudit = this._buildAudit(verdict);
     const dl = $('#atDownloadAudit'); if(dl) dl.hidden = false;
     // Refresh grid + pill AFTER the verdict is computed so Phase reads "idle".
     this._refreshStatusGrid();
-    logLine('AUTO-TEST', `run ${this.st.runId} DONE — verdict=${verdict.label} · sent=${this.st.sent} ok=${this.st.ok} fail=${this.st.failed}`, verdict.label === 'PASS');
+    logLine('AUTO-TEST',
+            `run ${this.st.runId} DONE — verdict=${verdict.label} · sent=${this.st.sent} ok=${this.st.ok} fail=${this.st.failed}`
+            + (this._lastAudit.realized_pnl != null
+               ? ` · realized=${this._lastAudit.realized_pnl.toFixed(2)}` : ''),
+            verdict.label === 'PASS');
     if(summary) toast(verdict.label === 'PASS' ? 'ok' : 'fail', `Auto-Test ${verdict.label}`, summary);
+
+    // Persistent FAIL banner — only on FAIL. Survives modal close + reload.
+    if(verdict.label === 'FAIL'){
+      setFailBanner(`${this.st.runId} — ${verdict.reason}`);
+    }
 
     // Flash the pill in verdict colour + auto-open modal after a brief delay
     // so the user catches the colour change but isn't slammed with the modal.
@@ -1475,7 +1587,37 @@ const AutoTest = {
     return v.reason;
   },
 
+  /* Assemble the per-run audit JSON. Captures:
+   *   - identity + verdict
+   *   - config snapshot
+   *   - totals + per-cycle stats
+   *   - start/end account snapshots (from /ws state.account)
+   *   - realized_pnl + balance_delta derived from those snapshots
+   *   - per-cycle slippage mean/max/p95 (from this.st.slippages)
+   *   - per-cycle retcodes_histogram (from this.st.retcodeHistogram)
+   *
+   * Output is intentionally pandas-friendly: top-level keys are scalars or
+   * small arrays of objects; deeply nested structures are avoided. */
   _buildAudit(verdict){
+    const sa = this.st.startAccount, ea = this.st.endAccount;
+    const realized = (sa && ea && sa.daily_realized != null && ea.daily_realized != null)
+                     ? Number((ea.daily_realized - sa.daily_realized).toFixed(2)) : null;
+    const balDelta = (sa && ea && sa.balance != null && ea.balance != null)
+                     ? Number((ea.balance - sa.balance).toFixed(2)) : null;
+    // Enrich each cycleStats entry with slippage stats + retcode histogram
+    // (these were tracked per-cycle in this.st, joined here by label).
+    const cycles = this.st.cycleStats.map(c => {
+      const slips = this.st.slippages[c.label] || [];
+      const hist  = this.st.retcodeHistogram[c.label] || {};
+      return {
+        ...c,
+        slippage_n:    slips.length,
+        slippage_mean: _stat_mean(slips),
+        slippage_max:  _stat_max(slips),
+        slippage_p95:  _stat_p95(slips),
+        retcodes_histogram: { ...hist },
+      };
+    });
     return {
       run_id: this.st.runId,
       started_at: this.st.startedAt,
@@ -1487,7 +1629,15 @@ const AutoTest = {
         sent: this.st.sent, ok: this.st.ok, failed: this.st.failed,
         achievedRate: this.st.achievedRate,
       },
-      cycles: this.st.cycleStats,
+      // Account snapshots taken from the live /ws feed at start and finish.
+      // realized_pnl = closed-deal P&L of the run; balance_delta = net effect
+      // on broker balance (includes commission & swap, hence the small drift
+      // vs realized_pnl on accounts that charge those).
+      start_account:  sa,
+      end_account:    ea,
+      realized_pnl:   realized,
+      balance_delta:  balDelta,
+      cycles,
     };
   },
 
@@ -1633,6 +1783,64 @@ async function fetchAccountSafety(){
   }
 }
 
+/* Small numeric stats used by AutoTest._buildAudit for slippage aggregation.
+ * Defined at module level so the audit assembler stays self-contained. */
+function _stat_mean(arr){
+  if(!arr || !arr.length) return null;
+  let s = 0; for(const v of arr) s += v;
+  return Number((s / arr.length).toFixed(6));
+}
+function _stat_max(arr){
+  if(!arr || !arr.length) return null;
+  let m = -Infinity; for(const v of arr) if(v > m) m = v;
+  return Number(m.toFixed(6));
+}
+function _stat_p95(arr){
+  if(!arr || !arr.length) return null;
+  const sorted = [...arr].sort((a,b) => a-b);
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+  return Number(sorted[idx].toFixed(6));
+}
+
+/* ============================================================================
+   FAIL banner  —  persistent across page reloads via localStorage
+   ============================================================================
+   Shown when AutoTest._finish() computes a FAIL verdict. It survives:
+   - the modal being closed
+   - the topbar pill auto-dismissing
+   - a full page reload (state stored in localStorage["mt5_fail_banner"])
+   so the operator cannot dismiss the warning by accident. Cleared only by
+   the user clicking the DISMISS button on the banner itself.
+   PASS / REVIEW verdicts do NOT use this banner.
+*/
+const FAIL_BANNER_KEY = 'mt5_fail_banner';
+
+function setFailBanner(text){
+  const banner = document.getElementById('atFailBanner');
+  const txt    = document.getElementById('atFailBannerText');
+  if(!banner || !txt) return;
+  const message = `AUTO-TEST FAILED — ${text}`;
+  txt.textContent = message;
+  banner.hidden = false;
+  try { localStorage.setItem(FAIL_BANNER_KEY, message); } catch(_e) {}
+}
+function clearFailBanner(){
+  const banner = document.getElementById('atFailBanner');
+  if(banner) banner.hidden = true;
+  try { localStorage.removeItem(FAIL_BANNER_KEY); } catch(_e) {}
+}
+function restoreFailBannerFromStorage(){
+  let saved = null;
+  try { saved = localStorage.getItem(FAIL_BANNER_KEY); } catch(_e) {}
+  if(!saved) return;
+  const banner = document.getElementById('atFailBanner');
+  const txt    = document.getElementById('atFailBannerText');
+  if(banner && txt){
+    txt.textContent = saved;
+    banner.hidden = false;
+  }
+}
+
 /* ============================================================================
    AUTO-TEST MODAL WIRING  —  open/close/start/stop/download buttons + pill
    ============================================================================ */
@@ -1646,6 +1854,11 @@ function openAutoTestModal(){
 function closeAutoTestModal(){
   const m = $('#autoTestModal'); if(!m) return;
   m.hidden = true;
+  // Closing via the X must behave like the backdrop click: once the run is
+  // idle (finished/stopped), dismiss the topbar pill too so it doesn't linger
+  // with a dead "STOP" button. While a run is still active the pill stays so
+  // the user can monitor progress / re-open the modal.
+  if(typeof AutoTest !== 'undefined' && AutoTest.st.phase === 'idle') hideRunPill();
 }
 
 /* Pill helpers — control the compact topbar status indicator that's
@@ -1721,6 +1934,12 @@ function bindAutoTest(){
     AutoTest.stop('user clicked pill STOP');
     closeAll();
   });
+
+  // FAIL banner controls (persistent across reloads via localStorage).
+  on('atFailBannerView',    'click', () => { openAutoTestModal(); });
+  on('atFailBannerDismiss', 'click', () => { clearFailBanner(); });
+  // Restore the banner if a previous run's FAIL was never dismissed.
+  restoreFailBannerFromStorage();
 }
 
 /* ===================== BOOT (must be last) =====================

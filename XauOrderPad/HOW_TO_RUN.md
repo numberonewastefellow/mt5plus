@@ -118,6 +118,80 @@ under burst load **before** you trade real money.
 | `EXTERNAL n` | n positions visible with a magic other than this app's — warning that you (or another EA) opened positions outside the order pad. Not a test FAIL. |
 | `LOST n` | n tickets > 5s without feed confirmation. Auto-Test verdict cannot be PASS. |
 
+## Logs
+
+Every order, fill, rejection, close, health change, and Auto-Test event is
+written to a structured **JSON Lines** log file in your Documents folder.
+This is the always-on system-of-record; the browser audit JSON is per-test.
+
+**Location**
+`%USERPROFILE%\Documents\XauOrderPad\XauOrderPad-YYYY-MM-DD.log`
+(on Windows that's typically `C:\Users\<you>\Documents\XauOrderPad\…`)
+
+**Rotation**
+
+- The live file always carries **today's date** in the name.
+- At local midnight the day's file is sealed and a fresh one starts for the
+  new day. Yesterday's file is kept on disk under its own dated name.
+- Restarting the server during the day **appends** to the same file — never
+  overwrites or splits.
+- The 100 most-recent days are kept; older files are pruned on rollover.
+
+**Format**
+
+Each line is one JSON object with at least these keys:
+
+```text
+ts        local time ISO 8601 with TZ offset    (pandas-parseable)
+level     INFO / WARNING / ERROR
+event     short event name — primary slicing key
+msg       human-readable string
+```
+
+Plus event-specific fields (e.g. `ticket`, `requested_price`, `fill_price`,
+`slippage`, `retcode`, `auto_test`, `magic`, etc.).
+
+**Event catalogue** (most important):
+
+| Event | When |
+|---|---|
+| `server_started` / `server_stopped` | At process boot / shutdown |
+| `mt5_connected` / `mt5_disconnected` | MT5 terminal connection transitions |
+| `mt5_init_failed` | MT5 initialize() returned False |
+| `account_snapshot` | Once per ~minute: balance, equity, daily realized, etc. |
+| `health_changed` | Healthy ⇄ unhealthy transitions (never on every poll) |
+| `order_request_http` | Every `/order` POST received (from server.py boundary) |
+| `order_request` | Every order about to be sent to MT5 |
+| `order_filled` | Order accepted by broker — includes `ticket`, `fill_price`, `slippage` |
+| `order_failed` | Order rejected by broker — includes `retcode`, `comment` |
+| `position_closed` | A position was successfully closed |
+| `close_all_request` / `close_all_completed` | Flatten operation |
+| `auto_test_refused_live_account` | 403 fired because someone tried `auto_test:true` on a real account |
+
+**Loading into Python / pandas (zero parsing)**
+
+```python
+import pandas as pd
+log = pd.read_json(
+    "~/Documents/XauOrderPad/XauOrderPad-2026-06-29.log",
+    lines=True,
+)
+
+# Auto-test orders only, on this day
+at = log[(log.event == "order_filled") & (log.auto_test == True)]
+
+# Slippage stats for that subset
+print(at.slippage.describe())
+
+# Broker rejection retcodes
+print(log[log.event == "order_failed"].retcode.value_counts())
+```
+
+If you want a flat CSV later, write any sliced DataFrame with
+`df.to_csv("out.csv")` — heterogeneous columns become NaN where the event
+doesn't have that field. That's the whole point of choosing JSON Lines:
+**one parser, all events, no regex**.
+
 ## Common issues
 
 | Symptom | Fix |
