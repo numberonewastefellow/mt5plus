@@ -64,10 +64,23 @@ const API = {
   base:'',          // same origin — served by the FastAPI backend
   demo:false,       // LIVE: wired to the XauOrderPad backend
 
+  // Set to TRUE by AutoTest.start() and back to FALSE in AutoTest._finish().
+  // Causes every /order POST to carry `auto_test:true` so the backend's
+  // demo-only guard can refuse live-account requests in defense-in-depth.
+  // Manual orders never see this flag and behave unchanged.
+  autoTestActive: false,
+
   async order(req){
     // req = {symbol, side:'buy'|'sell', volume, type:'market'|'limit', price, sl, tp}
     if(this.demo) return demoOrder(req);
-    const r = await fetch(this.base+'/order', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(req)});
+    // Bug #2 fix: inject `auto_test:true` ONLY while a run is active.
+    // Without this the backend 403 demo-guard was completely dead code.
+    const body = this.autoTestActive ? { ...req, auto_test:true } : req;
+    const r = await fetch(this.base+'/order', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
     if(!r.ok) throw new Error((await r.json()).detail || 'order rejected');
     return r.json();   // expect {ticket, price}
   },
@@ -293,25 +306,40 @@ function sltpPrice(side, points, kind){
   return side==='buy'? ref+off : ref-off;
 }
 
-async function placeOrder(side, isMarketKey){
+/* Place an order via the keyboard or click path.
+ *
+ * Returns `{ok, ticket?, error?}` — NEVER `undefined`. Auto-Test's burst loop
+ * depends on this shape to count failures correctly; the previous habit of
+ * silently returning early on bad health or "no opposite to close" was the
+ * source of bug #1 (test always showed PASS because catch-blocks never fired).
+ *
+ * `override` is forwarded to openOrder. Auto-Test passes
+ *   { volume: cfg.lot, sl: 0, tp: 0 }
+ * so the burst is fully decoupled from whatever the user has typed in the
+ * lot / SL / TP form inputs (bug #3). The reduce-opposite path is NOT used
+ * during Auto-Test (the burst always arms first then fires the same side),
+ * so override only needs to flow through the open-side branches.
+ */
+async function placeOrder(side, isMarketKey, override){
   if(!API.demo && !liveHealthy){
     toast('fail','Not ready', liveMsg||'terminal/trading unavailable'); beep('fail');
     logLine(side.toUpperCase(), `Blocked — ${liveMsg||'not ready'}`, false);
-    return;
+    return { ok:false, error: liveMsg || 'not ready' };
   }
   syncFormFromInputs();
   // NOTE: armed direction is sticky — it changes ONLY via B/S (arm()), never by firing.
   const type = isMarketKey ? 'market' : state.type;
-  const vol  = state.lot;
+  const vol  = (override && 'volume' in override) ? override.volume : state.lot;
   flashAct(side);
 
   // LIMIT → pending entry (free; pendings are deliberate setups, not direction-locked)
   if(type==='limit'){
     if(!(parseFloat(state.limit)>0)){
       toast('fail','Limit price required','Enter a price or press M for market'); beep('fail');
-      logLine(side.toUpperCase(), `Limit ${vol} rejected — no price`, false); return;
+      logLine(side.toUpperCase(), `Limit ${vol} rejected — no price`, false);
+      return { ok:false, error:'limit price required' };
     }
-    return openOrder(side, vol, 'limit');
+    return openOrder(side, vol, 'limit', override);
   }
 
   // MARKET with netting ON → the ARMED direction is the only side you may OPEN.
@@ -320,7 +348,7 @@ async function placeOrder(side, isMarketKey){
   //     If there's nothing on the armed side to close → BLOCK (no reverse). Re-arm to flip.
   if(S.netting !== false){
     const A = state.armed;
-    if(side === A) return openOrder(side, vol, 'market');     // entry / add in armed dir
+    if(side === A) return openOrder(side, vol, 'market', override);  // entry / add in armed dir
 
     const openArmed = state.positions
       .filter(p=>p.state==='open' && p.side===A && p.symbol===state.symbol)
@@ -331,36 +359,64 @@ async function placeOrder(side, isMarketKey){
       toast('fail', `No ${ln} to close`, `${A.toUpperCase()} armed — press ${A==='buy'?'S':'B'} to trade the other way`);
       beep('fail'); flashBlock(side);
       logLine(side.toUpperCase(), `Blocked — no ${ln} to close (${A.toUpperCase()} armed)`, false);
-      return;
+      return { ok:false, error:`no ${ln} to close` };
     }
-    return reduceOpposite(side, vol, openArmed, armedVol);    // close armed-side only
+    // reduceOpposite does its own logging + still returns undefined; treat as "best-effort ok"
+    await reduceOpposite(side, vol, openArmed, armedVol);
+    return { ok:true, reduced:true };
   }
 
   // netting OFF → hedging: open freely in either direction
-  return openOrder(side, vol, 'market');
+  return openOrder(side, vol, 'market', override);
 }
 
-/* open a brand-new position (market fill or pending limit) */
-async function openOrder(side, vol, type){
+/* Open a brand-new position (market fill or pending limit).
+ *
+ * Returns `{ok, ticket?, price?, error?}` — NEVER `undefined`. This shape is
+ * required by the Auto-Test burst loop (which counts results), and is also
+ * useful for any future caller that needs to react to per-order outcomes.
+ *
+ * The optional `override` lets callers (Auto-Test) force volume / SL / TP
+ * without mutating the on-screen form inputs. When `override` is omitted,
+ * the previous form-driven behaviour is preserved exactly.
+ *
+ *   override = { volume?:number, sl?:number, tp?:number }
+ *
+ * Side effects (toast / beep / logLine / renderPositions / saveBook) are
+ * unchanged — wrapping callers shouldn't have to know they happened.
+ */
+async function openOrder(side, vol, type, override){
+  const useSl = override && 'sl' in override ? override.sl : (parseFloat(state.sl) || 0);
+  const useTp = override && 'tp' in override ? override.tp : (parseFloat(state.tp) || 0);
+  const useVol = override && 'volume' in override ? override.volume : vol;
   const req = {
-    symbol:state.symbol, side, volume:vol, type,
+    symbol:state.symbol, side, volume:useVol, type,
     price: type==='limit'? parseFloat(state.limit) : (side==='buy'?state.ask:state.bid),
-    sl: parseFloat(state.sl)||0, tp: parseFloat(state.tp)||0,
+    sl: useSl, tp: useTp,
   };
   try{
     const res = await API.order(req);
     const pos = state.positions.find(p=>p.ticket===res.ticket);
-    if(pos){ pos.slPrice=sltpPrice(side, state.sl,'sl'); pos.tpPrice=sltpPrice(side, state.tp,'tp'); }
+    if(pos){
+      // Only re-write SL/TP on the local position object when the form supplied them
+      // (override path passes 0/0 deliberately and should leave them at 0).
+      if(!override){
+        pos.slPrice=sltpPrice(side, state.sl,'sl');
+        pos.tpPrice=sltpPrice(side, state.tp,'tp');
+      }
+    }
     const verb = type==='limit'?'Limit set':'Filled';
-    logLine(side.toUpperCase(), `${verb} ${vol} ${state.symbol} @ ${fmt(req.price)}`+
-            (req.sl?` · SL ${req.sl}p`:'')+(req.tp?` · TP ${req.tp}p`:''), true);
+    logLine(side.toUpperCase(), `${verb} ${useVol} ${state.symbol} @ ${fmt(req.price)}`+
+            (req.sl?` · SL ${req.sl}`:'')+(req.tp?` · TP ${req.tp}`:''), true);
     toast('ok', `${side==='buy'?'BUY':'SELL'} ${type==='limit'?'pending':'filled'}`,
-          `#${res.ticket} ${vol} @ ${fmt(req.price)}`);
+          `#${res.ticket} ${useVol} @ ${fmt(req.price)}`);
     beep(side);
     renderPositions(); renderMetrics(); saveBook();
+    return { ok:true, ticket:res.ticket, price:res.price };
   }catch(err){
-    logLine(side.toUpperCase(), `${vol} ${state.symbol} — ${err.message}`, false);
+    logLine(side.toUpperCase(), `${useVol} ${state.symbol} — ${err.message}`, false);
     toast('fail','Order rejected', err.message); beep('fail');
+    return { ok:false, error: err.message };
   }
 }
 
@@ -696,14 +752,37 @@ const isTyping = () => {
   return t==='INPUT'||t==='SELECT'||t==='TEXTAREA';
 };
 window.addEventListener('keydown', e=>{
-  // modal open → Esc closes, otherwise let inputs work
+  // settings modal open → Esc closes settings, otherwise let inputs work
   if(!$('#settingsModal').hidden){
     if(e.key==='Escape'){ e.preventDefault(); closeSettings(); }
+    return;
+  }
+  // auto-test modal open → its own field inputs already swallow; Esc closes it
+  if($('#autoTestModal') && !$('#autoTestModal').hidden){
+    if(e.key==='Escape'){ e.preventDefault(); $('#autoTestModal').hidden = true; }
     return;
   }
   if(isTyping()){
     if(e.key==='Enter'||e.key==='Escape'){ e.preventDefault(); document.activeElement.blur(); syncFormFromInputs(); }
     return;
+  }
+  // While AutoTest is running, swallow all order-affecting hotkeys to prevent
+  // the user from racing the burst engine. Esc is special: it both ABORTS the
+  // run AND triggers an immediate closeAll (emergency flatten). Theme / settings
+  // / lot-adjust hotkeys stay live — they don't touch the broker.
+  const autoTestRunning = (typeof AutoTest !== 'undefined') && AutoTest.st.phase !== 'idle';
+  if(autoTestRunning){
+    if(e.key==='Escape'){
+      e.preventDefault();
+      AutoTest.stop('user pressed Esc');
+      closeAll();
+      return;
+    }
+    if([' ','Backspace','Delete','Enter','b','B','s','S'].includes(e.key)){
+      e.preventDefault();
+      toast('info','Auto-Test active','Hotkeys disabled — STOP from the panel to regain control');
+      return;
+    }
   }
   switch(e.key){
     case ' ':        e.preventDefault(); placeOrder('buy', true);  break; // SPACE = buy now
@@ -782,6 +861,7 @@ function init(){
   }
   applyTheme(S.theme);
   bind();
+  bindAutoTest();                  // wire the AUTO-TEST modal buttons (open / close / start / stop / download)
   setSymbol(state.symbol);
   setTf(state.tf);
   setLot(S.defaultLot);
@@ -797,6 +877,7 @@ function init(){
   }else{
     lockSingleSymbol();
     startLive();                   // real prices/positions over WebSocket
+    fetchAccountSafety();          // initial DEMO/REAL badge probe (canonical source)
   }
   setInterval(tickClock, 250);     // clock + candle
   tickClock();
@@ -846,6 +927,11 @@ function setHealth(ok, msg){
   if(!ok) b.textContent = '⚠ '+liveMsg+' — trading disabled';
 }
 
+/* Map a backend position (from worker._poll_state) into the shape the UI's
+ * renderers expect. We deliberately preserve `magic` so the Auto-Test sync
+ * verifier (reconcileAutoTest) can detect "foreign" positions — i.e.
+ * positions on the same symbol opened by something other than this app
+ * (e.g. user clicking BUY in the MT5 desktop terminal, or another EA). */
 function mapPos(p, isPending){
   const sym = state.symbol, pt = (SYMBOLS[sym] && SYMBOLS[sym].point) || 0.001;
   const entry = p.price_open;
@@ -861,6 +947,7 @@ function mapPos(p, isPending){
     slPrice: slP || 0, tpPrice: tpP || 0,
     openTime: (p.time||0)*1000,
     liveProfit: isPending ? null : (p.profit!=null ? p.profit : null),
+    magic: (p.magic != null) ? p.magic : null,   // for reconcileAutoTest foreign-magic check
   };
 }
 
@@ -884,6 +971,17 @@ function onState(s){
                        wins:acc.wins, losses:acc.losses});
 
   setHealth(!!s.healthy, s.error || (s.connected ? 'trading not allowed' : 'terminal offline'));
+
+  // ---- Auto-Test hooks (run on every /ws frame) -----------------------------
+  // We attach BOTH callbacks here so that:
+  //  (a) the AutoTest engine sees demo/healthy changes mid-run and can self-abort
+  //  (b) reconcileAutoTest updates the SYNC chip + maintains the placed-ticket
+  //      ledger and foreign-magic detection (runs always — chip is informative
+  //      outside a run too)
+  // No second WebSocket is opened. This is the SINGLE consumer of /ws.
+  try { if(typeof AutoTest !== 'undefined') AutoTest._onState(s); } catch(e){ console.warn('AutoTest._onState', e); }
+  try { if(typeof reconcileAutoTest === 'function') reconcileAutoTest(s); } catch(e){ console.warn('reconcileAutoTest', e); }
+  try { if(typeof updateAccountBadgeFromState === 'function') updateAccountBadgeFromState(s); } catch(e){}
 }
 
 function startLive(){
@@ -897,6 +995,732 @@ function startLive(){
   };
   setHealth(false,'connecting…');
   connect();
+}
+
+/* ============================================================================
+   AUTO-TEST ENGINE  (demo-only burst tester + sync verifier)
+   ============================================================================
+   Purpose: drive the EXACT live order-placement path used by manual hotkeys
+   (placeOrder / closeAll), in BOTH directions (LONG = buy-armed burst,
+   SHORT = sell-armed burst), and verify every order is acknowledged by the
+   broker via the live /ws feed. Designed to surface bugs in the order path
+   BEFORE the user trades real money.
+
+   ─── Safety: three layers, none can be bypassed ──────────────────────────
+   (1) START button is disabled until /api/account/safety reports is_demo=true
+   (2) AutoTest._verifyDemo() re-checks before every sub-cycle; flips abort if
+       the account is no longer demo
+   (3) Server /order returns 403 for auto_test=true on non-demo accounts —
+       survives JS bugs / console exec / forged curl / mid-session login swap
+
+   ─── Bug-fix cross-references (see plan file) ────────────────────────────
+   #1 telemetry double-count → counters live ONLY in _burst's .then handler.
+       openOrder/placeOrder now return {ok, ticket, error} so .then sees real
+       success/failure. No external onResult hook.
+   #2 dead backend guard → API.autoTestActive flag (set true by start(), false
+       by _finish()) causes API.order to inject auto_test:true.
+   #3 lot/SL/TP override → _burst builds {volume:cfg.lot, sl:0, tp:0} and
+       threads it through placeOrder → openOrder; form inputs are ignored.
+   #4 not-flat → _runCycle returns false if _waitForBrokerFlat times out, and
+       start() exits on a false return BEFORE Cycle B can start. Final closeAll
+       always runs in the finally block.
+   #5 sync tautology → reconcileAutoTest uses (a) our own placedTickets ledger
+       (a Map<ticket,{placedAt,confirmed,latencyMs}>) cross-checked against the
+       feed, and (b) foreign-magic detection (positions with a magic other
+       than config.MAGIC). The old uiTickets-vs-brokerTickets comparison is
+       gone (it was always equal — UI is sourced from feed).
+   #6 single WebSocket → we hook the existing onState(s) above. There is no
+       second WebSocket anywhere in this file.
+   ============================================================================ */
+
+const AUTOTEST_MAGIC = 532026;            // mirrors config.MAGIC in the backend
+
+const AutoTest = {
+  /* User-configurable knobs (snapshot at start()). Persisted to localStorage
+   * via _readCfgFromForm / _writeCfgToForm so a refresh keeps your last setup.*/
+  cfg: {
+    rate: 20,             // orders/sec target
+    burstCount: 100,      // orders per sub-cycle
+    restSec: 5,           // seconds between A_CLOSE and B_OPEN
+    lot: 0.01,            // lot size — overrides form
+    triggerMode: 'wall_minute',  // 'wall_minute' | 'tf_bar_start' | 'immediate'
+    maxOrdersPerRun: 500, // hard cap on total orders (both cycles combined)
+    consecFailKill: 10,   // consecutive failures → abort + closeAll
+    inFlightCap: 32,      // max pending sends; prevents broker pile-up
+  },
+
+  /* Live state — reset on every start() */
+  st: {
+    phase: 'idle',        // idle | wait_trigger | A_OPEN | A_REST | A_CLOSE | B_OPEN | B_REST | B_CLOSE | done
+    cycle: null,          // 'LONG' | 'SHORT' | null
+    sent: 0, ok: 0, failed: 0,
+    consecFail: 0, inFlight: 0,
+    achievedRate: 0,
+    abort: null,          // null | 'reason string'
+    healthyMissCount: 0,
+    placedTickets: new Map(),   // ticket → {placedAt, side, confirmed, latencyMs, lost}
+    cycleStats: [],       // appended at the end of each sub-cycle for the audit log
+    runId: null,
+    startedAt: null,
+    // burst timing — for achieved-rate display
+    _t0: 0, _sentT0: 0,
+    // direction-sanity tracking for the burst phase
+    _prevNetLots: null,
+    _wrongDirFrames: 0,
+  },
+
+  /* Public: invoked from the AUTO-TEST modal's START button. */
+  async start(){
+    if(this.st.phase !== 'idle') return;                    // idempotent
+    this._resetState();
+    this._readCfgFromForm();
+
+    const safety = await this._verifyDemo();
+    if(!safety.is_demo){ return this._fail(`account is NOT demo (login=${safety.login}, mode=${safety.trade_mode})`); }
+
+    const pre = this._preflight();
+    if(!pre.ok){ return this._fail(`preflight: ${pre.reason}`); }
+
+    if(!await this._confirmDialog(safety)) return;          // user cancelled
+
+    this._lockManualKeys(true);
+    this._lockSymbolSelect(true);
+    API.autoTestActive = true;                              // bug #2: backend now sees auto_test
+    this.st.startedAt = new Date().toISOString();
+    this.st.runId = this._mkRunId();
+    logLine('AUTO-TEST', `run ${this.st.runId} START · rate=${this.cfg.rate}/s × ${this.cfg.burstCount} × 2 cycles · lot=${this.cfg.lot}`, true);
+
+    // UX fix: close the modal so the user can see the main UI (positions,
+    // floating P&L, price ticker) while the run executes. The compact
+    // topbar pill provides at-a-glance status + a STOP button without
+    // taking over the screen. Clicking the pill re-opens the modal.
+    closeAutoTestModal();
+    showRunPill();
+
+    try {
+      await this._waitForTrigger();
+      if(this.st.abort) return;
+
+      const aOk = await this._runCycle('LONG',  'buy');
+      if(!aOk || this.st.abort) return;                     // HARD ABORT — no Cycle B
+
+      const safety2 = await this._verifyDemo();
+      if(!safety2.is_demo){ this.stop('account changed to non-demo mid-run'); return; }
+
+      const bOk = await this._runCycle('SHORT', 'sell');
+      if(!bOk || this.st.abort) return;
+    } finally {
+      try { await closeAll(); } catch(e){}                  // final safety flatten — never throws
+      API.autoTestActive = false;
+      this._lockManualKeys(false);
+      this._lockSymbolSelect(false);
+      this._finish();
+    }
+  },
+
+  /* Public: STOP button or emergency Esc. Sets abort; the running phase exits
+   * at its next checkpoint, finally{} flattens, _finish renders verdict. */
+  stop(reason){
+    if(this.st.phase === 'idle') return;
+    this.st.abort = reason || 'user stop';
+    logLine('AUTO-TEST', `STOP requested: ${this.st.abort}`, false);
+  },
+
+  /* Run one sub-cycle. Returns true ONLY if it reached flat — caller MUST
+   * abort the run on a false return (bug #4: never proceed into B on non-flat). */
+  async _runCycle(label, side){
+    this.st.cycle = label;
+    arm(side);
+
+    await this._burst(side);
+    if(this.st.abort) return false;
+
+    this.st.phase = label === 'LONG' ? 'A_REST' : 'B_REST';
+    await this._sleep(this.cfg.restSec * 1000);
+    if(this.st.abort) return false;
+
+    this.st.phase = label === 'LONG' ? 'A_CLOSE' : 'B_CLOSE';
+    try { await closeAll(); } catch(e){ /* tolerated; flat-check below decides */ }
+
+    const flat = await this._waitForBrokerFlat(10000);
+    if(!flat){
+      this.stop(`failed to flatten after ${label}_CLOSE within 10s`);
+      this.st.cycleStats.push({label, sent:this.st.sent, ok:this.st.ok, failed:this.st.failed, flat:false});
+      return false;
+    }
+    this.st.cycleStats.push({label, sent:this.st.sent, ok:this.st.ok, failed:this.st.failed, flat:true});
+    return true;
+  },
+
+  /* Fire the burst. SINGLE counting site (bug #1) — increments st.ok/st.failed
+   * from the {ok,…} return shape only here. No onResult hook anywhere else. */
+  async _burst(side){
+    this.st.phase = side==='buy' ? 'A_OPEN' : 'B_OPEN';
+    const interval = 1000 / Math.max(1, this.cfg.rate);
+    const override = { volume: this.cfg.lot, sl: 0, tp: 0 };   // bug #3 fix
+    this.st._t0 = performance.now();
+    this.st._sentT0 = this.st.sent;
+    this.st._prevNetLots = null;
+    this.st._wrongDirFrames = 0;
+
+    let done = 0;
+    while (done < this.cfg.burstCount &&
+           this.st.sent < this.cfg.maxOrdersPerRun &&
+           this.st.consecFail < this.cfg.consecFailKill &&
+           !this.st.abort) {
+      if (this.st.inFlight >= this.cfg.inFlightCap) {
+        await this._sleep(5);
+        continue;
+      }
+      this.st.inFlight++; this.st.sent++; done++;
+
+      // Fire-and-track: do NOT await, so the loop maintains its tick rate.
+      placeOrder(side, true, override).then(r => {
+        if (r && r.ok) {
+          this.st.ok++;
+          this.st.consecFail = 0;
+          if (r.ticket != null) {
+            this.st.placedTickets.set(r.ticket, {
+              placedAt: performance.now(),
+              side, confirmed: false, latencyMs: null, lost: false,
+            });
+          }
+        } else {
+          this.st.failed++;
+          this.st.consecFail++;
+        }
+      }).finally(() => {
+        this.st.inFlight--;
+        this._updateAchievedRate();
+        this._refreshStatusGrid();
+      });
+
+      await this._sleep(interval);
+    }
+
+    // Drain in-flight requests so we don't enter REST with sends still landing.
+    const drainStart = performance.now();
+    while (this.st.inFlight > 0 && performance.now() - drainStart < 3000) {
+      await this._sleep(20);
+    }
+
+    if (this.st.consecFail >= this.cfg.consecFailKill) {
+      this.stop(`kill: ${this.st.consecFail} consecutive failures`);
+    }
+  },
+
+  /* Called from the EXISTING onState(s) — no second WebSocket. */
+  _onState(s){
+    if(this.st.phase === 'idle') return;
+    if(s && s.account && s.account.is_demo === false){
+      this.stop('account became non-demo mid-run');
+      return;
+    }
+    if(!s || !s.healthy){
+      this.st.healthyMissCount++;
+      if(this.st.healthyMissCount > 3) this.stop('healthy=false for >3 frames');
+    } else {
+      this.st.healthyMissCount = 0;
+    }
+    // Direction sanity during BURST phase: net_lots must move in armed-side
+    // direction (positive for LONG, negative for SHORT). Two consecutive
+    // wrong-sign deltas during burst = critical routing bug → abort.
+    if((this.st.phase === 'A_OPEN' || this.st.phase === 'B_OPEN') && s && s.net_lots != null){
+      const expectedSign = (this.st.phase === 'A_OPEN') ? +1 : -1;
+      if(this.st._prevNetLots != null){
+        const delta = s.net_lots - this.st._prevNetLots;
+        if(delta !== 0 && Math.sign(delta) !== expectedSign){
+          this.st._wrongDirFrames++;
+          if(this.st._wrongDirFrames >= 2){
+            this.stop(`wrong-direction net_lots during ${this.st.phase} (expected ${expectedSign>0?'+':'-'})`);
+          }
+        } else if(delta !== 0){
+          this.st._wrongDirFrames = 0;
+        }
+      }
+      this.st._prevNetLots = s.net_lots;
+    } else {
+      this.st._prevNetLots = null;
+    }
+  },
+
+  /* Wait until the broker reports zero positions for the active symbol.
+   * Polls UI state.positions (which is already the live feed via onState).
+   * Returns true if flat reached; false on timeout. */
+  async _waitForBrokerFlat(timeoutMs){
+    const start = performance.now();
+    while (performance.now() - start < timeoutMs) {
+      const open = state.positions.filter(p => p.state === 'open' && p.symbol === state.symbol);
+      if(open.length === 0) return true;
+      if(this.st.abort) return false;
+      await this._sleep(75);  // ~ one /ws frame at POLL_HZ=15
+    }
+    return false;
+  },
+
+  /* Wait for the configured trigger before firing the first burst. */
+  async _waitForTrigger(){
+    this.st.phase = 'wait_trigger';
+    if(this.cfg.triggerMode === 'immediate') return;
+    if(this.cfg.triggerMode === 'wall_minute'){
+      // Sleep until the next whole minute (local clock). Within ±100ms is fine.
+      const ms = 60_000 - (Date.now() % 60_000);
+      logLine('AUTO-TEST', `waiting ${(ms/1000).toFixed(1)}s to next :00 minute`, true);
+      await this._sleep(ms);
+      return;
+    }
+    if(this.cfg.triggerMode === 'tf_bar_start'){
+      // Wait for the candle "elapsed" indicator to wrap from large → near-zero.
+      // The candle update loop runs every ~250ms (tickClock) and writes #candleElapsed.
+      const el = document.getElementById('candleElapsed');
+      let prev = -1;
+      const giveUpAt = performance.now() + 16 * 60 * 1000;  // worst case: M15 = 15min
+      while(performance.now() < giveUpAt && !this.st.abort){
+        const txt = el ? el.textContent || '00:00' : '00:00';
+        const [mm, ss] = txt.split(':').map(n => parseInt(n,10) || 0);
+        const elapsedSec = mm * 60 + ss;
+        if(prev >= 0 && prev > 5 && elapsedSec <= 1) return;   // wrapped → new bar
+        prev = elapsedSec;
+        await this._sleep(200);
+      }
+    }
+  },
+
+  /* Hit /api/account/safety to confirm DEMO status. Returns the safety object. */
+  async _verifyDemo(){
+    try {
+      const r = await fetch('/api/account/safety', {cache:'no-store'});
+      if(!r.ok) return { is_demo:false, login:'?', server:'?', trade_mode:-1, healthy:false };
+      return await r.json();
+    } catch(e){
+      return { is_demo:false, login:'?', server:'?', trade_mode:-1, healthy:false };
+    }
+  },
+
+  /* Synchronous gates that must all pass before the START button does anything.
+   * Returns {ok:bool, reason:string}. */
+  _preflight(){
+    if(!liveHealthy) return {ok:false, reason:`broker not healthy: ${liveMsg||'unknown'}`};
+    if(!(state.bid > 0) || !(state.ask > 0)) return {ok:false, reason:'no quote (bid/ask = 0)'};
+    const spread = state.ask - state.bid;
+    if(spread > 1.0) return {ok:false, reason:`spread too wide (${spread.toFixed(3)})`};
+    if(!(this.cfg.lot > 0)) return {ok:false, reason:'lot must be > 0'};
+    // pending orders check — refuse to start if there are existing pendings on the symbol
+    const pending = state.positions.filter(p => p.state === 'pending' && p.symbol === state.symbol);
+    if(pending.length > 0) return {ok:false, reason:`cancel the ${pending.length} pending order(s) on ${state.symbol} first`};
+    return {ok:true, reason:''};
+  },
+
+  /* User-facing confirm dialog. Last chance to say no. */
+  async _confirmDialog(safety){
+    const total = this.cfg.burstCount * 2;
+    const msg = `About to place LIVE DEMO orders on ${safety.login}@${safety.server}.\n\n` +
+                `~${total} orders (${this.cfg.burstCount} × 2 cycles), lot ${this.cfg.lot} each, rate ${this.cfg.rate}/s.\n\n` +
+                `Continue?`;
+    return window.confirm(msg);
+  },
+
+  /* Block / unblock manual order hotkeys via a flag (the keydown handler reads
+   * AutoTest.st.phase directly, so this is just for symmetry / future toggles). */
+  _lockManualKeys(_on){ /* keydown handler reads st.phase directly */ },
+
+  /* Disable the symbol selector for the duration of a run so a mid-run
+   * symbol change can't orphan positions opened in the original symbol. */
+  _lockSymbolSelect(on){
+    const sel = $('#symbolSelect');
+    if(!sel) return;
+    if(on){ sel.dataset.prevDisabled = sel.disabled ? '1':'0'; sel.disabled = true; }
+    else  { sel.disabled = sel.dataset.prevDisabled === '1'; }
+  },
+
+  /* Compute orders-per-second over the current burst window for the UI. */
+  _updateAchievedRate(){
+    const elapsed = (performance.now() - this.st._t0) / 1000;
+    if(elapsed > 0.05){
+      this.st.achievedRate = (this.st.sent - this.st._sentT0) / elapsed;
+    }
+  },
+
+  /* Render the live status grid in the modal AND the compact topbar pill.
+   * Cheap; called from .finally on every order and once more in _finish().
+   * The pill mirrors the most important numbers (phase + sent/total) so the
+   * user can monitor progress without re-opening the modal. */
+  _refreshStatusGrid(){
+    const set = (id, v) => { const el = document.getElementById(id); if(el) el.textContent = v; };
+    set('atPhase', this.st.phase);
+    set('atCycle', this.st.cycle || '—');
+    set('atSent', String(this.st.sent));
+    set('atOk', String(this.st.ok));
+    set('atFailed', String(this.st.failed));
+    set('atAchRate', this.st.achievedRate.toFixed(1));
+    let confirmed = 0, lost = 0;
+    for(const r of this.st.placedTickets.values()){
+      if(r.confirmed && !r.lost) confirmed++;
+      if(r.lost) lost++;
+    }
+    set('atConfirmed', String(confirmed));
+    set('atLost', String(lost));
+
+    // Topbar pill mirrors phase + progress. Two-cycle total = burstCount × 2.
+    const totalTarget = (this.cfg.burstCount || 0) * 2;
+    set('atRunPhase', this.st.phase);
+    set('atRunProgress', `${this.st.sent}/${totalTarget}`);
+  },
+
+  _resetState(){
+    this.st = {
+      phase: 'idle', cycle: null,
+      sent: 0, ok: 0, failed: 0,
+      consecFail: 0, inFlight: 0, achievedRate: 0,
+      abort: null, healthyMissCount: 0,
+      placedTickets: new Map(),
+      cycleStats: [],
+      runId: null, startedAt: null,
+      _t0: 0, _sentT0: 0,
+      _prevNetLots: null, _wrongDirFrames: 0,
+    };
+  },
+
+  _mkRunId(){
+    const d = new Date();
+    const z = n => String(n).padStart(2,'0');
+    return `${d.getUTCFullYear()}${z(d.getUTCMonth()+1)}${z(d.getUTCDate())}-${z(d.getUTCHours())}${z(d.getUTCMinutes())}${z(d.getUTCSeconds())}`;
+  },
+
+  /* Read modal inputs → cfg. Persisted to localStorage so refresh keeps last setup. */
+  _readCfgFromForm(){
+    const num = (id, dflt) => { const el = $(id); const v = el ? parseFloat(el.value) : NaN; return Number.isFinite(v) ? v : dflt; };
+    this.cfg.rate            = num('#atRate', 20);
+    this.cfg.burstCount      = num('#atBurstCount', 100);
+    this.cfg.restSec         = num('#atRestSec', 5);
+    this.cfg.lot             = num('#atLot', 0.01);
+    this.cfg.maxOrdersPerRun = num('#atMaxOrders', 500);
+    this.cfg.consecFailKill  = num('#atConsecFailKill', 10);
+    this.cfg.inFlightCap     = num('#atInFlightCap', 32);
+    const sel = $('#atTriggerMode'); if(sel) this.cfg.triggerMode = sel.value;
+    try { localStorage.setItem('mt5autotest', JSON.stringify(this.cfg)); } catch(e){}
+  },
+
+  /* Write persisted cfg → modal inputs (called on modal-open). */
+  _writeCfgToForm(){
+    try {
+      const saved = JSON.parse(localStorage.getItem('mt5autotest') || 'null');
+      if(saved) Object.assign(this.cfg, saved);
+    } catch(e){}
+    const set = (id, v) => { const el = $(id); if(el) el.value = v; };
+    set('#atRate', this.cfg.rate);
+    set('#atBurstCount', this.cfg.burstCount);
+    set('#atRestSec', this.cfg.restSec);
+    set('#atLot', this.cfg.lot);
+    set('#atMaxOrders', this.cfg.maxOrdersPerRun);
+    set('#atConsecFailKill', this.cfg.consecFailKill);
+    set('#atInFlightCap', this.cfg.inFlightCap);
+    const sel = $('#atTriggerMode'); if(sel) sel.value = this.cfg.triggerMode;
+  },
+
+  /* Compute final verdict (PASS / REVIEW / FAIL), render it, refresh status
+   * grid one more time so the Phase cell catches up to "idle" (fixing the
+   * "phase still shows B_OPEN after done" bug), flash the topbar pill in the
+   * verdict colour, then auto-open the modal so the user sees the verdict
+   * block + audit-download button immediately — no risk of missing the result. */
+  _finish(){
+    this.st.phase = 'idle';
+    this.st.cycle = null;
+    const verdict = this._computeVerdict();
+    const summary = this._renderVerdict(verdict);
+    this._lastAudit = this._buildAudit(verdict);
+    const dl = $('#atDownloadAudit'); if(dl) dl.hidden = false;
+    // Refresh grid + pill AFTER the verdict is computed so Phase reads "idle".
+    this._refreshStatusGrid();
+    logLine('AUTO-TEST', `run ${this.st.runId} DONE — verdict=${verdict.label} · sent=${this.st.sent} ok=${this.st.ok} fail=${this.st.failed}`, verdict.label === 'PASS');
+    if(summary) toast(verdict.label === 'PASS' ? 'ok' : 'fail', `Auto-Test ${verdict.label}`, summary);
+
+    // Flash the pill in verdict colour + auto-open modal after a brief delay
+    // so the user catches the colour change but isn't slammed with the modal.
+    setVerdictPill(verdict.label);
+    setTimeout(() => { openAutoTestModal(); }, 900);
+  },
+
+  _fail(reason){
+    logLine('AUTO-TEST', `refused to start: ${reason}`, false);
+    toast('fail', 'Auto-Test refused', reason);
+    this.st.phase = 'idle';
+    API.autoTestActive = false;
+  },
+
+  /* Bundle deterministic PASS / REVIEW / FAIL based on confirmed criteria. */
+  _computeVerdict(){
+    const sent = this.st.sent, ok = this.st.ok, failed = this.st.failed;
+    let confirmed = 0, lost = 0, late = 0;
+    for(const r of this.st.placedTickets.values()){
+      if(r.lost) lost++;
+      else if(r.confirmed) confirmed++;
+    }
+    const ratio = sent > 0 ? ok / sent : 0;
+    const rateOk = sent === 0 ? false : Math.abs(this.st.achievedRate - this.cfg.rate) / Math.max(1, this.cfg.rate) <= 0.20;
+    const allFlat = this.st.cycleStats.every(c => c.flat);
+    if(this.st.abort && !allFlat) return {label:'FAIL', reason: this.st.abort};
+    if(lost > 0) return {label:'FAIL', reason:`${lost} tickets never appeared in feed`};
+    if(!allFlat) return {label:'FAIL', reason:'one or more sub-cycles did not reach flat'};
+    if(ratio >= 0.95 && rateOk) return {label:'PASS', reason:'all checks green'};
+    return {label:'REVIEW', reason:`ok/sent=${(ratio*100).toFixed(0)}% achievedRate=${this.st.achievedRate.toFixed(1)}/s`};
+  },
+
+  _renderVerdict(v){
+    const el = $('#atVerdict'); if(!el) return v.reason;
+    el.hidden = false;
+    el.className = 'autotest-verdict ' + (v.label === 'PASS' ? 'pass' : v.label === 'REVIEW' ? 'review' : 'fail');
+    const text = `${v.label}: ${v.reason}\nsent=${this.st.sent} ok=${this.st.ok} failed=${this.st.failed} achieved=${this.st.achievedRate.toFixed(1)}/s`;
+    el.textContent = text;
+    return v.reason;
+  },
+
+  _buildAudit(verdict){
+    return {
+      run_id: this.st.runId,
+      started_at: this.st.startedAt,
+      ended_at: new Date().toISOString(),
+      verdict: verdict.label,
+      verdict_reason: verdict.reason,
+      config: { ...this.cfg },
+      totals: {
+        sent: this.st.sent, ok: this.st.ok, failed: this.st.failed,
+        achievedRate: this.st.achievedRate,
+      },
+      cycles: this.st.cycleStats,
+    };
+  },
+
+  _sleep(ms){ return new Promise(res => setTimeout(res, ms)); },
+};
+
+/* ============================================================================
+   SYNC VERIFIER — reconcileAutoTest(state)
+   Called from onState(s). Does two distinct jobs:
+     A) Reconciles AutoTest's placedTickets ledger against the live feed:
+        marks confirmed (latency < 1s = OK, 1-5s = pending, >5s = LOST)
+     B) Detects "foreign" positions on the symbol (magic != AUTOTEST_MAGIC) —
+        these are positions opened by something OTHER than this app (user
+        clicking BUY in MT5, another EA, etc.). Warning-only, not a test FAIL.
+   The SYNC chip in the topbar reflects the worst of the two states.
+   ============================================================================ */
+function reconcileAutoTest(s){
+  const positions = (s && s.positions) || [];
+  const feedTickets = new Set(positions.map(p => p.ticket));
+
+  // --- Foreign-magic detection (runs always) ----------------------------------
+  let foreignCount = 0;
+  for(const p of positions){
+    if(p.magic != null && Number(p.magic) !== AUTOTEST_MAGIC) foreignCount++;
+  }
+
+  // --- Placed-ticket ledger (only meaningful during a run) -------------------
+  let pendingCount = 0, lateCount = 0, lostCount = 0;
+  const now = performance.now();
+  if(AutoTest.st.phase !== 'idle'){
+    for(const [ticket, rec] of AutoTest.st.placedTickets){
+      if(rec.confirmed) continue;
+      const age = now - rec.placedAt;
+      if(feedTickets.has(ticket)){
+        rec.confirmed = true; rec.latencyMs = age;
+      } else if(age > 5000){
+        rec.confirmed = true; rec.lost = true; lostCount++;
+      } else if(age > 1000){
+        lateCount++;
+      } else {
+        pendingCount++;
+      }
+    }
+  }
+
+  // --- Chip state: worst-of wins ---------------------------------------------
+  // priority: fail (lost) > pending (late) > external > ok
+  //
+  // The topbar chip and the modal SYNC cell use SLIGHTLY different value
+  // strings to avoid the "SYNCSYNC OK" duplication bug: the topbar chip
+  // has no separate label, so it shows "SYNC OK" / "LOST n" / etc; the
+  // modal cell already has a "SYNC" label next to it, so the value drops
+  // the "SYNC " prefix and shows just "OK" / "LOST n" / "PENDING n" /
+  // "EXTERNAL n".
+  let cls = 'ok', chipText = 'SYNC OK', cellText = 'OK';
+  if(lostCount > 0){
+    cls = 'fail';     chipText = `LOST ${lostCount}`;     cellText = `LOST ${lostCount}`;
+  } else if(lateCount > 0){
+    cls = 'pending';  chipText = `PENDING ${lateCount}`;  cellText = `PENDING ${lateCount}`;
+  } else if(foreignCount > 0){
+    cls = 'external'; chipText = `EXTERNAL ${foreignCount}`; cellText = `EXTERNAL ${foreignCount}`;
+  }
+  const chip = document.getElementById('syncChip');
+  const txt  = document.getElementById('syncText');
+  if(chip) chip.className = 'sync ' + cls;
+  if(txt)  txt.textContent = chipText;
+
+  // Modal status cell — value only, no "SYNC " prefix (label is rendered separately).
+  const ms = document.getElementById('atSync');
+  if(ms) ms.textContent = cellText;
+}
+
+/* ============================================================================
+   ACCOUNT BADGE  —  driven by /api/account/safety (and refreshed from /ws state)
+   ============================================================================ */
+function setAccountBadge(safety){
+  const txt = document.getElementById('connText');
+  if(!txt) return;
+  txt.classList.remove('loading','demo','real','contest');
+  if(!safety || safety.trade_mode == null){
+    txt.classList.add('loading');
+    txt.textContent = '…';
+    return;
+  }
+  const login = safety.login != null ? `#${safety.login}` : '';
+  if(safety.is_demo){
+    txt.classList.add('demo');
+    txt.textContent = `DEMO ${login}`;
+  } else if(safety.trade_mode === 1){
+    txt.classList.add('contest');
+    txt.textContent = `CONTEST ${login}`;
+  } else {
+    txt.classList.add('real');
+    txt.textContent = `REAL — TEST BLOCKED`;
+  }
+  // Update Auto-Test modal banner + account block (if modal exists / open).
+  const banner = document.getElementById('autoTestBanner');
+  if(banner){
+    banner.classList.remove('loading','demo','real','contest');
+    if(safety.is_demo){
+      banner.classList.add('demo');
+      banner.textContent = `Demo account verified: ${login}@${safety.server || '?'} · Auto-Test allowed`;
+    } else {
+      banner.classList.add(safety.trade_mode === 1 ? 'contest' : 'real');
+      banner.textContent = `Account is NOT demo — Auto-Test REFUSED`;
+    }
+  }
+  const set = (id,v) => { const el = document.getElementById(id); if(el) el.textContent = v; };
+  set('atLogin',  safety.login   != null ? safety.login   : '—');
+  set('atServer', safety.server  != null ? safety.server  : '—');
+  set('atMargin', safety.margin_mode === 0 ? 'NETTING' :
+                  safety.margin_mode === 2 ? 'HEDGING' : '—');
+  set('atHealthy', safety.healthy ? 'YES' : 'NO');
+  // START button is gated on DEMO + healthy
+  const startBtn = document.getElementById('atStart');
+  if(startBtn) startBtn.disabled = !(safety.is_demo && safety.healthy);
+}
+
+/* Refresh badge from the /ws frame so it stays current without re-fetching. */
+function updateAccountBadgeFromState(s){
+  if(!s || !s.account) return;
+  const a = s.account;
+  setAccountBadge({
+    login: a.login, server: a.server,
+    trade_mode: a.trade_mode,
+    is_demo: a.is_demo,
+    margin_mode: a.margin_mode,
+    healthy: !!s.healthy,
+  });
+}
+
+/* Fetched explicitly on page load + Auto-Test modal open (canonical source). */
+async function fetchAccountSafety(){
+  try {
+    const r = await fetch('/api/account/safety', {cache:'no-store'});
+    if(!r.ok) return null;
+    const s = await r.json();
+    setAccountBadge(s);
+    return s;
+  } catch(e){
+    setAccountBadge(null);
+    return null;
+  }
+}
+
+/* ============================================================================
+   AUTO-TEST MODAL WIRING  —  open/close/start/stop/download buttons + pill
+   ============================================================================ */
+function openAutoTestModal(){
+  const m = $('#autoTestModal'); if(!m) return;
+  m.hidden = false;
+  AutoTest._writeCfgToForm();
+  AutoTest._refreshStatusGrid();
+  fetchAccountSafety();          // refresh badge + gate
+}
+function closeAutoTestModal(){
+  const m = $('#autoTestModal'); if(!m) return;
+  m.hidden = true;
+}
+
+/* Pill helpers — control the compact topbar status indicator that's
+ * visible while a run is active. Hidden by default (HTML has `hidden`). */
+function showRunPill(){
+  const p = document.getElementById('atRunPill'); if(!p) return;
+  // Reset to default running colour (clear any previous verdict class).
+  p.classList.remove('pass','review','fail','ping');
+  p.hidden = false;
+  // Force a refresh of the pill text immediately so it doesn't show stale data.
+  AutoTest._refreshStatusGrid();
+}
+function hideRunPill(){
+  const p = document.getElementById('atRunPill'); if(!p) return;
+  p.hidden = true;
+  p.classList.remove('pass','review','fail','ping');
+}
+
+/* Flip the pill into a verdict colour + brief "ping" animation. Called from
+ * AutoTest._finish(). The pill stays visible behind the modal that the
+ * finish handler auto-opens; it's hidden when the modal is closed. */
+function setVerdictPill(verdictLabel){
+  const p = document.getElementById('atRunPill'); if(!p) return;
+  p.classList.remove('pass','review','fail');
+  const cls = verdictLabel === 'PASS' ? 'pass'
+            : verdictLabel === 'REVIEW' ? 'review' : 'fail';
+  p.classList.add(cls);
+  // Trigger the ping animation (remove + re-add for repeat-ability).
+  p.classList.remove('ping'); void p.offsetWidth; p.classList.add('ping');
+  // The phase cell already reads "idle"; surface the verdict label on the pill.
+  const phaseEl = document.getElementById('atRunPhase');
+  if(phaseEl) phaseEl.textContent = verdictLabel;
+}
+
+function downloadAuditJson(){
+  const audit = AutoTest._lastAudit;
+  if(!audit){ toast('info','No audit','Run an Auto-Test first'); return; }
+  const blob = new Blob([JSON.stringify(audit, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `autotest-${audit.run_id}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function bindAutoTest(){
+  const on = (id, ev, fn) => { const el = document.getElementById(id); if(el) el.addEventListener(ev, fn); };
+  on('autoTestBtn',     'click', openAutoTestModal);
+  on('autoTestClose',   'click', closeAutoTestModal);
+  on('atStart',         'click', () => AutoTest.start());
+  on('atStop',          'click', () => { AutoTest.stop('user clicked STOP'); closeAll(); });
+  on('atDownloadAudit', 'click', downloadAuditJson);
+  const modal = document.getElementById('autoTestModal');
+  if(modal) modal.addEventListener('click', e => {
+    if(e.target.id === 'autoTestModal'){
+      closeAutoTestModal();
+      // Closing the modal after a finished run also dismisses the pill so
+      // the topbar returns to its normal state. While a run is still active,
+      // the pill stays so the user can re-open via clicking it.
+      if(AutoTest.st.phase === 'idle') hideRunPill();
+    }
+  });
+
+  // Pill: clicking anywhere except the STOP button re-opens the modal.
+  // STOP button gets its own handler that aborts the run AND flattens.
+  const pill = document.getElementById('atRunPill');
+  if(pill) pill.addEventListener('click', e => {
+    if(e.target && e.target.id === 'atRunStop') return; // STOP handler below
+    openAutoTestModal();
+  });
+  on('atRunStop', 'click', e => {
+    e.stopPropagation();           // don't bubble to the pill click → open modal
+    AutoTest.stop('user clicked pill STOP');
+    closeAll();
+  });
 }
 
 /* ===================== BOOT (must be last) =====================

@@ -52,9 +52,32 @@
       <span class="clock-zone" id="clockZone">UTC</span>
     </div>
 
+    <!-- Account-type / connectivity indicator.
+         The badge text + class is driven by /api/account/safety so it accurately
+         reflects whether the connected MT5 account is DEMO / CONTEST / REAL.
+         The Auto-Test START button is gated on this badge resolving to .demo. -->
     <div class="conn" id="conn" title="Data feed">
       <span class="conn-dot" id="connDot"></span>
-      <span class="conn-text" id="connText">DEMO</span>
+      <span class="conn-text loading" id="connText">…</span>
+    </div>
+
+    <!-- Live UI ↔ broker sync chip. Always visible (not just during auto-test).
+         States: ok / pending / fail / external — see reconcileAutoTest in app.js -->
+    <div class="sync" id="syncChip" title="UI vs broker sync">
+      <span class="sync-dot" id="syncDot"></span>
+      <span class="sync-text" id="syncText">SYNC</span>
+    </div>
+
+    <button class="tb-btn" id="autoTestBtn" title="Open Auto-Test (demo only)">AUTO-TEST</button>
+
+    <!-- Compact running-status pill shown ONLY while an auto-test is active or
+         immediately after it completes. Click anywhere except STOP to re-open
+         the full Auto-Test modal. The pill itself is non-blocking — clicks
+         outside it pass through to the main UI normally. -->
+    <div class="atrun-pill" id="atRunPill" hidden>
+      <span class="atrun-phase" id="atRunPhase">idle</span>
+      <span class="atrun-progress" id="atRunProgress">0/0</span>
+      <button class="atrun-stop" id="atRunStop" type="button" title="Stop the auto-test">STOP</button>
     </div>
 
     <button class="tb-btn" id="themeBtn" title="Cycle theme (T)"><span id="themeName">Terminal</span></button>
@@ -281,6 +304,111 @@
     <div class="modal-foot">
       <button class="btn ghost" id="settingsReset">Reset</button>
       <button class="btn primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== AUTO-TEST MODAL =====================
+     Purpose: run an automated demo-account burst test that exercises the
+     EXACT order-placement path used by manual hotkeys (Space / Backspace / Esc),
+     in BOTH directions (Cycle A = LONG, Cycle B = SHORT), and verifies every
+     order is acknowledged by the broker via the live /ws feed.
+
+     SAFETY: refuses to run on a non-demo account. Three-layer guard:
+       (1) START button disabled when /api/account/safety.is_demo != true
+       (2) re-check inside AutoTest.start before each sub-cycle
+       (3) backend /order returns 403 for auto_test=true on non-demo accounts
+     See app.js: AutoTest, reconcileAutoTest, API.autoTestActive. -->
+<div class="modal" id="autoTestModal" hidden>
+  <div class="modal-card autotest-card">
+    <div class="modal-head">
+      <h2>Auto-Test (Demo Only)</h2>
+      <button class="modal-x" id="autoTestClose">✕</button>
+    </div>
+
+    <!-- Demo/Real banner — colour driven by safety probe; START is gated on this. -->
+    <div class="autotest-banner loading" id="autoTestBanner">
+      checking account…
+    </div>
+
+    <!-- Account summary. Each cell uses nested div blocks (not inline spans)
+         so the label-above-value layout never collapses to a single line,
+         regardless of which CSS rules cascade onto .modal-body. -->
+    <div class="autotest-acct" id="autoTestAcct">
+      <div class="kv"><div class="atk">Login</div>  <div class="atv" id="atLogin">—</div></div>
+      <div class="kv"><div class="atk">Server</div> <div class="atv" id="atServer">—</div></div>
+      <div class="kv"><div class="atk">Margin</div> <div class="atv" id="atMargin">—</div></div>
+      <div class="kv"><div class="atk">Healthy</div><div class="atv" id="atHealthy">—</div></div>
+    </div>
+
+    <div class="modal-body autotest-body">
+      <!-- Burst configuration. Defaults match the user's literal spec:
+           20 orders/sec × 5s burst = 100 orders per sub-cycle.
+           Lot is sourced ONLY from this field — the form's #lotInput is
+           ignored during the burst (bug #3 fix). SL/TP are forced to 0
+           on burst orders so nothing closes positions mid-burst except
+           the explicit closeAll. -->
+      <div class="set-row">
+        <label>Rate (orders/sec)</label>
+        <input id="atRate" type="number" min="1" max="50" step="1" value="20">
+      </div>
+      <div class="set-row">
+        <label>Burst count (per sub-cycle)</label>
+        <input id="atBurstCount" type="number" min="1" max="200" step="1" value="100">
+      </div>
+      <div class="set-row">
+        <label>Rest seconds (between A_CLOSE and B_OPEN)</label>
+        <input id="atRestSec" type="number" min="1" max="60" step="1" value="5">
+      </div>
+      <div class="set-row">
+        <label>Lot per order (overrides form input)</label>
+        <input id="atLot" type="number" min="0.01" step="0.01" value="0.01">
+      </div>
+      <div class="set-row">
+        <label>Trigger</label>
+        <select id="atTriggerMode">
+          <option value="wall_minute" selected>Next :00 wall-clock minute</option>
+          <option value="tf_bar_start">Next M1/M5/M15 bar start</option>
+          <option value="immediate">Immediate (smoke test)</option>
+        </select>
+      </div>
+      <div class="set-row">
+        <label>Max orders per run (hard cap)</label>
+        <input id="atMaxOrders" type="number" min="1" max="2000" step="1" value="500">
+      </div>
+      <div class="set-row">
+        <label>Consecutive-fail kill (abort + closeAll)</label>
+        <input id="atConsecFailKill" type="number" min="1" max="100" step="1" value="10">
+      </div>
+      <div class="set-row">
+        <label>In-flight cap (max pending sends)</label>
+        <input id="atInFlightCap" type="number" min="1" max="200" step="1" value="32">
+      </div>
+
+      <!-- Live status grid — refreshed from the existing /ws onState callback.
+           Nested div blocks (same rationale as the account block above). -->
+      <div class="autotest-status" id="autoTestStatus">
+        <div class="kv"><div class="atk">Phase</div>       <div class="atv" id="atPhase">idle</div></div>
+        <div class="kv"><div class="atk">Cycle</div>       <div class="atv" id="atCycle">—</div></div>
+        <div class="kv"><div class="atk">Sent</div>        <div class="atv" id="atSent">0</div></div>
+        <div class="kv"><div class="atk">OK</div>          <div class="atv ok" id="atOk">0</div></div>
+        <div class="kv"><div class="atk">Failed</div>      <div class="atv fail" id="atFailed">0</div></div>
+        <div class="kv"><div class="atk">Achieved /s</div> <div class="atv" id="atAchRate">0.0</div></div>
+        <div class="kv"><div class="atk">Confirmed</div>   <div class="atv" id="atConfirmed">0</div></div>
+        <div class="kv"><div class="atk">Lost</div>        <div class="atv fail" id="atLost">0</div></div>
+        <div class="kv"><div class="atk">Open (feed)</div> <div class="atv" id="atOpenCount">0</div></div>
+        <div class="kv"><div class="atk">Net lots</div>    <div class="atv" id="atNetLots">0.00</div></div>
+        <div class="kv"><div class="atk">Floating</div>    <div class="atv" id="atFloating">0.00</div></div>
+        <div class="kv"><div class="atk">SYNC</div>        <div class="atv" id="atSync">OK</div></div>
+      </div>
+
+      <div class="autotest-verdict" id="atVerdict" hidden></div>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn ghost" id="atDownloadAudit" hidden>Download last run (JSON)</button>
+      <button class="btn ghost" id="atStop">STOP</button>
+      <button class="btn primary" id="atStart" disabled>START</button>
     </div>
   </div>
 </div>

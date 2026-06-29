@@ -380,3 +380,186 @@ kbd{
   .metrics{grid-template-columns:1.4fr 1fr 1fr}
   .main{grid-template-columns:380px 1fr}
 }
+
+/* ============================================================
+   AUTO-TEST + ACCOUNT BADGE + SYNC CHIP
+   These additions cover the Demo Auto-Test feature (see app.js
+   AutoTest engine and reconcileAutoTest). All styling uses the
+   existing theme tokens so dark-terminal / dark-minimal / light
+   all work without per-theme rules.
+   ============================================================ */
+
+/* ---- Top-bar account badge (replaces the static "DEMO" text) ----
+   Class is set by app.js based on /api/account/safety:
+     .demo    → green   (safe for auto-test)
+     .real    → red     ("REAL — TEST BLOCKED")
+     .contest → yellow  (treated like real for safety)
+     .loading → grey    (probe in flight)                              */
+.conn-text{
+  font-family:var(--font-mono); font-size:11px; font-weight:700;
+  letter-spacing:.08em; padding:3px 8px; border-radius:4px;
+  border:1px solid var(--border-2); background:var(--panel-3);
+  color:var(--text-dim);
+}
+.conn-text.loading{color:var(--text-faint)}
+.conn-text.demo   {color:var(--good); border-color:var(--good); background:rgba(25,201,138,.10)}
+.conn-text.real   {color:var(--bad);  border-color:var(--bad);  background:rgba(255,77,82,.12)}
+.conn-text.contest{color:var(--warn); border-color:var(--warn); background:rgba(255,176,32,.10)}
+
+/* ---- Top-bar SYNC chip (always visible) ----
+   Driven by reconcileAutoTest() in app.js. Communicates whether the
+   UI's view of broker state matches reality:
+     .ok       → all good
+     .pending  → tickets placed > 1s ago, still within 5s grace
+     .fail     → tickets lost (>5s) or wrong-direction net_lots
+     .external → foreign-magic positions detected (warning, not fail)  */
+.sync{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:2px 8px; border-radius:4px;
+  border:1px solid var(--border-2); background:var(--panel-3);
+  font-family:var(--font-mono); font-size:11px; font-weight:700;
+  letter-spacing:.08em;
+}
+.sync-dot{width:7px; height:7px; border-radius:50%; background:var(--text-faint)}
+.sync.ok       .sync-dot{background:var(--good); box-shadow:0 0 6px var(--good)}
+.sync.pending  .sync-dot{background:var(--warn); box-shadow:0 0 6px var(--warn)}
+.sync.fail     .sync-dot{background:var(--bad);  box-shadow:0 0 6px var(--bad)}
+.sync.external .sync-dot{background:var(--warn); box-shadow:0 0 6px var(--warn)}
+.sync.ok       .sync-text{color:var(--good)}
+.sync.pending  .sync-text{color:var(--warn)}
+.sync.fail     .sync-text{color:var(--bad)}
+.sync.external .sync-text{color:var(--warn)}
+
+/* ---- Auto-Test modal layout ----
+   Reuses the existing .modal/.modal-card chrome from the settings modal.
+   .autotest-card is wider to fit the 12-cell status grid.                */
+.autotest-card{max-width:560px; width:96vw}
+
+/* ---- Demo/Real safety banner ----
+   Top of the Auto-Test modal — colour signals whether START is allowed.
+   Class toggled by app.js from the /api/account/safety probe.           */
+.autotest-banner{
+  margin:10px 14px 0; padding:10px 12px; border-radius:6px;
+  font-weight:700; font-size:12px; letter-spacing:.04em;
+  border:1px solid var(--border-2); text-align:center;
+}
+.autotest-banner.loading{color:var(--text-dim); background:var(--panel-3)}
+.autotest-banner.demo {color:var(--good); background:rgba(25,201,138,.10); border-color:var(--good)}
+.autotest-banner.real {color:var(--bad);  background:rgba(255,77,82,.12);  border-color:var(--bad)}
+.autotest-banner.contest{color:var(--warn); background:rgba(255,176,32,.10); border-color:var(--warn)}
+
+/* ---- Compact key/value rows shown in the modal (account summary + status) ----
+   Specificity is intentionally bumped via the .modal-body parent + !important
+   on the grid display so no ancestor rule (e.g. a .modal-body > div block layout)
+   can collapse the grid into a single column. We also force the cell to
+   display:block so the label always sits above the value, regardless of
+   container quirks. The HTML wraps each cell as <div class="kv"> with two
+   nested <div class="atk"/atv"> children — block flow does the right thing
+   even if the CSS file is partially cached or partially overridden. */
+.modal-body .autotest-acct,
+.modal-body .autotest-status,
+.autotest-acct,
+.autotest-status{
+  display:grid !important;
+  grid-template-columns:repeat(4, minmax(0, 1fr)) !important;
+  gap:10px; margin:10px 14px;
+  padding:10px; border:1px solid var(--border); border-radius:6px;
+  background:var(--panel-3); font-size:11px;
+}
+.modal-body .autotest-acct .kv,
+.modal-body .autotest-status .kv,
+.autotest-acct .kv,
+.autotest-status .kv{
+  display:block !important;
+  min-width:0;
+}
+.autotest-acct .atk,
+.autotest-status .atk{
+  display:block;
+  color:var(--text-faint); font-size:9px; font-weight:700;
+  letter-spacing:.08em; text-transform:uppercase;
+  margin-bottom:3px;
+}
+.autotest-acct .atv,
+.autotest-status .atv{
+  display:block;
+  font-family:var(--font-mono); font-variant-numeric:tabular-nums;
+  color:var(--text); font-size:12px;
+  overflow:hidden; white-space:nowrap; text-overflow:ellipsis;
+}
+.autotest-status .atv.ok  {color:var(--good)}
+.autotest-status .atv.fail{color:var(--bad)}
+
+/* Narrow screens (and the modal itself when modal-card max-width kicks in):
+   drop to 2 columns so cells stay readable. */
+@media (max-width:720px){
+  .modal-body .autotest-acct,
+  .modal-body .autotest-status,
+  .autotest-acct,
+  .autotest-status{
+    grid-template-columns:repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+/* ---- Final PASS / REVIEW / FAIL verdict block ----
+   Rendered into #atVerdict after a run finishes. Class controls colour.  */
+.autotest-verdict{
+  margin:10px 14px; padding:12px 14px; border-radius:6px;
+  font-family:var(--font-mono); font-size:13px; font-weight:700;
+  border:1px solid var(--border-2); white-space:pre-wrap;
+}
+.autotest-verdict.pass  {color:var(--good); background:rgba(25,201,138,.08); border-color:var(--good)}
+.autotest-verdict.review{color:var(--warn); background:rgba(255,176,32,.08); border-color:var(--warn)}
+.autotest-verdict.fail  {color:var(--bad);  background:rgba(255,77,82,.08);  border-color:var(--bad)}
+
+/* ---- AUTO-TEST top-bar button ----
+   Same look as the existing .tb-btn (themeBtn / settingsBtn); just
+   slightly bolder so it reads as a deliberate, separate control.        */
+#autoTestBtn{font-weight:700; letter-spacing:.06em}
+
+/* ---- Topbar running-status pill (.atrun-pill) ----
+   Shown ONLY while an auto-test run is active OR for the brief verdict
+   flash after _finish(). Click anywhere except the STOP button re-opens
+   the modal. The pill is `inline-flex` and `pointer-events:auto` on itself
+   only — its presence does NOT block clicks on anything else on the page.
+
+   Colour states (toggled by JS):
+     default → orange/accent (running)
+     .pass   → green
+     .review → yellow
+     .fail   → red
+*/
+.atrun-pill{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:3px 4px 3px 10px; margin-left:4px;
+  border:1px solid var(--accent); border-radius:14px;
+  background:rgba(255,176,32,.10);
+  font-family:var(--font-mono); font-size:11px; font-weight:700;
+  letter-spacing:.06em; color:var(--accent);
+  cursor:pointer; user-select:none;
+  transition:background var(--speed), border-color var(--speed), color var(--speed);
+}
+.atrun-pill:hover{background:rgba(255,176,32,.18)}
+.atrun-pill.pass  {color:var(--good); border-color:var(--good); background:rgba(25,201,138,.10)}
+.atrun-pill.review{color:var(--warn); border-color:var(--warn); background:rgba(255,176,32,.14)}
+.atrun-pill.fail  {color:var(--bad);  border-color:var(--bad);  background:rgba(255,77,82,.12)}
+.atrun-pill .atrun-phase{
+  font-weight:700; text-transform:uppercase;
+  max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.atrun-pill .atrun-progress{
+  color:var(--text-dim); font-weight:600;
+}
+.atrun-pill .atrun-stop{
+  background:var(--bad); color:#fff; border:none; border-radius:10px;
+  padding:2px 8px; font:700 10px var(--font-mono);
+  letter-spacing:.08em; cursor:pointer;
+}
+.atrun-pill .atrun-stop:hover{filter:brightness(1.15)}
+/* Brief visual ping when the pill first turns to a verdict colour. */
+@keyframes atrun-ping{
+  0%   {transform:scale(1);   box-shadow:0 0 0 0   rgba(255,176,32,.45)}
+  60%  {transform:scale(1.08); box-shadow:0 0 0 8px rgba(255,176,32,0)}
+  100% {transform:scale(1);   box-shadow:0 0 0 0   rgba(255,176,32,0)}
+}
+.atrun-pill.ping{animation:atrun-ping .9s ease-out 1}

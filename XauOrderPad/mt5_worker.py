@@ -169,6 +169,11 @@ class Mt5Worker:
                                  "margin_mode": int(acc.margin_mode),     # 0=netting 2=hedging
                                  **self._stats}
 
+            # `magic` is exposed so the Auto-Test sync verifier can distinguish
+            # positions opened by THIS APP (magic == config.MAGIC) from positions
+            # opened elsewhere (e.g. user clicking BUY in the MT5 desktop terminal,
+            # or another EA). Without this field, the verifier cannot detect
+            # foreign interference during an auto-test run.
             positions = mt5.positions_get(symbol=self._symbol) or []
             pos_list = []
             net = 0.0
@@ -183,6 +188,7 @@ class Mt5Worker:
                     "volume": p.volume, "price_open": p.price_open,
                     "sl": p.sl, "tp": p.tp, "profit": p.profit,
                     "time": p.time,
+                    "magic": int(p.magic),          # for Auto-Test foreign-magic detection
                 })
             st["positions"] = pos_list
 

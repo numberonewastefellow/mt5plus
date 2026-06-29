@@ -50,7 +50,14 @@ class OrderReq(BaseModel):
 
 
 class PlaceReq(BaseModel):
-    """Unified order request used by the new UI (market or limit)."""
+    """Unified order request used by the new UI (market or limit).
+
+    The `auto_test` flag is set TRUE by the browser ONLY while the Auto-Test
+    burst engine is running. The /order handler refuses requests with this flag
+    on any non-demo account (defense-in-depth backend guard that survives JS
+    bugs, console exec, forged curl, or a swapped MT5 login mid-session).
+    Manual orders from the UI never carry this flag, so they behave unchanged.
+    """
     symbol: str | None = None
     side: str
     volume: float | None = None
@@ -58,6 +65,7 @@ class PlaceReq(BaseModel):
     price: float | None = None
     sl: float | None = None
     tp: float | None = None
+    auto_test: bool = False     # Auto-Test → backend demo-only guard (see /order)
 
 
 class CloseReq(BaseModel):
@@ -73,6 +81,28 @@ def _check_token(token: str | None) -> None:
 @app.get("/api/state")
 def get_state():
     return worker.get_state()
+
+
+@app.get("/api/account/safety")
+def account_safety():
+    """Lightweight endpoint the UI calls BEFORE enabling Auto-Test.
+
+    Returns just the fields the browser needs to make the demo/real decision —
+    deliberately minimal so the UI doesn't have to scrape /api/state. Mirrors
+    the account block from worker.get_state(); kept thin so the safety check
+    on the START button doesn't pull positions, stats, ticks, etc.
+    """
+    st = worker.get_state()
+    acc = st.get("account") or {}
+    return {
+        "connected": bool(st.get("connected")),
+        "healthy": bool(st.get("healthy")),
+        "login": acc.get("login"),
+        "server": acc.get("server"),
+        "trade_mode": acc.get("trade_mode"),     # 0=demo 1=contest 2=real (MT5 enum)
+        "is_demo": bool(acc.get("is_demo")),
+        "margin_mode": acc.get("margin_mode"),   # 0=netting 2=hedging
+    }
 
 
 async def _do(cmd: dict):
@@ -96,8 +126,32 @@ async def sell(req: OrderReq, x_token: str | None = Header(default=None)):
 
 @app.post("/order")
 async def order(req: PlaceReq, x_token: str | None = Header(default=None)):
-    """Unified market/limit order endpoint for the new UI."""
+    """Unified market/limit order endpoint for the new UI.
+
+    Demo-only guard: when `req.auto_test` is True, this handler refuses (403)
+    unless the connected MT5 account is a demo account. This is the deepest
+    safety layer for the Auto-Test feature -- it survives JS bugs, console
+    exec, forged curl requests, or a swapped MT5 login between page-load and
+    order-send. The flag is set ONLY by the browser's AutoTest engine; manual
+    orders never carry it and bypass the check entirely.
+    """
     _check_token(x_token)
+
+    # Auto-Test live-account guard. Must fire BEFORE the order is submitted.
+    if req.auto_test:
+        st = worker.get_state()
+        acc = st.get("account") or {}
+        if not bool(acc.get("is_demo")):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "auto_test orders refused: connected account is not a demo "
+                    f"account (login={acc.get('login')!r}, "
+                    f"server={acc.get('server')!r}, "
+                    f"trade_mode={acc.get('trade_mode')!r})"
+                ),
+            )
+
     res = await _do({"action": "order", **req.model_dump()})
     if not res.get("ok"):
         detail = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"

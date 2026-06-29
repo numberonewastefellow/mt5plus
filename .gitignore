@@ -4,3 +4,7 @@ config.js
 .venv/
 __pycache__/
 *.pyc
+
+# XauOrderPad Auto-Test audit logs (browser-downloaded by default; the dir
+# only appears if the optional backend persist endpoint is ever wired up).
+XauOrderPad/audit/

@@ -53,6 +53,71 @@ cd /d d:\llm\ios\mt5plus\XauOrderPad
 
 (Buttons do the same. Keys only work while the page/tab is focused.)
 
+## Auto-Test (demo only)
+
+**Auto-Test** runs an automated stress test that exercises the exact order path
+your hotkeys use, in both directions:
+
+> **Cycle A (LONG):** arm BUY → burst N orders/sec for M seconds → rest → close all → wait flat
+> **Cycle B (SHORT):** arm SELL → burst N orders/sec for M seconds → rest → close all → wait flat
+> Then a final safety `closeAll()` and a **PASS / REVIEW / FAIL** verdict.
+
+Goal: prove the order placement path and the live position feed are correct
+under burst load **before** you trade real money.
+
+### Three layers of demo-only protection
+
+1. **UI gate** — the `AUTO-TEST` top-bar button shows `DEMO #login` (green) /
+   `REAL — TEST BLOCKED` (red); START is disabled unless the account is demo.
+2. **Engine re-check** — the engine re-verifies the account is demo before
+   every sub-cycle; flips abort + closeAll if it changes mid-run.
+3. **Backend guard** — `/order` returns **HTTP 403** for any request carrying
+   `auto_test:true` on a non-demo account. This survives JS bugs, console
+   exec, forged `curl`, or a swapped MT5 login mid-session.
+
+### How to run
+
+1. Make sure you are logged into your **Exness demo** account in MT5 and
+   AutoTrading is on. Open the panel — the badge should read **DEMO #login** in green.
+2. Click **AUTO-TEST** in the top bar to open the panel.
+3. Confirm the green banner says **"Demo account verified"**. Set:
+   - **Rate** (orders/sec): start at **5/s** for the first run to verify
+     plumbing; bump to your target (e.g. 20/s) once a PASS is achieved.
+   - **Burst count** per sub-cycle: **20** for first run; **100** to reproduce
+     the literal "20/s × 5s" spec.
+   - **Rest seconds**: 5 (range 1–60).
+   - **Lot per order**: **0.01** for first run. *Overrides the form input.*
+   - **Trigger**: default `Next :00 wall-clock minute` (always within 60s).
+   - **In-flight cap / Consec-fail kill**: leave defaults.
+4. Click **START** → a confirm dialog summarises the run; OK to proceed.
+5. Watch the live status grid + the SYNC chip in the top bar. After the run
+   finishes, the **PASS / REVIEW / FAIL** verdict appears. Click
+   **Download last run (JSON)** to save an audit log for review.
+
+### Stopping early
+
+- Click **STOP** in the panel.
+- **Esc** anywhere (when no input is focused) — also triggers abort + `closeAll`.
+- Closing the browser tab — the server will retain any positions left open;
+  re-open the panel and click **CLOSE ALL** (or press Esc) to flatten.
+
+### Verdict criteria
+
+| Verdict | Meaning |
+|---|---|
+| **PASS** | ≥95% orders ok, every ticket appeared in the feed within 1s, sync green throughout, broker reached flat within 5s of each closeAll, achieved rate within ±20% of requested. **Required before real money.** |
+| **REVIEW** | All sub-cycles reached flat, but: some rejections, achieved rate < 50% of requested, transient sync delays, or notable retcodes. Open the audit JSON and read the cycle stats. |
+| **FAIL** | Flat NOT reached (positions stranded), tickets lost (never confirmed in feed), wrong-direction `net_lots` during burst, kill-switch tripped, account became non-demo mid-run, or backend 403. **Do NOT proceed to real money until you understand why and have a PASS run.** |
+
+### SYNC chip states (top bar — visible at all times)
+
+| State | Meaning |
+|---|---|
+| `SYNC OK` | All placed tickets confirmed; no foreign positions on the symbol. |
+| `PENDING n` | n tickets > 1s without feed confirmation (still within 5s grace). |
+| `EXTERNAL n` | n positions visible with a magic other than this app's — warning that you (or another EA) opened positions outside the order pad. Not a test FAIL. |
+| `LOST n` | n tickets > 5s without feed confirmation. Auto-Test verdict cannot be PASS. |
+
 ## Common issues
 
 | Symptom | Fix |
