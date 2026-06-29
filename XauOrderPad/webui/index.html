@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark-terminal">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MT5 Terminal</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="terminal" id="terminal">
+
+  <!-- ===================== TOP BAR ===================== -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">⌁</span>
+      <span class="brand-name">MT5<span class="brand-sub">TERMINAL</span></span>
+    </div>
+
+    <div class="tb-group symbol-group">
+      <label class="tb-label">SYM</label>
+      <select id="symbolSelect" class="tb-select sym-select"></select>
+    </div>
+
+    <div class="tb-group">
+      <label class="tb-label">TF</label>
+      <select id="tfSelect" class="tb-select">
+        <option value="1">M1</option>
+        <option value="5">M5</option>
+        <option value="15" selected>M15</option>
+        <option value="30">M30</option>
+        <option value="60">H1</option>
+        <option value="240">H4</option>
+      </select>
+    </div>
+
+    <!-- candle timer -->
+    <div class="candle">
+      <div class="candle-head">
+        <span class="candle-tf" id="candleTfLabel">M15</span>
+        <span class="candle-elapsed" id="candleElapsed">00:00</span>
+        <span class="candle-sep">elapsed</span>
+        <span class="candle-left" id="candleLeft">15:00</span>
+        <span class="candle-sep">left</span>
+      </div>
+      <div class="candle-bar"><div class="candle-fill" id="candleFill"></div></div>
+    </div>
+
+    <div class="tb-spacer"></div>
+
+    <div class="clock">
+      <span class="clock-time" id="clock">--:--:--</span>
+      <span class="clock-zone" id="clockZone">UTC</span>
+    </div>
+
+    <div class="conn" id="conn" title="Data feed">
+      <span class="conn-dot" id="connDot"></span>
+      <span class="conn-text" id="connText">DEMO</span>
+    </div>
+
+    <button class="tb-btn" id="themeBtn" title="Cycle theme (T)"><span id="themeName">Terminal</span></button>
+    <button class="tb-btn icon" id="settingsBtn" title="Settings">⚙</button>
+  </header>
+
+  <!-- ===================== BOOK BAR + METRICS STRIP ===================== -->
+  <section class="topstrip" id="topstrip">
+    <div class="sym-bar" id="symBar"></div>
+    <div class="metrics">
+    <div class="metric metric-hero" id="floatCard">
+      <span class="metric-label">FLOATING P&amp;L</span>
+      <span class="metric-value big" id="floatingPnl">0.00</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">DAILY REALIZED</span>
+      <span class="metric-value" id="dailyPnl">0.00</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">WIN / LOSS</span>
+      <span class="metric-value" id="winLoss">0 / 0</span>
+      <span class="metric-foot" id="winRate">0% wr</span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">EQUITY</span>
+      <span class="metric-value" id="equity">0.00</span>
+      <span class="metric-foot">bal <span id="balance">0.00</span></span>
+    </div>
+    <div class="metric">
+      <span class="metric-label">OPEN</span>
+      <span class="metric-value" id="openCount">0</span>
+      <span class="metric-foot"><span id="lotSum">0.00</span> lots</span>
+    </div>
+    </div>
+  </section>
+
+  <!-- ===================== MAIN ===================== -->
+  <main class="main">
+
+    <!-- ORDER FORM -->
+    <section class="order" id="orderForm" data-armed="buy">
+      <div class="order-arm" id="armedBanner">
+        <span class="arm-dot"></span><span id="armedText">LONG · BUY ARMED</span>
+      </div>
+
+      <div class="quote">
+        <button class="quote-cell sell" id="bidCell" data-side="sell">
+          <span class="quote-tag">BID · SELL</span>
+          <span class="quote-price" id="bidPrice">--</span>
+        </button>
+        <div class="quote-mid">
+          <span class="spread-label">SPREAD</span>
+          <span class="spread-val" id="spread">--</span>
+        </div>
+        <button class="quote-cell buy" id="askCell" data-side="buy">
+          <span class="quote-tag">ASK · BUY</span>
+          <span class="quote-price" id="askPrice">--</span>
+        </button>
+      </div>
+
+      <div class="field lot-field">
+        <label class="field-label">LOT SIZE</label>
+        <div class="stepper">
+          <button class="step-btn" id="lotDown" tabindex="-1">–</button>
+          <input class="step-input" id="lotInput" inputmode="decimal" value="0.10">
+          <button class="step-btn" id="lotUp" tabindex="-1">+</button>
+        </div>
+        <div class="lot-quick">
+          <span class="hint-key">1–9</span> set · <span class="hint-key">+ / −</span> step
+        </div>
+      </div>
+
+      <div class="field type-field">
+        <label class="field-label">ORDER TYPE</label>
+        <div class="segment">
+          <button class="seg-btn active" id="typeMarket" data-type="market">MARKET</button>
+          <button class="seg-btn" id="typeLimit" data-type="limit">LIMIT</button>
+        </div>
+      </div>
+
+      <div class="field limit-field" id="limitWrap" hidden>
+        <label class="field-label">LIMIT PRICE</label>
+        <input class="text-input" id="limitPrice" inputmode="decimal" placeholder="0.00000">
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label class="field-label">STOP LOSS <span class="unit">pts</span></label>
+          <input class="text-input" id="slInput" inputmode="numeric" placeholder="0">
+          <span class="price-preview" id="slPreview">—</span>
+        </div>
+        <div class="field">
+          <label class="field-label">TAKE PROFIT <span class="unit">pts</span></label>
+          <input class="text-input" id="tpInput" inputmode="numeric" placeholder="0">
+          <span class="price-preview" id="tpPreview">—</span>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="act-btn sell-btn" id="sellBtn">
+          <span class="act-key">⌫</span>
+          <span class="act-main" id="sellMain">SELL</span>
+          <span class="act-sub" id="sellSub">--</span>
+        </button>
+        <button class="act-btn buy-btn" id="buyBtn">
+          <span class="act-key">␣</span>
+          <span class="act-main" id="buyMain">BUY</span>
+          <span class="act-sub" id="buySub">--</span>
+        </button>
+      </div>
+      <div class="place-hint" id="placeHint"><span class="hint-key">␣ Space</span> buy now · <span class="hint-key">⌫ Backspace</span> sell now — instant market</div>
+    </section>
+
+    <!-- POSITIONS -->
+    <section class="positions">
+      <div class="panel-head">
+        <span class="panel-title">OPEN POSITIONS</span>
+        <span class="panel-meta">total <span id="posTotal" class="num">0.00</span></span>
+      </div>
+      <div class="grid-wrap">
+        <table class="grid">
+          <thead>
+            <tr>
+              <th>SIDE</th><th class="r">LOT</th><th class="r">ENTRY</th>
+              <th class="r">CURRENT</th><th class="r">SL</th><th class="r">TP</th>
+              <th class="r">P&amp;L</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="positionsBody"></tbody>
+        </table>
+        <div class="empty" id="posEmpty">No open positions — arm a side and fire.</div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===================== EXECUTION LOG ===================== -->
+  <section class="log">
+    <div class="panel-head">
+      <span class="panel-title">EXECUTION LOG</span>
+      <span class="panel-meta">last fills &amp; events</span>
+    </div>
+    <div class="log-wrap"><div id="logBody" class="log-body"></div></div>
+  </section>
+
+  <!-- ===================== HOTKEY LEGEND ===================== -->
+  <footer class="legend" id="legend">
+    <span class="lg"><kbd>B</kbd> arm buy</span>
+    <span class="lg"><kbd>S</kbd> arm sell</span>
+    <span class="lg"><kbd>Space</kbd> buy now</span>
+    <span class="lg"><kbd>⌫</kbd> sell now</span>
+    <span class="lg"><kbd>M</kbd> market/limit</span>
+    <span class="lg"><kbd>+ −</kbd> lot</span>
+    <span class="lg"><kbd>1–9</kbd> set lot</span>
+    <span class="lg danger"><kbd>Esc</kbd> close all</span>
+    <span class="lg danger"><kbd>Del</kbd> close last</span>
+    <span class="lg"><kbd>T</kbd> theme</span>
+  </footer>
+</div>
+
+<!-- ===================== TOASTS ===================== -->
+<div class="toasts" id="toasts"></div>
+
+<!-- ===================== SETTINGS MODAL ===================== -->
+<div class="modal" id="settingsModal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Settings</h2>
+      <button class="modal-x" id="settingsClose">✕</button>
+    </div>
+    <div class="modal-tabs">
+      <button class="mtab active" data-tab="defaults">Defaults</button>
+      <button class="mtab" data-tab="behavior">Behavior</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="tabpane active" data-pane="defaults">
+        <div class="set-row">
+          <label>Default lot size</label>
+          <input id="setDefaultLot" inputmode="decimal" value="0.10">
+        </div>
+        <div class="set-row">
+          <label>Lot step (+ / − &amp; digits)</label>
+          <input id="setLotStep" inputmode="decimal" value="0.01">
+        </div>
+        <div class="set-row">
+          <label>Default Stop Loss <span class="unit">pts</span></label>
+          <input id="setDefaultSl" inputmode="numeric" value="200">
+        </div>
+        <div class="set-row">
+          <label>Default Take Profit <span class="unit">pts</span></label>
+          <input id="setDefaultTp" inputmode="numeric" value="400">
+        </div>
+        <div class="set-row">
+          <label>Max lot (safety cap)</label>
+          <input id="setMaxLot" inputmode="decimal" value="50">
+        </div>
+      </div>
+
+      <div class="tabpane" data-pane="behavior">
+        <div class="set-row toggle">
+          <label>Sound on fill</label>
+          <input type="checkbox" id="setSound" checked>
+        </div>
+        <div class="set-row toggle">
+          <label>Confirm "close all"</label>
+          <input type="checkbox" id="setConfirmClose">
+        </div>
+        <div class="set-row toggle">
+          <label>Auto-apply default SL / TP to new orders</label>
+          <input type="checkbox" id="setAutoSltp" checked>
+        </div>
+        <div class="set-row toggle">
+          <label>Netting — opposite order closes existing first (no auto-reverse)</label>
+          <input type="checkbox" id="setNetting" checked>
+        </div>
+        <div class="set-note">
+          Order keys: <kbd>B</kbd>/<kbd>S</kbd> arm direction &amp; recolor the form ·
+          <kbd>Space</kbd>/<kbd>⌫</kbd> fire market buy/sell instantly ·
+          <kbd>Enter</kbd> places in the armed direction.
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn ghost" id="settingsReset">Reset</button>
+      <button class="btn primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js" defer></script>
+</body>
+</html>

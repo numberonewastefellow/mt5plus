@@ -25,6 +25,7 @@ import config
 from mt5_worker import Mt5Worker
 
 STATIC_DIR = Path(__file__).parent / "static"
+WEBUI_DIR = Path(__file__).parent / "webui"
 
 worker = Mt5Worker()
 
@@ -46,6 +47,22 @@ class OrderReq(BaseModel):
     sl: float | None = None
     tp: float | None = None
     sl_tp_mode: str | None = None
+
+
+class PlaceReq(BaseModel):
+    """Unified order request used by the new UI (market or limit)."""
+    symbol: str | None = None
+    side: str
+    volume: float | None = None
+    type: str | None = "market"
+    price: float | None = None
+    sl: float | None = None
+    tp: float | None = None
+
+
+class CloseReq(BaseModel):
+    ticket: int
+    volume: float | None = None
 
 
 def _check_token(token: str | None) -> None:
@@ -77,6 +94,29 @@ async def sell(req: OrderReq, x_token: str | None = Header(default=None)):
     return JSONResponse(await _do(cmd))
 
 
+@app.post("/order")
+async def order(req: PlaceReq, x_token: str | None = Header(default=None)):
+    """Unified market/limit order endpoint for the new UI."""
+    _check_token(x_token)
+    res = await _do({"action": "order", **req.model_dump()})
+    if not res.get("ok"):
+        detail = res.get("error") or res.get("comment") or f"retcode {res.get('retcode')}"
+        raise HTTPException(status_code=400, detail=detail)
+    return {"ticket": res.get("ticket"), "price": res.get("price"),
+            "state": res.get("state", "open")}
+
+
+@app.post("/close")
+async def close(req: CloseReq, x_token: str | None = Header(default=None)):
+    """Close (full/partial) a position by ticket, or cancel a pending order."""
+    _check_token(x_token)
+    res = await _do({"action": "close", "ticket": req.ticket, "volume": req.volume})
+    if not res.get("ok"):
+        detail = res.get("error") or res.get("comment") or "close failed"
+        raise HTTPException(status_code=400, detail=detail)
+    return res
+
+
 @app.post("/close_all")
 async def close_all(x_token: str | None = Header(default=None)):
     _check_token(x_token)
@@ -98,8 +138,11 @@ async def ws(websocket: WebSocket):
             await websocket.close()
 
 
-# Mount the UI last so the API routes above take precedence.
-app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+# Mount UIs last so the API routes above take precedence. The old simple panel
+# stays at /legacy; the new terminal UI is served at /. ("/legacy" must be
+# registered before "/" so it is not swallowed by the root mount.)
+app.mount("/legacy", StaticFiles(directory=str(STATIC_DIR), html=True), name="legacy")
+app.mount("/", StaticFiles(directory=str(WEBUI_DIR), html=True), name="webui")
 
 
 if __name__ == "__main__":

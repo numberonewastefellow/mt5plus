@@ -8,6 +8,7 @@ ticks and orders never race and state can never half-update.
 
 from __future__ import annotations
 
+import datetime
 import queue
 import threading
 import time
@@ -43,6 +44,8 @@ class Mt5Worker:
         self._stop = threading.Event()
         self._symbol = config.SYMBOL
         self._initialized = False
+        self._poll_count = 0
+        self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
         self._thread = threading.Thread(target=self._run, name="mt5-worker",
                                         daemon=True)
 
@@ -153,10 +156,18 @@ class Mt5Worker:
                 st["bid"] = tick.bid
                 st["ask"] = tick.ask
                 st["spread"] = round((tick.ask - tick.bid), 6)
+            # account stats (daily realized / wins / losses) are heavy -> ~1 Hz
+            self._poll_count += 1
+            if self._poll_count % max(1, config.POLL_HZ) == 1:
+                self._stats = self._compute_stats()
             if acc is not None:
                 st["account"] = {"balance": acc.balance, "equity": acc.equity,
                                  "currency": acc.currency, "login": acc.login,
-                                 "server": acc.server}
+                                 "server": acc.server,
+                                 "trade_mode": int(acc.trade_mode),       # 0=demo 1=contest 2=real
+                                 "is_demo": int(acc.trade_mode) != 2,
+                                 "margin_mode": int(acc.margin_mode),     # 0=netting 2=hedging
+                                 **self._stats}
 
             positions = mt5.positions_get(symbol=self._symbol) or []
             pos_list = []
@@ -171,12 +182,39 @@ class Mt5Worker:
                     "side": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
                     "volume": p.volume, "price_open": p.price_open,
                     "sl": p.sl, "tp": p.tp, "profit": p.profit,
+                    "time": p.time,
                 })
             st["positions"] = pos_list
+
+            orders = mt5.orders_get(symbol=self._symbol) or []
+            buy_types = (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT,
+                         mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_BUY_STOP_LIMIT)
+            ord_list = []
+            for o in orders:
+                ord_list.append({
+                    "ticket": o.ticket,
+                    "side": "BUY" if o.type in buy_types else "SELL",
+                    "volume": o.volume_current, "price_open": o.price_open,
+                    "sl": o.sl, "tp": o.tp, "type": "limit", "time": o.time_setup,
+                })
+            st["orders"] = ord_list
+
             st["net_lots"] = round(net, 4)
             st["floating_pl"] = round(pl, 2)
             st["healthy"] = bool(st["connected"] and trade_allowed and symbol_ok)
-            st["error"] = None
+            # Specific, actionable reason when not healthy (shown in the UI banner).
+            if st["healthy"]:
+                st["error"] = None
+            elif not st["connected"]:
+                st["error"] = "terminal not connected to broker"
+            elif not symbol_ok:
+                st["error"] = f"{self._symbol} not available in Market Watch"
+            elif ti is not None and not ti.trade_allowed:
+                st["error"] = "AutoTrading is OFF in MT5 — press Ctrl+E to enable"
+            elif si is not None and si.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
+                st["error"] = "market closed / symbol not tradable right now"
+            else:
+                st["error"] = "trading not allowed"
         except Exception as exc:
             st.update(connected=False, healthy=False, error=f"poll error: {exc}")
         self._swap(st)
@@ -190,9 +228,147 @@ class Mt5Worker:
         action = cmd.get("action")
         if action in ("buy", "sell"):
             return self._market_order(cmd)
+        if action == "order":
+            return self._place_order(cmd)
+        if action == "close":
+            return self._close_ticket(cmd.get("ticket"), cmd.get("volume"))
         if action == "close_all":
             return self._close_all()
         return {"ok": False, "error": f"unknown action {action!r}"}
+
+    def _place_order(self, cmd: dict) -> dict:
+        """Unified entry for the new UI: market or pending(limit)."""
+        typ = (cmd.get("type") or "market").lower()
+        side = (cmd.get("side") or "").lower()
+        if side not in ("buy", "sell"):
+            return {"ok": False, "error": f"bad side {side!r}"}
+        if typ == "limit":
+            return self._pending_order(cmd, side)
+        return self._market_order({
+            "action": side, "volume": cmd.get("volume"),
+            "sl": cmd.get("sl"), "tp": cmd.get("tp"), "sl_tp_mode": "points",
+        })
+
+    def _pending_order(self, cmd: dict, side: str) -> dict:
+        if not self._ensure_connected():
+            return {"ok": False, "error": "terminal not connected"}
+        si = mt5.symbol_info(self._symbol)
+        tick = mt5.symbol_info_tick(self._symbol)
+        if si is None or tick is None:
+            return {"ok": False, "error": f"symbol {self._symbol} unavailable"}
+        price = float(cmd.get("price") or 0)
+        if price <= 0:
+            return {"ok": False, "error": "limit price required"}
+
+        is_buy = side == "buy"
+        otype = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
+        volume = float(cmd.get("volume") or config.DEFAULT_VOLUME)
+        # SL/TP points are measured from the pending (limit) price, not market.
+        sl_price, tp_price = self._sl_tp_prices(
+            {"sl": cmd.get("sl"), "tp": cmd.get("tp"), "sl_tp_mode": "points"},
+            si, is_buy, round(price, si.digits))
+
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": self._symbol,
+            "volume": volume,
+            "type": otype,
+            "price": round(price, si.digits),
+            "magic": int(config.MAGIC),
+            "comment": "XauOrderPad limit",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+        if sl_price:
+            request["sl"] = sl_price
+        if tp_price:
+            request["tp"] = tp_price
+
+        res = mt5.order_send(request)
+        if res is None:
+            code, msg = mt5.last_error()
+            return {"ok": False, "error": f"order_send failed ({code}: {msg})"}
+        ok = res.retcode == mt5.TRADE_RETCODE_DONE
+        return {
+            "ok": ok, "retcode": res.retcode, "comment": res.comment,
+            "ticket": getattr(res, "order", 0), "price": round(price, si.digits),
+            "volume": volume, "side": side.upper(), "state": "pending",
+            "sl": sl_price, "tp": tp_price,
+        }
+
+    def _close_ticket(self, ticket, volume=None) -> dict:
+        if not self._ensure_connected():
+            return {"ok": False, "error": "terminal not connected"}
+        if ticket is None:
+            return {"ok": False, "error": "ticket required"}
+        ticket = int(ticket)
+
+        poss = mt5.positions_get(ticket=ticket)
+        if poss:
+            p = poss[0]
+            if volume and 0 < float(volume) < p.volume:
+                return self._close_partial(p, float(volume))
+            return self._close_one(p)
+
+        # not a position -> maybe a pending order to cancel
+        orders = mt5.orders_get(ticket=ticket)
+        if orders:
+            res = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": ticket})
+            if res is None:
+                code, msg = mt5.last_error()
+                return {"ok": False, "ticket": ticket, "error": f"{code}: {msg}"}
+            return {"ok": res.retcode == mt5.TRADE_RETCODE_DONE, "ticket": ticket,
+                    "retcode": res.retcode, "comment": res.comment, "cancelled": True}
+        return {"ok": False, "ticket": ticket, "error": "ticket not found"}
+
+    def _close_partial(self, p, volume: float) -> dict:
+        si = mt5.symbol_info(self._symbol)
+        tick = mt5.symbol_info_tick(self._symbol)
+        is_buy = p.type == mt5.POSITION_TYPE_BUY
+        otype = mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY
+        price = tick.bid if is_buy else tick.ask
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self._symbol,
+            "volume": round(volume, 2),
+            "type": otype,
+            "position": p.ticket,
+            "price": price,
+            "deviation": int(config.DEFAULT_DEVIATION),
+            "magic": int(config.MAGIC),
+            "comment": "XauOrderPad partial",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": _pick_filling(si),
+        }
+        res = mt5.order_send(request)
+        if res is None:
+            code, msg = mt5.last_error()
+            return {"ok": False, "ticket": p.ticket, "error": f"{code}: {msg}"}
+        return {"ok": res.retcode == mt5.TRADE_RETCODE_DONE, "ticket": p.ticket,
+                "retcode": res.retcode, "comment": res.comment, "volume": volume}
+
+    def _compute_stats(self) -> dict:
+        """Today's realized P/L + win/loss counts from closing deals."""
+        try:
+            now = datetime.datetime.now()
+            start = datetime.datetime(now.year, now.month, now.day)
+            deals = mt5.history_deals_get(start, now) or []
+            out_entries = (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT,
+                           mt5.DEAL_ENTRY_OUT_BY)
+            realized = 0.0
+            wins = losses = 0
+            for d in deals:
+                if d.entry not in out_entries:
+                    continue
+                realized += d.profit + d.swap + d.commission
+                if d.profit > 0:
+                    wins += 1
+                elif d.profit < 0:
+                    losses += 1
+            return {"daily_realized": round(realized, 2), "wins": wins,
+                    "losses": losses}
+        except Exception:
+            return {"daily_realized": 0.0, "wins": 0, "losses": 0}
 
     def _market_order(self, cmd: dict) -> dict:
         if not self._ensure_connected():
