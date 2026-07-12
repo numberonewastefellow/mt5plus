@@ -33,6 +33,7 @@ import com.xauorderpad.ui.LoginScreen
 import com.xauorderpad.ui.Screen
 import com.xauorderpad.ui.TradeScreen
 import com.xauorderpad.ui.TradingViewModel
+import kotlinx.serialization.json.JsonObject
 
 class MainActivity : ComponentActivity() {
 
@@ -84,6 +85,7 @@ class MainActivity : ComponentActivity() {
                 val profiles by vm.profiles.collectAsStateWithLifecycle()
                 val confirmCloses by vm.confirmCloses.collectAsStateWithLifecycle()
                 val live by vm.live.collectAsStateWithLifecycle()
+                val strategies by vm.strategies.collectAsStateWithLifecycle()
 
                 val snackbar = remember { SnackbarHostState() }
 
@@ -145,6 +147,8 @@ class MainActivity : ComponentActivity() {
                         val onSaveConnection: (String, String) -> Unit = { u, t -> vm.saveConnection(u, t) }
                         val onDisconnect: () -> Unit = { vm.disconnect() }
                         val onToggleConfirm: (Boolean) -> Unit = { vm.setConfirmCloses(it) }
+                        val onSetStrategy: (String, Boolean?, JsonObject) -> Unit =
+                            { id, en, params -> vm.setStrategy(id, en, params) }
                     }
                 }
 
@@ -192,6 +196,8 @@ class MainActivity : ComponentActivity() {
                             confirmCloses = confirmCloses,
                             serverUrl = vm.baseUrl,
                             live = live,
+                            strategies = strategies,
+                            onSetStrategy = callbacks.onSetStrategy,
                             modifier = inset,
                         )
                     }

@@ -119,6 +119,32 @@ class Api(
     ) { }
 
     /**
+     * Enable/disable or retune one server-side strategy engine.
+     *
+     * Returns the engine's REAL status, which is not the same as "the request
+     * succeeded". The server can answer 200 with `enabled:false` and a reason -- a
+     * target inside the spread, a non-demo account, the kill-switch latched. The
+     * caller must render what comes back, never what it asked for.
+     *
+     * `params` is deliberately a free-form JsonObject: the engines take different
+     * tunables, and the server ignores what an engine does not recognise. Modelling
+     * the union here would mean the phone had to be updated to add a param to an
+     * engine, which is the wrong place for that coupling.
+     */
+    suspend fun setStrategy(
+        id: String,
+        enabled: Boolean?,
+        params: JsonObject = JsonObject(emptyMap()),
+    ): ApiResult<StrategyStatus> = post(
+        path = "/api/strategy/$id",
+        body = buildJsonObject {
+            params.forEach { (k, v) -> put(k, v) }
+            if (enabled != null) put("enabled", JsonPrimitive(enabled))
+        },
+        client = tradeHttp,
+    ) { json.decodeFromString<StrategyStatus>(it) }
+
+    /**
      * Bulk close. [filter] is "all" | "losing" | "profit".
      *
      * ─────────────────────────────────────────────────────────────────────────────

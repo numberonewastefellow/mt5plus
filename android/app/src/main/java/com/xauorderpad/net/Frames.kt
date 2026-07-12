@@ -75,6 +75,16 @@ data class Snapshot(
     @SerialName("net_lots") val netLots: Double? = null,
     /** Server-side sum of positions[].profit. Broker-computed. Never recompute. */
     @SerialName("floating_pl") val floatingPl: Double? = null,
+
+    /**
+     * Status of every server-side strategy engine, keyed by id.
+     *
+     * It rides the /ws snapshot rather than a REST poll, because the worker already
+     * puts it there -- polling would be duplicate machinery for data the socket is
+     * carrying anyway. The strategies RUN on the server; the phone only watches and
+     * toggles them.
+     */
+    val strategies: Map<String, StrategyStatus>? = null,
 ) {
     /** Spread in points -- the unit the UI shows. Null when either half is missing. */
     val spreadPoints: Double?
@@ -89,6 +99,46 @@ data class Snapshot(
     /** True only when the server explicitly said so. Absence != logged in. */
     val isLoggedOut: Boolean get() = loggedOut == true
 }
+
+/**
+ * One server-side strategy engine, as the server reports it.
+ *
+ * Only the fields the phone RENDERS. The phone is a remote control, not a config
+ * editor: full tuning lives in the web panel, and every guard lives on the server.
+ *
+ * `error` and `warning` are computed server-side from real measurements (a target
+ * inside the spread cannot win; extra ladder positions multiply cost, not edge), so
+ * they must be shown, never swallowed. `enabled` is the SERVER's answer -- a POST can
+ * return 200 and `enabled:false` because the engine refused. Trust this, not the
+ * request that was sent.
+ */
+@Immutable
+@Serializable
+data class StrategyStatus(
+    val id: String = "",
+    val name: String = "",
+    val enabled: Boolean = false,
+    val state: String = "",
+    val error: String? = null,
+    val killed: Boolean = false,
+    // ladder-only; null on engines that do not have them
+    val paper: Boolean? = null,
+    val spread: Double? = null,
+    val warning: String? = null,
+    val params: StrategyParams? = null,
+)
+
+@Immutable
+@Serializable
+data class StrategyParams(
+    val side: String? = null,
+    val trigger: Double? = null,
+    val target: Double? = null,
+    val retrace: Double? = null,
+    val volume: Double? = null,
+    @SerialName("max_positions") val maxPositions: Int? = null,
+    val paper: Boolean? = null,
+)
 
 @Immutable
 @Serializable

@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
 import java.math.BigDecimal
 import java.math.RoundingMode
 import kotlin.math.max
@@ -123,6 +124,15 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         .map { PositionsUi(it?.openPositions.orEmpty().toImmutableList(), it?.digits ?: 2) }
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, PositionsUi(persistentListOf()))
+
+    /** Server-side strategy engines, straight off the feed. Ordered for a stable UI. */
+    val strategies: StateFlow<StrategiesUi> = feed
+        .map { s ->
+            StrategiesUi(
+                s?.strategies.orEmpty().values.sortedBy { it.id }.toImmutableList())
+        }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, StrategiesUi(persistentListOf()))
 
     // ---- screen / form state --------------------------------------------
 
@@ -267,6 +277,55 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
             _busy.value = false
         }
     }
+
+    // ---- strategies (server-side engines; this is a remote control) --------
+
+    /**
+     * Enable/disable or retune one engine.
+     *
+     * Two things this deliberately does NOT do:
+     *
+     *  - It does not decide anything. Every guard (demo-only, hedging, target vs
+     *    spread, kill-switch) lives on the server, where it cannot be bypassed by a
+     *    stale phone or a forged request. The phone asks; the server rules.
+     *
+     *  - It does not assume success. The server answers 200 with the engine's REAL
+     *    status, which can be `enabled:false` plus a reason -- and reporting "armed"
+     *    on the strength of an HTTP code would be a lie in the dangerous direction.
+     *    So we read `enabled` back and say what actually happened.
+     */
+    fun setStrategy(id: String, enabled: Boolean?, params: JsonObject = JsonObject(emptyMap())) =
+        viewModelScope.launch {
+            if (!live.value) {
+                say("Feed is stale — cannot arm a strategy from a frozen screen", error = true)
+                return@launch
+            }
+            _busy.value = true
+            val e = Feed.epoch
+            try {
+                when (val r = Feed.api.setStrategy(id, enabled, params)) {
+                    is ApiResult.Ok -> {
+                        val s = r.value
+                        when {
+                            enabled == true && !s.enabled ->
+                                say(s.error ?: "$id refused to arm", error = true)
+                            enabled == true ->
+                                say("${s.name} armed" + if (s.paper == true) " (PAPER — no orders)" else " — LIVE ORDERS", error = false)
+                            enabled == false -> say("${s.name} disabled", error = false)
+                            else -> say("${s.name} updated", error = false)
+                        }
+                    }
+                    is ApiResult.Unauthorized -> onUnauthorized(e)
+                    is ApiResult.TimedOut -> say(
+                        "TIMED OUT — the strategy may still have changed. Check the panel.",
+                        error = true,
+                    )
+                    is ApiResult.Failed -> say(r.message, error = true)
+                }
+            } finally {
+                _busy.value = false
+            }
+        }
 
     // ---- order form ------------------------------------------------------
 

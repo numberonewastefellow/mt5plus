@@ -19,6 +19,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -43,6 +44,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xauorderpad.net.Link
+import com.xauorderpad.net.StrategyStatus
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 
 /**
  * The trading screen.
@@ -75,6 +80,8 @@ fun TradeScreen(
     serverUrl: String,
     /** Socket is Up. False => everything on this screen is a frozen last-known frame. */
     live: Boolean,
+    strategies: StrategiesUi,
+    onSetStrategy: (String, Boolean?, JsonObject) -> Unit,
     modifier: Modifier = Modifier,
     closing: Boolean = false,
 ) {
@@ -86,6 +93,7 @@ fun TradeScreen(
     // open on the server, which the dialog says plainly, because a "logout" button on a trading
     // screen absolutely reads like it might flatten you.
     var confirmDisconnect by remember { mutableStateOf(false) }
+    var showStrategies by remember { mutableStateOf(false) }
 
     Column(modifier.fillMaxSize().padding(12.dp)) {
         ServerBar(
@@ -93,6 +101,9 @@ fun TradeScreen(
             confirmCloses = confirmCloses,
             onToggleConfirm = onToggleConfirm,
             onDisconnect = { confirmDisconnect = true },
+            strategyDot = strategies.items.any { it.enabled },
+            strategyKilled = strategies.items.any { it.killed },
+            onStrategies = { showStrategies = true },
         )
         Spacer(Modifier.height(6.dp))
 
@@ -175,6 +186,15 @@ fun TradeScreen(
         )
     }
 
+    if (showStrategies) {
+        StrategiesDialog(
+            strategies = strategies,
+            live = live,
+            onSet = onSetStrategy,
+            onDismiss = { showStrategies = false },
+        )
+    }
+
     if (confirmDisconnect) {
         AlertDialog(
             onDismissRequest = { confirmDisconnect = false },
@@ -199,6 +219,174 @@ fun TradeScreen(
 }
 
 /**
+ * The server-side strategy engines.
+ *
+ * The phone is a REMOTE CONTROL: it renders what the server says and asks it to
+ * change. Every guard -- demo-only, hedging, target-vs-spread, the kill-switch --
+ * lives on the server, where a stale phone or a forged request cannot get round it.
+ *
+ * Three rules this UI does enforce, because they are about what the user is told:
+ *
+ *  1. `live` gates arming. Arming a real trader from a screen whose prices are frozen
+ *     is the exact scenario the stale-feed guard exists for.
+ *  2. Turning PAPER off gets its OWN confirm, separate from enabling. It is the moment
+ *     real orders begin -- a different decision, and folding the two into one dialog
+ *     would let someone arm a live trader without ever being asked about it.
+ *  3. `error` and `warning` come from real measurements on the server. Render them.
+ */
+@Composable
+private fun StrategiesDialog(
+    strategies: StrategiesUi,
+    live: Boolean,
+    onSet: (String, Boolean?, JsonObject) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var confirmArm by remember { mutableStateOf<StrategyStatus?>(null) }
+    var confirmPaperOff by remember { mutableStateOf<StrategyStatus?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Strategies") },
+        text = {
+            Column {
+                Text(
+                    "These run on the SERVER, not on this phone — they keep running with the " +
+                        "app closed.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (!live) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "⚠ Feed is stale — controls disabled. You are looking at a frozen screen.",
+                        fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Amber,
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+
+                if (strategies.items.isEmpty()) {
+                    Text("No strategies reported by the server.",
+                         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                for (s in strategies.items) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(s.name.ifBlank { s.id },
+                                 fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text(s.state, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(
+                            checked = s.enabled,
+                            enabled = live,
+                            onCheckedChange = { want ->
+                                if (want) confirmArm = s else onSet(s.id, false, JsonObject(emptyMap()))
+                            },
+                        )
+                    }
+
+                    // Ladder only: PAPER is the safety, so it gets its own visible switch.
+                    if (s.paper != null) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                if (s.paper) "PAPER — logs only, places NO orders"
+                                else "LIVE — placing REAL orders",
+                                Modifier.weight(1f),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (s.paper) Amber else Red,
+                            )
+                            Switch(
+                                checked = s.paper,
+                                enabled = live,
+                                onCheckedChange = { wantPaper ->
+                                    if (!wantPaper) confirmPaperOff = s
+                                    else onSet(s.id, null, buildJsonObject {
+                                        put("paper", JsonPrimitive(true))
+                                    })
+                                },
+                            )
+                        }
+                        s.params?.trigger?.let {
+                            Text("trigger ${Fmt.price(it, 2)} · ${s.params.side ?: "?"}" +
+                                 (s.spread?.let { sp -> "  · spread ${Fmt.price(sp, 2)}/oz" } ?: ""),
+                                 fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+
+                    // Server-computed, from real measurements. Never swallow these.
+                    s.warning?.let {
+                        Text("⚠ $it", fontSize = 10.sp, color = Amber)
+                    }
+                    s.error?.let {
+                        Text("⚠ $it", fontSize = 10.sp, color = Red)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Spacer(Modifier.height(6.dp))
+                }
+                Text(
+                    "Full tuning is in the web panel. This is a remote control.",
+                    fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("CLOSE") } },
+    )
+
+    confirmArm?.let { s ->
+        val livePaper = s.paper == false
+        AlertDialog(
+            onDismissRequest = { confirmArm = null },
+            title = { Text("Enable ${s.name.ifBlank { s.id }}?") },
+            text = {
+                Text(
+                    if (livePaper)
+                        "PAPER MODE IS OFF — this will place REAL orders on the demo account " +
+                            "when it triggers."
+                    else if (s.paper == true)
+                        "Paper mode is ON — it will log what it would do and place NO orders."
+                    else
+                        "It will place REAL orders on the demo account when it signals."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onSet(s.id, true, JsonObject(emptyMap())); confirmArm = null
+                }) { Text("ENABLE", fontWeight = FontWeight.Bold,
+                          color = if (livePaper) Red else Green) }
+            },
+            dismissButton = { TextButton(onClick = { confirmArm = null }) { Text("Cancel") } },
+        )
+    }
+
+    confirmPaperOff?.let { s ->
+        AlertDialog(
+            onDismissRequest = { confirmPaperOff = null },
+            title = { Text("Turn PAPER MODE off?") },
+            text = {
+                Text(
+                    "It will place REAL orders on the demo account from the next trigger.\n\n" +
+                        "Measured on 37,500 real ticks: with no directional edge this loses about " +
+                        "one spread (0.24/oz) per trade, and the ladder multiplies that cost. Only " +
+                        "your trigger can beat it — and paper mode is how you find out whether it does."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onSet(s.id, null, buildJsonObject { put("paper", JsonPrimitive(false)) })
+                    confirmPaperOff = null
+                }) { Text("GO LIVE", color = Red, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmPaperOff = null }) { Text("Keep paper") }
+            },
+        )
+    }
+}
+
+/**
  * Shows WHICH server this app is talking to, and the way out.
  *
  * Both halves are the point: without the address on screen there is no way to tell a phone
@@ -211,6 +399,9 @@ private fun ServerBar(
     confirmCloses: Boolean,
     onToggleConfirm: (Boolean) -> Unit,
     onDisconnect: () -> Unit,
+    strategyDot: Boolean,
+    strategyKilled: Boolean,
+    onStrategies: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth(),
@@ -227,6 +418,17 @@ private fun ServerBar(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+
+        // A strategy running on the SERVER is invisible from the phone unless we say
+        // so. Green = something is armed and may be trading without you watching.
+        TextButton(onClick = onStrategies) {
+            Text("STRAT", fontSize = 11.sp)
+            if (strategyDot || strategyKilled) {
+                Spacer(Modifier.width(4.dp))
+                Text("●", fontSize = 11.sp,
+                     color = if (strategyKilled) Red else Green)
+            }
+        }
 
         // Turning this OFF makes CLOSE ALL / CLOSE LOSING / CLOSE PROFIT fire on a single tap.
         // Coloured red when off, because "one tap flattens the book" is a state worth seeing.

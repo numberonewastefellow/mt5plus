@@ -63,3 +63,15 @@ data class PositionsUi(
     val items: ImmutableList<com.xauorderpad.net.Position>,
     val digits: Int = 2,
 )
+
+/**
+ * The server-side strategy engines. Arrives on the /ws snapshot, so it costs nothing
+ * extra -- the strategies RUN on the server; this is only a view of them.
+ *
+ * Its own slice for the usual reason (see the header): the strategy panel must not
+ * recompose on every bid tick.
+ */
+@Immutable
+data class StrategiesUi(
+    val items: ImmutableList<com.xauorderpad.net.StrategyStatus>,
+)
