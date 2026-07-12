@@ -8,3 +8,39 @@ __pycache__/
 # XauOrderPad Auto-Test audit logs (browser-downloaded by default; the dir
 # only appears if the optional backend persist endpoint is ever wired up).
 XauOrderPad/audit/
+
+# AWS deploy secrets - NEVER commit.
+# The .pem is the ONLY way to decrypt the EC2 Windows Administrator password and
+# it grants SSH to the box. If it reaches a remote it cannot be un-published;
+# the instance would have to be rebuilt and the key pair rotated.
+*.pem
+*.ppk
+# unanchored (no leading path) so it matches deploy/ AND XauOrderPad/deploy/
+state.json
+
+# Android signing key - NEVER commit. Same reasoning as the .pem above, plus:
+# lose it and you can never ship an upgrade OVER the installed APK (Android
+# refuses an update signed by a different key) - you'd have to uninstall first.
+# Back it up OUTSIDE this repo.
+*.jks
+*.keystore
+keystore.properties
+
+# The API token for the local/LAN dev server. Grants order placement on whatever
+# account MT5 is logged into -- treat it like the .pem above.
+.token.local
+*.token.local
+
+# Server stdout/stderr captured when launching detached. Machine-local noise, and
+# the banner echoes the LAN URL, so keep it out of the repo.
+XauOrderPad/.server.*.log
+
+# Android build output
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# Phone address remembered by deploy.bat. Machine-local, and the wireless-debug
+# port changes on every toggle, so it is noise in a diff.
+android/.deploy-phone
