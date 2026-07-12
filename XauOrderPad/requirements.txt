@@ -1,3 +1,8 @@
 MetaTrader5>=5.0.4424
 fastapi>=0.110
 uvicorn[standard]>=0.29
+keyring>=24            # encrypted account-password storage (Windows Credential Locker)
+numpy>=1.26            # strategy.py imports it directly. It used to arrive only as a
+                       # TRANSITIVE dependency of MetaTrader5 -- so `import server` broke the
+                       # moment anything installed without MT5 (e.g. the Linux test image).
+                       # Depending on someone else's transitive dep is not a dependency.

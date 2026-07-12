@@ -1,0 +1,36 @@
+# TEST ONLY. This runs the real server.py against a FAKE MetaTrader5. See README.md.
+#
+# Run from the XauOrderPad/ directory (the build context is the parent, so the container
+# gets server.py / mt5_worker.py / config.py / webui/ / static/):
+#
+#   docker compose -f testing/docker-compose.yml up -d --build
+#   docker compose -f testing/docker-compose.yml exec tests pytest -v testing/test_endpoints.py
+
+services:
+  tests:
+    build:
+      context: ..                     # XauOrderPad/, so the real source is in the image
+      dockerfile: testing/Dockerfile
+    image: xauorderpad-tests:local
+    container_name: xauorderpad-tests
+    working_dir: /app
+
+    environment:
+      # The stub REFUSES to import without this. Nothing else in the project sets it, so a
+      # stray PYTHONPATH on the trading box raises instead of silently faking a broker.
+      XAUORDERPAD_FAKE_MT5: "1"
+
+    volumes:
+      # Bind-mount the whole XauOrderPad tree so edits to server.py / the tests are picked
+      # up without an image rebuild. The tests import the REAL server module -- nothing here
+      # is a copy or a reimplementation.
+      - ..:/app
+
+    # NOTE: no `ports:` at all.
+    #
+    # The suite starts uvicorn on 127.0.0.1:8766 INSIDE the container and drives it from
+    # pytest in the same process, so nothing needs to be published to the host. That is
+    # deliberate: a fake broker that answers on a host port is exactly the thing you do not
+    # want lying around. In particular this can never bind 8765, where the real server lives.
+
+    command: sleep infinity

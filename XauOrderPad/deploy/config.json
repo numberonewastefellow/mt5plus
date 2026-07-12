@@ -1,0 +1,12 @@
+{
+  "region": "eu-west-2",
+  "instance_type": "m7i-flex.large",
+  "project_tag": "mt5plus",
+  "instance_name": "mt5-london",
+  "app_port": 8765,
+  "auto_stop_minutes": 60,
+  "volume_size_gb": 30,
+  "key_name": "mt5-london-key",
+  "python_url": "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe",
+  "mt5_setup_url": "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
+}
