@@ -56,7 +56,13 @@ object Feed {
         // Ping frames keep the socket alive through carrier NAT. Without them an idle socket
         // on a mobile network can be silently reaped, leaving us "connected" and showing
         // stale prices -- worse than showing offline.
-        .pingInterval(20, TimeUnit.SECONDS)
+        //
+        // 5 s, not 20: this interval IS the detection latency for a silently-reaped socket --
+        // OkHttp only discovers the death when a ping goes unanswered. At 20 s the app could
+        // sit for twenty seconds showing a frozen quote while `live` still read true, with
+        // BUY/SELL and the strategy switches armed against it. A keepalive frame every 5 s is
+        // nothing next to the 5 Hz snapshot stream it is protecting.
+        .pingInterval(5, TimeUnit.SECONDS)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)   // 0 = none; the socket is long-lived by design
         .callTimeout(15, TimeUnit.SECONDS)       // applies to the REST calls, not the socket

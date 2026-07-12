@@ -1,6 +1,7 @@
 package com.xauorderpad.ui
 
 import android.app.Application
+import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xauorderpad.data.Feed
@@ -10,11 +11,15 @@ import com.xauorderpad.net.Profile
 import com.xauorderpad.net.Snapshot
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toImmutableList
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -23,6 +28,14 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import kotlin.math.max
 import kotlin.math.round
+
+/**
+ * No frame for this long => the feed is dead, whatever the socket claims.
+ *
+ * The server force-resends at least every 1.0 s even when the state has not changed
+ * (`HEARTBEAT_S` in server.py), so this is ten missed heartbeats.
+ */
+private const val STALE_AFTER_MS = 10_000L
 
 enum class Screen { CONNECT, LOGIN, TRADE }
 
@@ -65,10 +78,40 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
      * HTTP still works (proxy or idle timeout). A tap on BUY then places a REAL order against a
      * price that has since moved, and it SUCCEEDS.
      *
-     * So: one source of truth for staleness, derived from the socket rather than the data.
+     * So: one source of truth for staleness -- and it takes BOTH halves.
+     *
+     *  - The SOCKET must be up. `Link.Up` is the only state in which frames can arrive.
+     *  - FRAMES must actually be arriving. An open socket is not a moving feed: the server
+     *    can hold the connection while its MT5 worker is wedged, and OkHttp only notices a
+     *    silently-reaped socket when a ping goes unanswered (5 s, see Feed). Between those
+     *    pings `Link.Up` is a claim, not a fact.
+     *
+     * The age is measured from the LOCAL arrival time of the newest frame, never from
+     * `Snapshot.ts`. That field is the SERVER's clock, and the phone's clock can be minutes
+     * off it -- comparing the two would compute an age made of clock skew and could read
+     * "stale" on a perfectly live feed, or (worse) "live" on a dead one.
+     *
+     * 10 s is the threshold because the server force-resends at least every 1.0 s even when
+     * nothing has changed (`HEARTBEAT_S`, server.py). Ten missed heartbeats is not a quiet
+     * market; it is a dead feed.
+     *
+     * Fail-closed: before the first frame, `lastFrameAt` is 0 and this is false.
      */
-    val live: StateFlow<Boolean> = Feed.link
-        .map { it is Link.Up }
+    private val lastFrameAt: StateFlow<Long> = feed
+        .filterNotNull()
+        .map { SystemClock.elapsedRealtime() }   // monotonic: immune to clock changes and skew
+        .stateIn(viewModelScope, SharingStarted.Eagerly, 0L)
+
+    val live: StateFlow<Boolean> = combine(
+        Feed.link,
+        lastFrameAt,
+        // The socket going quiet produces NO emission, so nothing would re-evaluate the age
+        // and `live` would stay stuck at its last value forever. This tick is what makes
+        // silence itself an event.
+        flow { while (true) { emit(Unit); delay(1_000) } },
+    ) { link, at, _ ->
+        link is Link.Up && at != 0L && SystemClock.elapsedRealtime() - at < STALE_AFTER_MS
+    }
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 

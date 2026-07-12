@@ -12,8 +12,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -189,6 +191,7 @@ fun TradeScreen(
     if (showStrategies) {
         StrategiesDialog(
             strategies = strategies,
+            quote = quote,
             live = live,
             onSet = onSetStrategy,
             onDismiss = { showStrategies = false },
@@ -237,6 +240,7 @@ fun TradeScreen(
 @Composable
 private fun StrategiesDialog(
     strategies: StrategiesUi,
+    quote: Quote,
     live: Boolean,
     onSet: (String, Boolean?, JsonObject) -> Unit,
     onDismiss: () -> Unit,
@@ -248,7 +252,10 @@ private fun StrategiesDialog(
         onDismissRequest = onDismiss,
         title = { Text("Strategies") },
         text = {
-            Column {
+            // Scrollable: two engines plus the ladder's side/trigger row overflow a phone
+            // dialog, and an AlertDialog CLIPS its body rather than scrolling it -- the PAPER
+            // switch would simply be unreachable on a short screen.
+            Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(
                     "These run on the SERVER, not on this phone — they keep running with the " +
                         "app closed.",
@@ -285,8 +292,11 @@ private fun StrategiesDialog(
                         )
                     }
 
-                    // Ladder only: PAPER is the safety, so it gets its own visible switch.
+                    // Ladder only. `paper != null` is the marker: engines without a paper mode
+                    // do not have a trigger either.
                     if (s.paper != null) {
+                        LadderControls(s, quote, live, onSet)
+
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text(
                                 if (s.paper) "PAPER — logs only, places NO orders"
@@ -306,12 +316,6 @@ private fun StrategiesDialog(
                                     })
                                 },
                             )
-                        }
-                        s.params?.trigger?.let {
-                            Text("trigger ${Fmt.price(it, 2)} · ${s.params.side ?: "?"}" +
-                                 (s.spread?.let { sp -> "  · spread ${Fmt.price(sp, 2)}/oz" } ?: ""),
-                                 fontSize = 10.sp, fontFamily = FontFamily.Monospace,
-                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
 
@@ -337,19 +341,39 @@ private fun StrategiesDialog(
 
     confirmArm?.let { s ->
         val livePaper = s.paper == false
+
+        // The APPLIED trigger, not the one in the text field -- arming acts on what the server
+        // holds. If that level is already behind the market, this engine does not wait for
+        // anything: it enters on the next tick. Say so at the moment of arming, which is the
+        // last point at which it can still be stopped.
+        val t = s.params?.trigger?.takeIf { it > 0.0 }
+        val bid = quote.bid
+        val armsNow = t != null && bid != null &&
+            if ((s.params?.side ?: "sell") == "sell") bid < t else bid > t
+
         AlertDialog(
             onDismissRequest = { confirmArm = null },
             title = { Text("Enable ${s.name.ifBlank { s.id }}?") },
             text = {
-                Text(
-                    if (livePaper)
-                        "PAPER MODE IS OFF — this will place REAL orders on the demo account " +
-                            "when it triggers."
-                    else if (s.paper == true)
-                        "Paper mode is ON — it will log what it would do and place NO orders."
-                    else
-                        "It will place REAL orders on the demo account when it signals."
-                )
+                Column {
+                    if (armsNow) {
+                        Text(
+                            "⚠ The trigger is ALREADY crossed — this will ENTER IMMEDIATELY, " +
+                                "not wait for a level.",
+                            fontWeight = FontWeight.Bold, color = Red,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    Text(
+                        if (livePaper)
+                            "PAPER MODE IS OFF — this will place REAL orders on the demo account " +
+                                "when it triggers."
+                        else if (s.paper == true)
+                            "Paper mode is ON — it will log what it would do and place NO orders."
+                        else
+                            "It will place REAL orders on the demo account when it signals."
+                    )
+                }
             },
             confirmButton = {
                 TextButton(onClick = {
@@ -383,6 +407,123 @@ private fun StrategiesDialog(
                 TextButton(onClick = { confirmPaperOff = null }) { Text("Keep paper") }
             },
         )
+    }
+}
+
+/**
+ * Side + trigger for the ladder — the "SELL if it goes below 4119" part.
+ *
+ * ── The warning is the reason this exists ──
+ *
+ * `LadderState.on_tick` arms on `mark < trigger` for a sell. So a sell trigger ABOVE the
+ * current bid is ALREADY crossed: it does not wait, it fires on the very next tick. Typing
+ * 4200 while the bid is 4119 means "enter now", and it looks like a perfectly ordinary
+ * number -- which is exactly why a phone keyboard makes it dangerous.
+ *
+ * It is a WARNING, not a block. Entering immediately is sometimes precisely what is wanted.
+ * But it must never be a surprise, and the trigger is never silently rewritten: a UI that
+ * quietly "corrects" a price the user typed is worse than one that tells them what it will do.
+ *
+ * APPLY sends `enabled = null`, so setting a level can never ARM the engine as a side effect.
+ * Arming stays one deliberate act: the switch.
+ */
+@Composable
+private fun LadderControls(
+    s: StrategyStatus,
+    quote: Quote,
+    live: Boolean,
+    onSet: (String, Boolean?, JsonObject) -> Unit,
+) {
+    // Keyed on the SERVER's values: a 5 Hz snapshot carrying the same trigger keeps the same
+    // key, so it cannot wipe what is being typed. When the value genuinely changes -- an APPLY
+    // landed, or the web panel moved it -- the key changes and the field re-seeds to the truth.
+    var side by remember(s.params?.side) { mutableStateOf(s.params?.side ?: "sell") }
+    var trig by remember(s.params?.trigger) {
+        mutableStateOf(s.params?.trigger?.takeIf { it > 0.0 }?.let { Fmt.price(it, 2) } ?: "")
+    }
+
+    val typed = trig.trim().toDoubleOrNull()
+    val valid = typed != null && typed > 0.0
+    val bid = quote.bid
+
+    // The bid is the mark for BOTH sides -- the chart is the bid, and the engine compares
+    // against it. (XAUUSDm is a CFD: tick.last is 0.0 on every tick, there is no LTP.)
+    val crossed = valid && bid != null &&
+        if (side == "sell") bid < typed!! else bid > typed!!
+
+    Row(Modifier.fillMaxWidth().padding(bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+
+        SideChip("SELL", side == "sell", Red, live) { side = "sell" }
+        Spacer(Modifier.width(6.dp))
+        SideChip("BUY", side == "buy", Green, live) { side = "buy" }
+        Spacer(Modifier.width(8.dp))
+
+        OutlinedTextField(
+            value = trig,
+            onValueChange = { trig = it },
+            enabled = live,
+            singleLine = true,
+            label = { Text("trigger", fontSize = 10.sp) },
+            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                fontFamily = FontFamily.Monospace),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            modifier = Modifier.weight(1f),
+        )
+        Spacer(Modifier.width(6.dp))
+
+        // Disabled rather than toasting: a blank or zero trigger is not an error to report,
+        // it is simply nothing to send. The server would reject it anyway ("waiting: no
+        // trigger price set"), and a round-trip to be told so is noise.
+        TextButton(
+            onClick = {
+                onSet(s.id, null, buildJsonObject {
+                    put("side", JsonPrimitive(side))
+                    put("trigger", JsonPrimitive(typed))
+                })
+            },
+            enabled = live && valid,
+        ) { Text("APPLY", fontWeight = FontWeight.Bold) }
+    }
+
+    if (crossed) {
+        Text(
+            "⚠ Trigger is ALREADY crossed (bid ${Fmt.price(bid, quote.digits ?: 2)}) — " +
+                "arming will enter IMMEDIATELY, not wait.",
+            fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Red,
+            modifier = Modifier.padding(bottom = 6.dp),
+        )
+    }
+
+    s.spread?.let {
+        Text("spread ${Fmt.price(it, 2)}/oz — every trade pays this",
+             fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+             color = MaterialTheme.colorScheme.onSurfaceVariant,
+             modifier = Modifier.padding(bottom = 6.dp))
+    }
+}
+
+@Composable
+private fun SideChip(
+    label: String,
+    selected: Boolean,
+    tint: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(6.dp),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = if (selected) tint.copy(alpha = 0.22f) else Color.Transparent,
+            contentColor = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant,
+        ),
+        modifier = Modifier.height(36.dp),
+    ) {
+        Text(label, fontSize = 11.sp,
+             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
     }
 }
 
