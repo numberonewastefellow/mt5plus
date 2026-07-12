@@ -70,6 +70,8 @@ fun SettingsScreen(
     serverUrl: String,
     strategies: StrategiesUi,
     live: Boolean,
+    confirmCloses: Boolean,
+    onToggleConfirm: (Boolean) -> Unit,
     onStrategies: () -> Unit,
     onDisconnect: () -> Unit,
     onBack: () -> Unit,
@@ -86,6 +88,32 @@ fun SettingsScreen(
 
         Column(Modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
 
+            SectionLabel("TRADING")
+
+            // Moved off the trade screen: it is a set-once preference, not something you work
+            // mid-trade, and it was costing the positions grid a row.
+            //
+            // Turning it OFF makes CLOSE ALL / CLOSE LOSING / CLOSE PROFIT fire on a single tap.
+            // That is the point (flattening fast in a spike), and it is also the whole risk, so
+            // the OFF state is stated in red rather than left as a quiet toggle position.
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Confirm bulk closes", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        if (confirmCloses)
+                            "CLOSE ALL / LOSING / PROFIT ask first."
+                        else
+                            "OFF — one tap flattens the book, no questions asked.",
+                        fontSize = 11.sp,
+                        fontWeight = if (confirmCloses) FontWeight.Normal else FontWeight.Bold,
+                        color = if (confirmCloses) MaterialTheme.colorScheme.onSurfaceVariant
+                        else Red,
+                    )
+                }
+                Switch(checked = confirmCloses, onCheckedChange = onToggleConfirm)
+            }
+
+            Spacer(Modifier.height(18.dp))
             SectionLabel("ENGINES")
             MenuRow(
                 title = "Strategies",

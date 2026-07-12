@@ -1,8 +1,10 @@
 package com.xauorderpad.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -13,19 +15,20 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,13 +36,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xauorderpad.net.Link
@@ -72,7 +77,7 @@ fun TradeScreen(
     onClosePosition: (Long) -> Unit,
     onLogin: () -> Unit,
     onSettings: () -> Unit,
-    onToggleConfirm: (Boolean) -> Unit,
+    /** Read-only here: the SWITCH lives in Settings now. This only decides whether to ask. */
     confirmCloses: Boolean,
     serverUrl: String,
     /** Socket is Up. False => everything on this screen is a frozen last-known frame. */
@@ -85,34 +90,52 @@ fun TradeScreen(
     // whole book. `confirm` holds the pending filter, or null.
     var confirm by remember { mutableStateOf<String?>(null) }
 
-    Column(modifier.fillMaxSize().padding(12.dp)) {
+    // Every control height is a FRACTION of the real screen height, not a fixed dp.
+    //
+    // The controls used to eat ~70% of the screen and the positions grid got whatever was left
+    // -- about three rows. The grid is the thing you actually watch while a trade is on, so the
+    // chrome above it has to yield. Fractions (not hardcoded dp) mean this holds on a small
+    // phone and a tall one alike; the coerceIn bounds stop it from collapsing into an untappable
+    // control on a tiny screen or ballooning on a tablet.
+    BoxWithConstraints(modifier.fillMaxSize()) {
+        val hPx = maxHeight
+        fun frac(f: Float, min: Dp, max: Dp): Dp = (hPx * f).coerceIn(min, max)
+        val d = Dims(
+            gap = frac(0.007f, 4.dp, 10.dp),
+            quotePad = frac(0.006f, 4.dp, 10.dp),
+            priceSp = (hPx.value * 0.026f).coerceIn(17f, 22f).sp,
+            tabH = frac(0.036f, 28.dp, 40.dp),
+            fieldH = frac(0.052f, 40.dp, 54.dp),
+            actionH = frac(0.068f, 52.dp, 64.dp),
+            bulkH = frac(0.044f, 34.dp, 46.dp),
+        )
+
+    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
         ServerBar(
             serverUrl = serverUrl,
-            confirmCloses = confirmCloses,
-            onToggleConfirm = onToggleConfirm,
             strategyDot = strategies.items.any { it.enabled },
             strategyKilled = strategies.items.any { it.killed },
             onSettings = onSettings,
         )
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(d.gap))
 
         StatusBanner(health, link, onLogin)
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(d.gap))
 
-        QuoteBlock(quote, live)
-        Spacer(Modifier.height(10.dp))
+        QuoteBlock(quote, live, d)
+        Spacer(Modifier.height(d.gap))
 
-        ArmedTabs(armed.side, onArmedSide)
-        Spacer(Modifier.height(8.dp))
+        ArmedTabs(armed.side, d, onArmedSide)
+        Spacer(Modifier.height(d.gap))
 
         // `live` gates ENTRY only. `health.healthy` alone is not enough: it is derived from the
         // last snapshot, which survives the socket's death -- so it still reports "healthy" from
         // a frame that may be minutes old, and BUY/SELL would stay armed against a frozen price.
         OrderFormBlock(form, canTrade = health.healthy && !busy && live, digits = positions.digits,
-            armed = armed, quote = quote, busy = busy,
+            armed = armed, quote = quote, busy = busy, d = d,
             onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp,
             onEnterArmed = onEnterArmed, onCloseArmed = onCloseArmed)
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(d.gap))
 
         // Gated ONLY on a bulk close already being in flight.
         //
@@ -135,13 +158,13 @@ fun TradeScreen(
         // server re-evaluates the filter against live broker prices, and if the network really is
         // down the call fails loudly with a toast. Refusing to even ask, at the moment gold is
         // gapping against you, is the worse failure.
-        BulkCloseBar(enabled = !closing) { filter ->
+        BulkCloseBar(enabled = !closing, d = d) { filter ->
             if (confirmCloses) confirm = filter else onCloseWhere(filter)
         }
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(d.gap))
 
         AccountStrip(account)
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(d.gap))
 
         PositionsGrid(
             state = positions,
@@ -149,9 +172,11 @@ fun TradeScreen(
             connected = health.connected,
             live = live,
             // weight(1f), not fillMaxSize(): as the last child of a Column, fillMaxSize is a
-            // fragile idiom that can fight the siblings for space.
+            // fragile idiom that can fight the siblings for space. Everything above shrank so
+            // that THIS gets the remainder.
             modifier = Modifier.weight(1f),
         )
+    }
     }
 
     confirm?.let { filter ->
@@ -186,25 +211,22 @@ fun TradeScreen(
  * The address is on screen because without it there is no way to tell a phone pointed at the
  * right box from one pointed at a stale baked-in default.
  *
- * CONFIRM stays HERE rather than moving behind the gear: it is the switch you reach for in a
- * spike, and burying a panic-path setting two taps deep would defeat it. Strategies and logout
- * moved to Settings — neither is something you need mid-trade.
+ * CONFIRM moved to Settings. It is a set-once preference, not a control you work during a trade,
+ * and the row it occupied here was costing the positions grid space it needs more.
  *
- * The dot on the gear is the one thing that must survive the move: a strategy running on the
- * SERVER is invisible from the phone unless we say so, and after this refactor it lives two
- * screens away. Green = something is armed and may be trading while you are not looking.
+ * The dot on the gear is the one thing that must survive that move: a strategy running on the
+ * SERVER is invisible from the phone unless we say so, and it now lives two screens away.
+ * Green = something is armed and may be trading while you are not looking.
  */
 @Composable
 private fun ServerBar(
     serverUrl: String,
-    confirmCloses: Boolean,
-    onToggleConfirm: (Boolean) -> Unit,
     strategyDot: Boolean,
     strategyKilled: Boolean,
     onSettings: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth(),
+        Modifier.fillMaxWidth().height(28.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -219,21 +241,10 @@ private fun ServerBar(
             modifier = Modifier.weight(1f),
         )
 
-        // Turning this OFF makes CLOSE ALL / CLOSE LOSING / CLOSE PROFIT fire on a single tap.
-        // Coloured red when off, because "one tap flattens the book" is a state worth seeing.
-        Text(
-            "CONFIRM",
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            color = if (confirmCloses) MaterialTheme.colorScheme.onSurfaceVariant else Red,
-        )
-        Switch(
-            checked = confirmCloses,
-            onCheckedChange = onToggleConfirm,
-            modifier = Modifier.scale(0.7f),
-        )
-
-        TextButton(onClick = onSettings) {
+        TextButton(
+            onClick = onSettings,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+        ) {
             Text("⚙", fontSize = 18.sp)
             if (strategyDot || strategyKilled) {
                 Spacer(Modifier.width(3.dp))
@@ -295,20 +306,20 @@ private fun StatusBanner(h: Health, link: Link, onLogin: () -> Unit) {
  * frozen price that still looks live is the actual hazard here, not the disconnection itself.
  */
 @Composable
-private fun QuoteBlock(q: Quote, live: Boolean) {
+private fun QuoteBlock(q: Quote, live: Boolean, d: Dims) {
     Box(Modifier.fillMaxWidth()) {
         Row(
             Modifier.fillMaxWidth().alpha(if (live) 1f else 0.35f),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            QuoteCell("BID", Fmt.price(q.bid, q.digits), Red, Modifier.weight(1f))
+            QuoteCell("BID", Fmt.price(q.bid, q.digits), Red, d, Modifier.weight(1f))
 
             Card(
-                Modifier.width(88.dp),
+                Modifier.width(78.dp),
                 colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceVariant),
             ) {
                 Column(
-                    Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                    Modifier.fillMaxWidth().padding(vertical = d.quotePad),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text("SPREAD", fontSize = 9.sp, fontWeight = FontWeight.Bold,
@@ -317,12 +328,14 @@ private fun QuoteBlock(q: Quote, live: Boolean) {
                     // difference. Rendering it raw prints "0.22" where a trader expects "22".
                     Text(
                         Fmt.points(q.spreadPoints),
-                        fontFamily = FontFamily.Monospace, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = d.priceSp * 0.82f,
+                        fontWeight = FontWeight.Bold,
                     )
                 }
             }
 
-            QuoteCell("ASK", Fmt.price(q.ask, q.digits), Green, Modifier.weight(1f))
+            QuoteCell("ASK", Fmt.price(q.ask, q.digits), Green, d, Modifier.weight(1f))
         }
 
         if (!live) {
@@ -344,16 +357,88 @@ private fun QuoteBlock(q: Quote, live: Boolean) {
 }
 
 @Composable
-private fun QuoteCell(label: String, value: String, color: Color, modifier: Modifier) {
+private fun QuoteCell(label: String, value: String, color: Color, d: Dims, modifier: Modifier) {
     Card(modifier, colors = CardDefaults.cardColors(color.copy(alpha = 0.12f))) {
         Column(
-            Modifier.fillMaxWidth().padding(vertical = 10.dp),
+            Modifier.fillMaxWidth().padding(vertical = d.quotePad),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(label, fontSize = 9.sp, fontWeight = FontWeight.Bold, color = color)
-            Text(value, fontFamily = FontFamily.Monospace, fontSize = 22.sp,
-                fontWeight = FontWeight.Bold, color = color)
+            Text(value, fontFamily = FontFamily.Monospace, fontSize = d.priceSp,
+                fontWeight = FontWeight.Bold, color = color, maxLines = 1)
         }
+    }
+}
+
+/**
+ * Every control height on this screen, derived from the REAL screen height rather than baked in.
+ *
+ * The trader watches the positions grid; the chrome above it is there to be used and then
+ * ignored. Fixed dp meant the chrome took whatever it liked and the grid took the remainder --
+ * about three rows. These fractions invert that, and the coerceIn bounds keep a control from
+ * shrinking below a tappable size on a small phone.
+ */
+@Immutable
+private data class Dims(
+    val gap: Dp,
+    val quotePad: Dp,
+    val priceSp: TextUnit,
+    val tabH: Dp,
+    val fieldH: Dp,
+    val actionH: Dp,
+    val bulkH: Dp,
+)
+
+/**
+ * A text field we can actually SIZE.
+ *
+ * Material3's OutlinedTextField enforces a 56.dp minimum height and reserves another line for a
+ * floating label -- roughly 70.dp per field. Three of them (LOT, SL, TP) ate a fifth of the
+ * screen before a single price was on it, and no Modifier.height() will talk it down. So the
+ * field is a BasicTextField in a bordered Box, with the label as a caption above it: same
+ * behaviour, height we control.
+ */
+@Composable
+private fun CompactField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    height: Dp,
+    keyboardType: KeyboardType,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    fontSize: TextUnit = 17.sp,
+) {
+    Column(modifier) {
+        Text(label, fontSize = 9.sp, fontWeight = FontWeight.Bold,
+             color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(2.dp))
+        BasicTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            textStyle = LocalTextStyle.current.copy(
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = fontSize,
+                fontWeight = FontWeight.Bold,
+            ),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(height)
+                .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+                .padding(horizontal = 10.dp),
+            decorationBox = { inner ->
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                    if (value.isEmpty() && placeholder.isNotEmpty()) {
+                        Text(placeholder, fontSize = 12.sp,
+                             color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    inner()
+                }
+            },
+        )
     }
 }
 
@@ -391,12 +476,13 @@ private fun OrderFormBlock(
     onTp: (String) -> Unit,
     onEnterArmed: () -> Unit,
     onCloseArmed: () -> Unit,
+    d: Dims,
 ) {
     Column {
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Bottom,
         ) {
             // contentPadding = 0 is load-bearing. Material's default button padding is 24.dp on
             // EACH side; inside a 48.dp-wide button that leaves ZERO width for the label, so the
@@ -404,26 +490,26 @@ private fun OrderFormBlock(
             OutlinedButton(
                 onClick = { onStepLot(-1) },
                 contentPadding = PaddingValues(0.dp),
-                modifier = Modifier.width(48.dp),
+                modifier = Modifier.width(46.dp).height(d.fieldH),
             ) { Text("−", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
 
-            OutlinedTextField(
+            CompactField(
                 value = form.lot,
                 onValueChange = onLot,
-                label = { Text("LOT", fontSize = 10.sp) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                label = "LOT",
+                height = d.fieldH,
+                keyboardType = KeyboardType.Decimal,
                 modifier = Modifier.weight(1f),
             )
 
             OutlinedButton(
                 onClick = { onStepLot(1) },
                 contentPadding = PaddingValues(0.dp),
-                modifier = Modifier.width(48.dp),
+                modifier = Modifier.width(46.dp).height(d.fieldH),
             ) { Text("+", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
 
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(d.gap))
 
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             // The labels say "points" on purpose. These are POINT DISTANCES, not prices -- the
@@ -431,29 +517,31 @@ private fun OrderFormBlock(
             // and a price entered here would be silently ACCEPTED as a distance, placing a stop
             // thousands of points away. Being accepted rather than rejected is what makes it
             // dangerous.
-            OutlinedTextField(
-                value = form.slPoints,
-                onValueChange = onSl,
-                label = { Text("SL (points)", fontSize = 10.sp) },
-                placeholder = { Text("0 = none", fontSize = 11.sp) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                supportingText = { PointsHint(form.slPoints, digits) },
-                modifier = Modifier.weight(1f),
-            )
-            OutlinedTextField(
-                value = form.tpPoints,
-                onValueChange = onTp,
-                label = { Text("TP (points)", fontSize = 10.sp) },
-                placeholder = { Text("0 = none", fontSize = 11.sp) },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                supportingText = { PointsHint(form.tpPoints, digits) },
-                modifier = Modifier.weight(1f),
-            )
+            Column(Modifier.weight(1f)) {
+                CompactField(
+                    value = form.slPoints,
+                    onValueChange = onSl,
+                    label = "SL (points)",
+                    height = d.fieldH,
+                    keyboardType = KeyboardType.Number,
+                    placeholder = "0 = none",
+                )
+                PointsHint(form.slPoints, digits)
+            }
+            Column(Modifier.weight(1f)) {
+                CompactField(
+                    value = form.tpPoints,
+                    onValueChange = onTp,
+                    label = "TP (points)",
+                    height = d.fieldH,
+                    keyboardType = KeyboardType.Number,
+                    placeholder = "0 = none",
+                )
+                PointsHint(form.tpPoints, digits)
+            }
         }
 
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(d.gap))
 
         // ── CLOSE is ALWAYS the left slot. ENTRY is ALWAYS the right slot. ──
         //
@@ -478,10 +566,14 @@ private fun OrderFormBlock(
                     contentColor = if (hasTarget) MaterialTheme.colorScheme.onSurface
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                 ),
-                modifier = Modifier.weight(1f).height(56.dp),
+                // Zero padding: the default 8.dp top+bottom clipped the second line clean off,
+                // so CLOSE showed no ticket and BUY showed no price -- the two facts those
+                // buttons exist to tell you.
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.weight(1f).height(d.actionH),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("CLOSE", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("CLOSE", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     // WHICH position is about to go. "Close one" without saying which one is an
                     // invitation to close the wrong rung of a pyramid.
                     Text(
@@ -500,11 +592,12 @@ private fun OrderFormBlock(
                 enabled = canTrade,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (armed.isBuy) Green else Red),
-                modifier = Modifier.weight(1f).height(56.dp),
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.weight(1f).height(d.actionH),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(if (armed.isBuy) "BUY" else "SELL",
-                         fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                         fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     // The price it will actually fill at: BUY lifts the ASK, SELL hits the BID.
                     Text(
                         Fmt.price(if (armed.isBuy) quote.ask else quote.bid, armed.digits),
@@ -527,12 +620,12 @@ private fun OrderFormBlock(
  *  - The buttons below it NEVER MOVE. Only their colour and label change. See OrderFormBlock.
  */
 @Composable
-private fun ArmedTabs(side: String, onPick: (String) -> Unit) {
+private fun ArmedTabs(side: String, d: Dims, onPick: (String) -> Unit) {
     val isBuy = side != "sell"
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        ArmedTab("BUY ARMED", selected = isBuy, tint = Green,
+        ArmedTab("BUY ARMED", selected = isBuy, tint = Green, h = d.tabH,
                  modifier = Modifier.weight(1f)) { onPick("buy") }
-        ArmedTab("SELL ARMED", selected = !isBuy, tint = Red,
+        ArmedTab("SELL ARMED", selected = !isBuy, tint = Red, h = d.tabH,
                  modifier = Modifier.weight(1f)) { onPick("sell") }
     }
 }
@@ -542,37 +635,59 @@ private fun ArmedTab(
     label: String,
     selected: Boolean,
     tint: Color,
+    h: Dp,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     Button(
         onClick = onClick,
         shape = RoundedCornerShape(6.dp),
-        contentPadding = PaddingValues(vertical = 6.dp),
+        contentPadding = PaddingValues(0.dp),
         colors = ButtonDefaults.buttonColors(
             containerColor = if (selected) tint else MaterialTheme.colorScheme.surfaceVariant,
             contentColor = if (selected) Color.Black
             else MaterialTheme.colorScheme.onSurfaceVariant,
         ),
-        modifier = modifier.height(38.dp),
+        modifier = modifier.height(h),
     ) {
-        Text(label, fontSize = 12.sp,
+        Text(label, fontSize = 12.sp, maxLines = 1,
              fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
     }
 }
 
 @Composable
-private fun BulkCloseBar(enabled: Boolean, onPick: (String) -> Unit) {
+private fun BulkCloseBar(enabled: Boolean, d: Dims, onPick: (String) -> Unit) {
+    // maxLines = 1 and contentPadding = 0: at the default padding "CLOSE LOSING" wrapped to two
+    // lines, which silently made this bar half as tall again as it needed to be. Three buttons
+    // wrapping is a surprising amount of the screen to lose to word-wrap.
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        OutlinedButton(onClick = { onPick("all") }, enabled = enabled, modifier = Modifier.weight(1f)) {
-            Text("CLOSE ALL", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        // The word CLOSE stays on every one of them. These are destructive, and "LOSING" on its
+        // own reads like a filter, not like a button that flattens your losers.
+        BulkBtn("CLOSE ALL", MaterialTheme.colorScheme.primary, enabled, d, Modifier.weight(1f)) {
+            onPick("all")
         }
-        OutlinedButton(onClick = { onPick("losing") }, enabled = enabled, modifier = Modifier.weight(1f)) {
-            Text("CLOSE LOSING", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Red)
-        }
-        OutlinedButton(onClick = { onPick("profit") }, enabled = enabled, modifier = Modifier.weight(1f)) {
-            Text("CLOSE PROFIT", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Green)
-        }
+        BulkBtn("CLOSE LOSING", Red, enabled, d, Modifier.weight(1f)) { onPick("losing") }
+        BulkBtn("CLOSE PROFIT", Green, enabled, d, Modifier.weight(1f)) { onPick("profit") }
+    }
+}
+
+@Composable
+private fun BulkBtn(
+    label: String,
+    tint: Color,
+    enabled: Boolean,
+    d: Dims,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        contentPadding = PaddingValues(0.dp),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = tint),
+        modifier = modifier.height(d.bulkH),
+    ) {
+        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
     }
 }
 

@@ -145,6 +145,35 @@ Connect screen always wins and is never silently reverted by the next install.
 
 ---
 
+## Pointing the app at the EC2 box
+
+**No rebuild. No certificate. Nothing to change in this directory.** The base URL is a *setting*, not
+a build constant — `Secrets.normalizeBaseUrl` takes whatever `host:port` you type, defaulting the
+scheme to `http://` and the port to `:8765`. So repointing the app is two fields on the Connect
+screen.
+
+What you need:
+
+| | |
+|---|---|
+| Phone | Android **14+** (`minSdk 34`) |
+| Tailscale | Install it from the Play Store, sign in to the same tailnet as the box |
+| Server address | The box's `100.x.y.z:8765` (printed by `provision.bat`) |
+| API token | Printed once by `provision.bat` |
+| **Certificates** | **None. Not required, and not supported** — see below |
+
+**There is no TLS anywhere in this app.** No trust store, no pinning, no self-signed handling — the
+OkHttp client is stock (`Feed.kt`), and the server speaks plain HTTP. A self-signed certificate would
+fail as an opaque "connection failed", not a useful error. Encryption comes from **WireGuard**:
+Tailscale carries the cleartext hop, and port 8765 is never opened in the EC2 security group.
+
+Set the box up with `XauOrderPad\deploy\bat\provision.bat` — see
+[XauOrderPad/deploy/README.md](../XauOrderPad/deploy/README.md). Do **not** try to reach the box by
+opening 8765 on its public IP: the token grants order placement on a live account and the transport
+is cleartext.
+
+---
+
 ## Release signing
 
 Four environment variables, supplied via `android/.env` (gitignored) → docker compose:
