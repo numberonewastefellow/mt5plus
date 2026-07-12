@@ -11,6 +11,13 @@ stop and a good target?
 > **not** survive honest (out-of-sample) testing — it loses. The magnitude signal
 > is real and reusable; the direction signal is not.
 
+**See also: [TREND_LADDER_STRATEGY.md](TREND_LADDER_STRATEGY.md)** — a tick-level
+pyramid-into-the-move strategy, investigated separately. It reaches **the same wall from a
+completely different direction**: with no directional edge, expectancy is **−1 spread per trade**,
+and *no* arrangement of target and stop escapes it (a full target × trail sweep lands every cell on
+−0.24 = the spread). That two unrelated approaches converge on the same barrier is the strongest
+evidence it is real.
+
 ---
 
 ## 1. The two-part conclusion

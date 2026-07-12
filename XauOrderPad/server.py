@@ -234,22 +234,41 @@ class CloseWhereReq(BaseModel):
 
 
 class StrategyReq(BaseModel):
-    """Enable/disable + tune the automated volume-spike straddle strategy.
+    """Enable/disable + tune ONE automated strategy engine.
 
     All fields optional: send just `enabled` to toggle, or any subset of params
-    to retune live. The worker enforces the DEMO-only + hedging-account guards;
-    this endpoint only forwards the request.
+    to retune live. Params are the union across engines and each engine ignores
+    what it does not recognise -- so one model serves both without the endpoint
+    needing to know which engine it is talking to.
+
+    The WORKER enforces every guard (demo-only, hedging where required, the
+    ladder's spread check, the kill-switch). This endpoint only forwards. That
+    ordering is deliberate: a guard that lives in the HTTP layer is one forged
+    curl away from being bypassed.
     """
     enabled: bool | None = None
-    volume: float | None = None
+    # straddle
     rvol_threshold: float | None = None
     sl_atr_mult: float | None = None
     tp_r: float | None = None
     max_hold_min: float | None = None
     cooldown_min: float | None = None
-    max_daily_loss: float | None = None
     max_concurrent: int | None = None
     vol_filter: bool | None = None
+    # ladder
+    side: str | None = None
+    trigger: float | None = None
+    max_positions: int | None = None
+    entry_mode: str | None = None
+    entry_step: float | None = None
+    entry_gap_ms: int | None = None
+    target: float | None = None
+    retrace: float | None = None
+    hard_sl: float | None = None
+    paper: bool | None = None
+    # shared
+    volume: float | None = None
+    max_daily_loss: float | None = None
 
 
 class ProfileReq(BaseModel):
@@ -319,23 +338,57 @@ async def _do(cmd: dict):
 
 
 # ---- automated strategy: status + enable/disable + tune ------------------
+@app.get("/api/strategies")
+def strategies_status(x_token: str | None = Header(default=None)):
+    """Status of EVERY engine, keyed by id (also in /ws state under `strategies`)."""
+    _check_token(x_token)
+    st = worker.get_state().get("strategies")
+    if st:
+        return st
+    return {sid: s.status() for sid, s in worker.strategies.items()}
+
+
+@app.get("/api/strategy/{sid}/status")
+def strategy_status_by_id(sid: str, x_token: str | None = Header(default=None)):
+    _check_token(x_token)
+    s = worker.strategies.get(sid)
+    if s is None:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {sid!r}")
+    return (worker.get_state().get("strategies") or {}).get(sid) or s.status()
+
+
+@app.post("/api/strategy/{sid}")
+async def strategy_control_by_id(sid: str, req: StrategyReq,
+                                 x_token: str | None = Header(default=None)):
+    """Enable/disable or retune ONE engine. Runs through the worker queue so it is
+    serialized with ticks/orders. Params with value None are left unchanged.
+
+    404 on an unknown id rather than silently doing nothing: a typo'd id that
+    returned 200 would leave the caller believing a strategy was armed when no
+    engine had ever heard of it."""
+    _check_token(x_token)
+    if sid not in worker.strategies:
+        raise HTTPException(status_code=404, detail=f"unknown strategy {sid!r}")
+    params = {k: v for k, v in req.model_dump().items() if k != "enabled" and v is not None}
+    log.info("strategy control", extra={"event": "strategy_control_http",
+                                        "strategy": sid, "enabled": req.enabled,
+                                        "params": params})
+    return JSONResponse(await _do({"action": "strategy", "id": sid,
+                                   "enabled": req.enabled, "params": params or None}))
+
+
+# ---- back-compat: the current web panel still talks to the un-namespaced pair.
+# Both alias the straddle. Kept so the UI keeps working across the migration; drop
+# them once webui/strategy.js has moved to the /{sid} routes.
 @app.get("/api/strategy/status")
 def strategy_status(x_token: str | None = Header(default=None)):
-    """Current strategy status (also included in /ws state under `strategy`)."""
     _check_token(x_token)
-    return worker.get_state().get("strategy") or worker.strategy.status()
+    return strategy_status_by_id("straddle", x_token)
 
 
 @app.post("/api/strategy")
 async def strategy_control(req: StrategyReq, x_token: str | None = Header(default=None)):
-    """Enable/disable or retune the strategy. Runs through the worker queue so it
-    is serialized with ticks/orders. Params with value None are left unchanged."""
-    _check_token(x_token)
-    params = {k: v for k, v in req.model_dump().items() if k != "enabled" and v is not None}
-    log.info("strategy control", extra={"event": "strategy_control_http",
-                                        "enabled": req.enabled, "params": params})
-    return JSONResponse(await _do({"action": "strategy",
-                                   "enabled": req.enabled, "params": params or None}))
+    return await strategy_control_by_id("straddle", req, x_token)
 
 
 # ---- account profiles: list / save / delete -----------------------------

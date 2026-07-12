@@ -42,6 +42,48 @@ STRATEGY_DEFAULTS = {
     "vol_filter": True,      # only fire when ATR is expanding (volatile regime)
 }
 
+# Each engine gets its OWN magic. This is what makes them independent: every
+# worker helper filters by magic, so no engine can see -- let alone close --
+# another's positions, and the log attributes every deal to exactly one engine.
+# Never reuse a number; an old position tagged with a recycled magic would be
+# adopted by the wrong engine on restart.
+STRATEGY_MAGICS = {
+    "straddle": 532027,
+    "ladder": 532028,
+}
+
+# --- Trend-Ladder (experimental, DEMO-ONLY) -------------------------------
+# Arm a side + trigger price; pyramid into the move; exit on a retrace.
+#
+# The defaults below are NOT arbitrary -- each one is a direct consequence of a
+# measurement in ../analysis/TREND_LADDER_STRATEGY.md. Read that before changing
+# them; the short version:
+#
+#   * The spread is FIXED at 0.24/oz and does not tighten. With no directional
+#     edge, expectancy is -1 spread per trade, and NO arrangement of target and
+#     stop escapes that (a full target x trail sweep lands every cell on -0.24).
+#   * The ladder is a pure MULTIPLIER, not an edge: same trigger/TP/stop, 1
+#     position loses $30/ladder and 10 positions lose $105. Hence max_positions
+#     defaults to 1 -- pyramiding must be opted into, once an edge is proven.
+#   * The only component that can beat the spread is the user's discretionary
+#     trigger, and that cannot be backtested. Hence paper=True by default: the
+#     engine logs what it WOULD do and places nothing, so the trigger's edge can
+#     be measured before a cent is risked.
+LADDER_DEFAULTS = {
+    "side": "sell",          # "buy" | "sell"
+    "trigger": 0.0,          # arm price; 0 = not set (engine will not fire)
+    "volume": 0.01,          # lots per position
+    "max_positions": 1,      # see above -- >1 multiplies the spread cost
+    "entry_mode": "step",    # "step" (spaced by price) | "timer" (N per second)
+    "entry_step": 0.30,      # step mode: add only on a new extreme this far on
+    "entry_gap_ms": 200,     # timer mode: min ms between entries (200 = 5/sec)
+    "target": 1.00,          # $/oz profit per position (1.00 = 1000 points)
+    "retrace": 0.30,         # $/oz pullback from the extreme -> close out
+    "hard_sl": 3.00,         # $/oz broker-side stop, in case this process dies
+    "max_daily_loss": 200.0, # USD kill-switch
+    "paper": True,           # log-only; places NO orders. Default ON.
+}
+
 # --- Server ---------------------------------------------------------------
 # HOST: bind address. Two legitimate values, and one that is never legitimate:
 #   127.0.0.1    -> local desktop use (default). Reachable only via an SSH tunnel.

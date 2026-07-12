@@ -19,7 +19,7 @@ from typing import Any
 import MetaTrader5 as mt5
 
 import config
-from strategy import VolumeSpikeStraddle
+from strategies import ENGINES
 
 
 # Logger for every worker-side event. Configured by logger_setup.setup_logging()
@@ -61,9 +61,13 @@ class Mt5Worker:
         self._session_active = False
         self._poll_count = 0
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
-        # The one automated, demo-only strategy. Disabled until enabled from the
-        # UI; evaluated on THIS worker thread so it never races ticks/orders.
-        self.strategy = VolumeSpikeStraddle()
+        # The automated, demo-only strategy engines, keyed by id. All disabled
+        # until enabled from a UI, and all evaluated on THIS worker thread, so
+        # they never race ticks/orders -- or each other. Each owns a distinct
+        # magic (config.STRATEGY_MAGICS), which is what makes them independent:
+        # every MT5 helper filters by it, so no engine can see or close another's
+        # positions.
+        self.strategies = {e.ID: e() for e in ENGINES}
         # Health-transition tracking: log only when these flip, not on every poll.
         self._last_healthy: bool | None = None
         # Account snapshot throttle: log a snapshot at most once per N polls.
@@ -289,17 +293,24 @@ class Mt5Worker:
             log.exception("poll_state crashed",
                           extra={"event": "poll_state_exception"})
         # Expose strategy status in the pushed snapshot so the UI can render it.
-        st["strategy"] = self.strategy.status()
+        st["strategies"] = {sid: s.status() for sid, s in self.strategies.items()}
+        # Back-compat: the current web panel still reads st["strategy"].
+        st["strategy"] = st["strategies"].get("straddle")
         self._swap(st)
 
-        # Drive the automated strategy AFTER the swap so any orders it places show
-        # up on the next poll. Fully sandboxed: a crash here never kills the worker
-        # and never affects manual trading (strategy is a no-op unless enabled).
-        try:
-            self.strategy.evaluate(self, st)
-        except Exception:
-            log.exception("strategy evaluate crashed",
-                          extra={"event": "strategy_exception"})
+        # Drive the engines AFTER the swap so any orders they place show up on the
+        # next poll. Fully sandboxed: a crash here never kills the worker and never
+        # affects manual trading (an engine is a no-op unless enabled).
+        #
+        # The try/except is PER ENGINE, deliberately. A shared one would let a crash
+        # in the first engine silently skip every engine after it -- including, say,
+        # the one holding open positions and waiting to close them.
+        for sid, s in self.strategies.items():
+            try:
+                s.evaluate(self, st)
+            except Exception:
+                log.exception("strategy evaluate crashed",
+                              extra={"event": "strategy_exception", "strategy": sid})
 
         # --- Structured event emission (post-swap, deliberately throttled) ---
         # We poll 15 times/sec; we do NOT want one log line every 67ms. Instead:
@@ -359,7 +370,11 @@ class Mt5Worker:
         if action == "logout":
             return self._logout(cmd)
         if action == "strategy":
-            return self.strategy.update(cmd.get("params"), cmd.get("enabled"))
+            sid = cmd.get("id") or "straddle"      # default keeps the old API working
+            s = self.strategies.get(sid)
+            if s is None:
+                return {"ok": False, "error": f"unknown strategy {sid!r}"}
+            return s.update(cmd.get("params"), cmd.get("enabled"))
         return {"ok": False, "error": f"unknown action {action!r}"}
 
     # ---- strategy support (worker-thread only; called from strategy.evaluate) ----
@@ -367,16 +382,23 @@ class Mt5Worker:
         """Last `count` M1 bars for the active symbol (structured np array)."""
         return mt5.copy_rates_from_pos(self._symbol, mt5.TIMEFRAME_M1, 0, int(count))
 
-    def strategy_positions(self) -> list:
-        """Open positions belonging to the strategy (STRATEGY_MAGIC only)."""
-        poss = mt5.positions_get(symbol=self._symbol) or []
-        return [p for p in poss if int(p.magic) == int(config.STRATEGY_MAGIC)]
+    def strategy_positions(self, magic: int) -> list:
+        """Open positions belonging to ONE engine.
 
-    def strategy_place(self, side: str, volume: float,
-                       sl_dist: float, tp_dist: float) -> dict:
-        """Market order for one straddle leg with absolute SL/TP derived from the
-        fill side price. Tagged STRATEGY_MAGIC so it is never touched by manual
-        close-all and is independently attributable in the log."""
+        `magic` is required, not defaulted. Every strategy helper filters on it,
+        and that filter is the only thing keeping two engines independent: without
+        it, one engine's kill-switch would happily flatten the other's book."""
+        poss = mt5.positions_get(symbol=self._symbol) or []
+        return [p for p in poss if int(p.magic) == int(magic)]
+
+    def strategy_place(self, magic: int, side: str, volume: float,
+                       sl_dist: float, tp_dist: float,
+                       comment: str = "XauStrategy") -> dict:
+        """Market order with absolute SL/TP derived from the fill-side price.
+
+        Tagged with the calling engine's `magic`, so it is never touched by manual
+        close-all, never touched by another engine, and independently attributable
+        in the log. `sl_dist`/`tp_dist` of 0 mean "no stop"/"no target"."""
         si = mt5.symbol_info(self._symbol)
         tick = mt5.symbol_info_tick(self._symbol)
         if si is None or tick is None:
@@ -391,11 +413,13 @@ class Mt5Worker:
             "volume": float(volume),
             "type": mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
             "price": price,
-            "sl": round(sl, si.digits),
-            "tp": round(tp, si.digits),
+            # 0 => omit. MT5 reads 0.0 as "no stop", but sending a rounded 0.0
+            # where a price is expected is asking for an INVALID_STOPS retcode.
+            "sl": round(sl, si.digits) if sl_dist else 0.0,
+            "tp": round(tp, si.digits) if tp_dist else 0.0,
             "deviation": int(config.DEFAULT_DEVIATION),
-            "magic": int(config.STRATEGY_MAGIC),
-            "comment": "XauStraddle",
+            "magic": int(magic),
+            "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": _pick_filling(si),
         }
@@ -408,12 +432,19 @@ class Mt5Worker:
                 "price": getattr(res, "price", price), "retcode": res.retcode,
                 "error": None if ok else f"retcode {res.retcode}: {res.comment}"}
 
-    def strategy_close_ticket(self, ticket: int) -> dict:
-        """Close one strategy position by ticket (closing deal keeps STRATEGY_MAGIC)."""
+    def strategy_close_ticket(self, magic: int, ticket: int) -> dict:
+        """Close one position by ticket, but ONLY if it belongs to `magic`.
+
+        The ownership re-check is not paranoia: a ticket list can go stale (the
+        broker closes a position on SL while the engine still holds its number),
+        and a recycled ticket must never let one engine close another's trade."""
         poss = mt5.positions_get(ticket=int(ticket))
         if not poss:
             return {"ok": False, "error": "ticket not found"}
         p = poss[0]
+        if int(p.magic) != int(magic):
+            return {"ok": False, "ticket": int(ticket),
+                    "error": f"ticket {ticket} belongs to magic {p.magic}, not {magic}"}
         si = mt5.symbol_info(self._symbol)
         tick = mt5.symbol_info_tick(self._symbol)
         is_buy = p.type == mt5.POSITION_TYPE_BUY
@@ -425,8 +456,8 @@ class Mt5Worker:
             "position": p.ticket,
             "price": tick.bid if is_buy else tick.ask,
             "deviation": int(config.DEFAULT_DEVIATION),
-            "magic": int(config.STRATEGY_MAGIC),
-            "comment": "XauStraddle close",
+            "magic": int(magic),
+            "comment": "XauStrategy close",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": _pick_filling(si),
         }
@@ -436,15 +467,15 @@ class Mt5Worker:
             return {"ok": False, "ticket": int(ticket), "error": f"{code}: {msg}"}
         return {"ok": res.retcode == mt5.TRADE_RETCODE_DONE, "ticket": int(ticket)}
 
-    def strategy_daily_realized(self) -> float:
-        """Today's realized P/L (profit+swap+commission) for STRATEGY_MAGIC deals."""
+    def strategy_daily_realized(self, magic: int) -> float:
+        """Today's realized P/L (profit+swap+commission) for ONE engine's deals."""
         now = datetime.datetime.now()
         start = datetime.datetime(now.year, now.month, now.day)
         deals = mt5.history_deals_get(start, now) or []
         out = (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT, mt5.DEAL_ENTRY_OUT_BY)
         total = 0.0
         for d in deals:
-            if int(getattr(d, "magic", 0)) == int(config.STRATEGY_MAGIC) and d.entry in out:
+            if int(getattr(d, "magic", 0)) == int(magic) and d.entry in out:
                 total += d.profit + d.swap + d.commission
         return round(total, 2)
 
