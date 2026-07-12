@@ -55,7 +55,11 @@ STRATEGY_DEFAULTS = {
 # Read from the environment so the secret never lands in a git-tracked file --
 # `mt5plus` is a repo, and a committed token is one `git add .` from publication.
 HOST = os.environ.get("XAUORDERPAD_HOST", "127.0.0.1")
-PORT = 8765
+# From the environment for the same reason as HOST: changing where the server
+# listens should never require editing a git-tracked file. The Android client
+# follows whatever host:port you type on its Connect screen, so a non-default
+# port needs no rebuild -- only this.
+PORT = int(os.environ.get("XAUORDERPAD_PORT", "8765"))
 POLL_HZ = 15                 # backend MT5 poll + max UI push rate (clients may ask for less)
 API_TOKEN = os.environ.get("XAUORDERPAD_TOKEN", "")
 

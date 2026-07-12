@@ -24,6 +24,12 @@ The repo root also holds a standalone PWA (`index.html`, `sw.js`) that is not pa
 | Headless API tests (no MT5 needed) | `docker compose -f testing/docker-compose.yml …` | [XauOrderPad/testing/README.md](XauOrderPad/testing/README.md) |
 | Deploy to EC2 | `XauOrderPad\deploy\bat\*.bat` | [XauOrderPad/deploy/README.md](XauOrderPad/deploy/README.md) |
 
+**The two AWS docs are split on purpose.** [deploy/README.md](XauOrderPad/deploy/README.md) is what
+you *do* (the operator runbook, next to the scripts); [DEPLOY_AWS.md](XauOrderPad/DEPLOY_AWS.md) is
+*why it is built that way* (architecture + decisions). They previously overlapped, drifted, and ended
+up **contradicting each other on whether the API token was needed** — with the runbook carrying the
+wrong answer. Do not re-merge them, and do not copy a section from one into the other: link instead.
+
 ## Things that have already gone wrong here. Do not repeat them.
 
 **Do not delete `android/Dockerfile` or `android/docker-compose.yml`.** An agent deleted both
