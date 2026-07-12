@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Compose supplies the real theme (MaterialTheme in MainActivity). This exists only
+      so the Activity has a valid android:theme before Compose takes over. Without it
+      the app flashes a white system background on launch, which on a dark trading
+      screen is jarring.
+    -->
+    <style name="Theme.XauOrderPad" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#101214</item>
+        <item name="android:navigationBarColor">#101214</item>
+        <item name="android:windowBackground">#101214</item>
+    </style>
+</resources>

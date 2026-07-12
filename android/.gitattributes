@@ -1,0 +1,7 @@
+# gradlew is executed by /bin/sh INSIDE the Linux build container. Git on Windows
+# would otherwise check it out with CRLF line endings, and Linux then fails with a
+# confusing `bad interpreter: No such file or directory` -- the \r becomes part of
+# the shebang path. Force LF regardless of the host's autocrlf setting.
+gradlew text eol=lf
+*.sh    text eol=lf
+gradlew.bat text eol=crlf

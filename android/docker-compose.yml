@@ -1,0 +1,57 @@
+services:
+  build:
+    build: .
+    image: xauorderpad-android:local
+    container_name: xauorderpad-android
+    working_dir: /workspace
+
+    # `sleep infinity` keeps the container LONG-LIVED so we `docker compose exec` into
+    # it. Do NOT switch to `docker compose run --rm` per build: that tears down the
+    # Gradle daemon every time, turning every build into a ~2 min cold start. With a
+    # warm daemon, incremental builds land in ~10-20 s.
+    command: sleep infinity
+
+    # No `network_mode: host`. Host networking is a Linux-only Docker feature -- on
+    # Docker Desktop for Windows it is an opt-in beta, not the default. It is also
+    # unnecessary: the default bridge NATs outbound TCP, and `adb connect
+    # <phone-ip>:<port>` is plain outbound TCP.
+
+    environment:
+      GRADLE_USER_HOME: /gradle-home
+
+      # Release signing. app/build.gradle.kts reads these four via System.getenv() and
+      # registers no release signingConfig unless ALL are set -- so assembleDebug works
+      # with them absent, and assembleRelease fails loudly rather than silently falling
+      # back to the debug key (Android refuses to update an APK signed with a different
+      # key, so a silent fallback is worse than a build failure).
+      # Put the values in android/.env, which compose reads automatically. Never commit.
+      XAU_KEYSTORE: /out/keystore/xau-release.jks
+      XAU_KEYSTORE_PASSWORD: ${XAU_KEYSTORE_PASSWORD:-}
+      XAU_KEY_ALIAS: ${XAU_KEY_ALIAS:-}
+      XAU_KEY_PASSWORD: ${XAU_KEY_PASSWORD:-}
+
+    volumes:
+      # Source: bind-mounted from Windows so it stays editable and git-tracked.
+      - .:/workspace
+
+      # Host output folder. The release APK is copied here because app/build below is a
+      # named volume and therefore invisible from Windows. Also holds the keystore, which
+      # lives OUTSIDE the git repo on purpose.
+      - E:/temp/mt5_data:/out
+
+      # The three named volumes exist because Docker Desktop on Windows crosses a
+      # gRPC-FUSE boundary on EVERY file operation against a bind-mounted Windows path,
+      # and Gradle does tens of thousands of small stats per build. Keeping the
+      # churn-heavy dirs on Linux-native volumes is what makes incremental builds fast.
+      - gradle-home:/gradle-home            # dependency cache (~5 min cold vs ~30 s cached)
+      - gradle-project:/workspace/.gradle   # per-project Gradle state
+      - build-out:/workspace/app/build      # build output -- the hottest churn
+
+      # Persist the adb pairing across container restarts, so the phone is paired once.
+      - adb-keys:/root/.android
+
+volumes:
+  gradle-home:
+  gradle-project:
+  build-out:
+  adb-keys:

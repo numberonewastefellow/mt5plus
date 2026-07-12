@@ -1,0 +1,51 @@
+[versions]
+# AGP must support compileSdk 36. AGP 8.7 was only tested to API 35 and emits
+# "This Android Gradle Plugin was tested up to compileSdk = 35" -- the build then only
+# proceeds with android.suppressUnsupportedCompileSdk, which is a lie we do not want to
+# tell. VERIFY this pair against the real compatibility matrix at first compile; if
+# 8.13.0 does not exist, drop to the newest AGP that genuinely supports API 36.
+agp = "8.13.0"
+kotlin = "2.1.0"                # Compose compiler ships INSIDE Kotlin 2.x
+
+coreKtx = "1.15.0"
+lifecycle = "2.8.7"
+activityCompose = "1.9.3"
+composeBom = "2024.12.01"
+okhttp = "4.12.0"
+serialization = "1.7.3"
+immutable = "0.3.8"             # ImmutableList -- Compose treats kotlin.List as UNSTABLE
+
+# NOTE: androidx.security:security-crypto (EncryptedSharedPreferences) is deliberately
+# ABSENT. It was deprecated in April 2025, never left alpha, and has keyset-corruption
+# crashes on some OEMs -- a crash-on-launch with no recovery but "clear app data". It also
+# cost 50-200 ms of Keystore + Tink work on the main thread at every launch.
+# We store exactly two things: a base URL and an API token for a TAILSCALE-ONLY endpoint.
+# The broker password never reaches the phone (the server reads it from the Windows
+# Credential Vault). The device lock screen is the real protection here; an at-rest
+# encryption layer that can brick the app is a bad trade. Plain SharedPreferences.
+
+[libraries]
+androidx-core-ktx           = { group = "androidx.core",              name = "core-ktx",                       version.ref = "coreKtx" }
+androidx-lifecycle-runtime  = { group = "androidx.lifecycle",         name = "lifecycle-runtime-ktx",          version.ref = "lifecycle" }
+androidx-lifecycle-compose  = { group = "androidx.lifecycle",         name = "lifecycle-runtime-compose",      version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose",   version.ref = "lifecycle" }
+androidx-activity-compose   = { group = "androidx.activity",          name = "activity-compose",               version.ref = "activityCompose" }
+
+androidx-compose-bom        = { group = "androidx.compose",           name = "compose-bom",                    version.ref = "composeBom" }
+androidx-compose-ui         = { group = "androidx.compose.ui",        name = "ui" }
+androidx-compose-graphics   = { group = "androidx.compose.ui",        name = "ui-graphics" }
+androidx-compose-material3  = { group = "androidx.compose.material3", name = "material3" }
+# Declared EXPLICITLY: LazyColumn, Modifier.background/clickable, KeyboardOptions and
+# RoundedCornerShape all come from here. It currently resolves only transitively through
+# material3's `api` dependency -- i.e. one BOM bump away from not compiling.
+androidx-compose-foundation = { group = "androidx.compose.foundation", name = "foundation" }
+
+okhttp                      = { group = "com.squareup.okhttp3",       name = "okhttp",                         version.ref = "okhttp" }
+kotlinx-serialization-json  = { group = "org.jetbrains.kotlinx",      name = "kotlinx-serialization-json",     version.ref = "serialization" }
+kotlinx-collections-immutable = { group = "org.jetbrains.kotlinx",    name = "kotlinx-collections-immutable",  version.ref = "immutable" }
+
+[plugins]
+android-application  = { id = "com.android.application",                   version.ref = "agp" }
+kotlin-android       = { id = "org.jetbrains.kotlin.android",              version.ref = "kotlin" }
+kotlin-compose       = { id = "org.jetbrains.kotlin.plugin.compose",       version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

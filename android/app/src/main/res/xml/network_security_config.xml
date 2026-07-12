@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The server speaks PLAIN HTTP. That is not an oversight and it is not insecure here:
+  WireGuard (Tailscale) is the encryption layer. The box binds 8765 to its tailnet
+  address only, port 8765 is never opened in the EC2 security group, and the traffic
+  never touches the public internet unencrypted.
+
+  ── An honest limitation ──
+  Android's network security config CANNOT express a CIDR range, so we cannot scope
+  cleartext to Tailscale's 100.64.0.0/10 CGNAT block. Scoping is only possible by
+  HOSTNAME.
+
+  Two ways to run this, in order of preference:
+
+  1. PREFERRED — point the app at the box's MagicDNS name (e.g. `mt5-box.tailnet-abc.ts.net`).
+     The `ts.net` domain-config below then permits cleartext for tailnet hosts and
+     NOTHING ELSE: a typo'd public URL would be refused by the platform rather than
+     sending an API token in the clear over the internet.
+
+  2. FALLBACK — a raw `100.x.y.z` IP. This requires the permissive base-config below.
+     It works, but the platform can no longer stop a mis-typed address from being
+     contacted in cleartext.
+
+  If you commit to MagicDNS, delete `cleartextTrafficPermitted="true"` from base-config
+  and this becomes genuinely scoped. It is left permissive by default only because a raw
+  Tailscale IP is the more likely thing to be typed on a phone.
+-->
+<network-security-config>
+
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Tailscale MagicDNS names. Cleartext here is carried inside WireGuard. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">ts.net</domain>
+    </domain-config>
+
+</network-security-config>

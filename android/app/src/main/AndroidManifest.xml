@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+      specialUse, NOT dataSync. Android 15 caps dataSync foreground services at a
+      CUMULATIVE 6 hours per 24h, after which the system stops them. For a trading feed
+      that is a silent catastrophic failure: the socket dies mid-session and the
+      notification freezes on a stale P&L while the user believes it is live.
+      specialUse is not time-capped. Google Play would demand a written justification
+      for it, which is irrelevant because this APK is sideloaded and never published.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="XauOrderPad"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.XauOrderPad">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="XauOrderPad"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".svc.FeedService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Maintains a persistent WebSocket to a private trading
+                    server so live quotes and open-position P&amp;L keep updating while the
+                    screen is off, and so positions can be closed from the notification.
+                    A time-capped type (dataSync) would silently sever the feed
+                    mid-session." />
+        </service>
+    </application>
+</manifest>
