@@ -463,13 +463,20 @@
 <div class="modal" id="strategyModal" hidden>
   <div class="modal-card">
     <div class="modal-head">
-      <h2>Strategy — Volume-Spike Straddle</h2>
+      <h2>Strategies</h2>
       <button class="modal-x" id="strategyClose">✕</button>
     </div>
 
     <div class="autotest-banner loading" id="stratBanner">checking account…</div>
 
-    <div class="modal-body">
+    <!-- One tab per engine. Each engine is fully independent server-side (its own
+         magic number), so enabling one has no bearing on the other. -->
+    <div class="strat-tabs">
+      <button class="strat-tab on" id="tabStraddle" data-panel="straddlePanel">STRADDLE</button>
+      <button class="strat-tab"    id="tabLadder"   data-panel="ladderPanel">LADDER</button>
+    </div>
+
+    <div class="modal-body" id="straddlePanel">
       <div class="set-note" style="margin-bottom:10px">
         On a volume spike (M1 volume ≥ threshold × its recent median) the bot opens
         a <b>long AND a short</b> at once — tight ATR stop each, larger target — so it
@@ -528,6 +535,98 @@
         <div class="kv"><div class="atk">Realized today</div><div class="atv" id="stRealized">0.00</div></div>
       </div>
       <div class="autotest-verdict" id="stError" hidden></div>
+    </div>
+
+    <!-- ===================== TREND LADDER ===================== -->
+    <div class="modal-body" id="ladderPanel" hidden>
+      <div class="set-note" style="margin-bottom:10px">
+        Arm a <b>side + trigger price</b>. When price crosses it the bot pyramids into the
+        move, takes <b>+target $/oz</b> per position, and closes everything if price
+        <b>retraces</b> from the extreme.
+        <br><br>
+        <b>Measured on 37,500 real ticks</b> (see <code>analysis/TREND_LADDER_STRATEGY.md</code>):
+        the spread is a fixed <b>0.24/oz</b> and never tightens. With no directional edge the
+        expectancy is <b>−1 spread per trade</b>, and <i>no</i> target/stop arrangement escapes
+        that. The ladder multiplies <b>cost</b>, not edge — 1 position loses $30/ladder, 10 lose
+        $105. <b>The only thing that can beat the spread is your trigger.</b> So: leave
+        <b>PAPER MODE on</b>, arm it with real calls for a week, and see whether your triggers
+        actually clear 0.24/oz before any money moves.
+      </div>
+
+      <!-- Paper mode first, and loudest. It is the safety, not a footnote. -->
+      <div class="set-row toggle paper-row">
+        <label><b>PAPER MODE</b> — log only, place NO orders <span class="paper-hint">(turn OFF and it trades for real)</span></label>
+        <input type="checkbox" id="ldPaper" checked>
+      </div>
+      <div class="set-row toggle">
+        <label><b>Enable strategy</b></label>
+        <input type="checkbox" id="ldEnabled">
+      </div>
+
+      <div class="set-row">
+        <label>Side</label>
+        <select id="ldSide">
+          <option value="sell">SELL below trigger</option>
+          <option value="buy">BUY above trigger</option>
+        </select>
+      </div>
+      <div class="set-row">
+        <label>Trigger price</label>
+        <input id="ldTrigger" type="number" step="0.01" placeholder="e.g. 4119.00" value="0">
+      </div>
+      <div class="set-row">
+        <label>Lot per position</label>
+        <input id="ldVolume" type="number" min="0.01" step="0.01" value="0.01">
+      </div>
+
+      <div class="set-row">
+        <label>Target ($/oz per position) <span class="spread-hint" id="ldSpreadHint"></span></label>
+        <input id="ldTarget" type="number" min="0.01" step="0.05" value="1.00">
+      </div>
+      <div class="set-row">
+        <label>Retrace stop ($/oz from the extreme)</label>
+        <input id="ldRetrace" type="number" min="0.01" step="0.05" value="0.30">
+      </div>
+
+      <div class="set-row">
+        <label>Max positions <span class="spread-hint">(&gt;1 multiplies the spread cost)</span></label>
+        <input id="ldMaxPos" type="number" min="1" max="20" step="1" value="1">
+      </div>
+      <div class="set-row">
+        <label>Entry spacing</label>
+        <select id="ldEntryMode">
+          <option value="step">By price (recommended)</option>
+          <option value="timer">By time (N/sec)</option>
+        </select>
+      </div>
+      <div class="set-row">
+        <label>…step ($/oz between entries)</label>
+        <input id="ldStep" type="number" min="0.01" step="0.05" value="0.30">
+      </div>
+      <div class="set-row">
+        <label>…or gap (ms between entries)</label>
+        <input id="ldGapMs" type="number" min="50" step="50" value="200">
+      </div>
+
+      <div class="set-row">
+        <label>Hard stop per position ($/oz, broker-side)</label>
+        <input id="ldHardSl" type="number" min="0.1" step="0.5" value="3.0">
+      </div>
+      <div class="set-row">
+        <label>Daily-loss kill-switch (USD)</label>
+        <input id="ldMaxLoss" type="number" min="0" step="10" value="200">
+      </div>
+
+      <div class="autotest-status" id="ladderStatus">
+        <div class="kv"><div class="atk">State</div>          <div class="atv" id="ldState">disabled</div></div>
+        <div class="kv"><div class="atk">Open positions</div> <div class="atv" id="ldOpen">0</div></div>
+        <div class="kv"><div class="atk">Ladders done</div>   <div class="atv" id="ldDone">0</div></div>
+        <div class="kv"><div class="atk">Paper P&amp;L ($/oz)</div><div class="atv" id="ldPaperPl">0.000</div></div>
+        <div class="kv"><div class="atk">Paper trades</div>   <div class="atv" id="ldPaperTrades">0</div></div>
+        <div class="kv"><div class="atk">Live spread</div>    <div class="atv" id="ldSpread">—</div></div>
+      </div>
+      <div class="autotest-verdict" id="ldWarn" hidden></div>
+      <div class="autotest-verdict" id="ldError" hidden></div>
     </div>
 
     <div class="modal-foot">

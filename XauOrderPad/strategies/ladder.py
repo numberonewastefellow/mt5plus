@@ -229,7 +229,32 @@ class TrendLadder(StrategyBase):
         self._ladder = None
         self._tickets = []
 
+    # ---- control ----------------------------------------------------------
+    def update(self, params: dict | None, enabled: bool | None) -> dict:
+        """Enable, then immediately re-check the spread guard.
+
+        Without this the guard only ran on the next worker poll, so POST returned
+        `enabled: true, error: null` for a configuration the engine was about to
+        refuse ~66 ms later. The caller toasted "enabled" and the UI then silently
+        flipped to disabled. An API that reports success for a request it is in the
+        middle of rejecting is worse than one that just says no.
+        """
+        res = super().update(params, enabled)
+        if self.enabled and not self._spread_guard(self._last_spread):
+            return self.status()          # _spread_guard already disabled + explained
+        return res
+
     # ---- main loop --------------------------------------------------------
+    def evaluate(self, worker, st: dict) -> None:
+        # Track the spread even while DISABLED. It is the number the operator needs
+        # in order to choose a target -- and _tick() (where it used to be captured)
+        # never runs until the engine is armed. That left the UI showing a spread of
+        # zero right up until the moment it was too late to be useful.
+        bid, ask = st.get("bid"), st.get("ask")
+        if bid and ask:
+            self._last_spread = float(ask) - float(bid)
+        super().evaluate(worker, st)
+
     def _tick(self, worker, st: dict) -> None:
         bid, ask = st.get("bid"), st.get("ask")
         if not bid or not ask:

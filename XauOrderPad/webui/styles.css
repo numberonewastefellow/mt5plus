@@ -721,3 +721,29 @@ kbd{
 .strat-dot.killed{ background:#e0524a; box-shadow:0 0 6px #e0524a; }
 @keyframes stratPulse{ 0%,100%{opacity:1} 50%{opacity:.35} }
 @media (prefers-reduced-motion: reduce){ .strat-dot.on{ animation:none } }
+
+/* ---- Strategy modal: one tab per engine ---- */
+.strat-tabs{
+  display:flex; gap:6px; padding:8px 14px 0; border-bottom:1px solid var(--border);
+}
+.strat-tab{
+  background:none; border:none; border-bottom:2px solid transparent;
+  color:var(--text-dim); font:inherit; font-size:12px; font-weight:800;
+  letter-spacing:.06em; padding:8px 12px; cursor:pointer;
+}
+.strat-tab:hover{ color:var(--text) }
+.strat-tab.on{ color:var(--text); border-bottom-color:var(--accent) }
+
+/* PAPER MODE is the safety on the ladder, not a footnote: give it the weight of
+   one. Amber = "armed but harmless"; unticking it is what makes orders real. */
+.paper-row{
+  background:rgba(217,164,65,.10); border:1px solid rgba(217,164,65,.35);
+  border-radius:6px; padding:8px 10px; margin-bottom:8px;
+}
+.paper-hint{ color:var(--text-dim); font-weight:400 }
+
+/* A target inside the spread cannot win. The server refuses to arm it; this says
+   so BEFORE apply is pressed rather than after. */
+.spread-hint{ color:var(--text-dim); font-weight:400; font-size:11px }
+.spread-hint.bad{ color:#e0524a; font-weight:700 }
+input.bad{ border-color:#e0524a !important; box-shadow:0 0 0 1px rgba(224,82,74,.35) }
