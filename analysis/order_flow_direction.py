@@ -33,6 +33,8 @@ import sys
 from math import erf, sqrt
 import numpy as np
 import MetaTrader5 as mt5
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ------------------------------ CONFIG -----------------------------------
 START     = dt.datetime(2026, 5, 24)
@@ -400,4 +402,44 @@ with open(summary_path, 'w', newline='') as f:
                     round(x['maxdd'], 2), round(x['maxdd_pct'], 2)])
 
 print(f"\nSaved:\n  {trades_path}\n  {summary_path}")
+
+# ----------------------------- Plotly chart ------------------------------
+# NOTE: this is the IN-SAMPLE picture — the config was optimized on THIS same
+# window, so the equity curve climbing is expected and NOT proof of an edge.
+if trades:
+    step = max(1, n // 6000)                       # thin the price line for the browser
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.70, 0.30],
+                        vertical_spacing=0.06,
+                        subplot_titles=(
+                            f"{symbol} M1 — {best['strat']} rvol>={best['rvol']} SL{best['sl']}xATR "
+                            f"{best['r']}R   [IN-SAMPLE: config optimized on THIS window]",
+                            "Cumulative P&L @ 0.1 lot (USD)"))
+    fig.add_trace(go.Scatter(x=D[::step], y=c[::step], mode='lines', name='price',
+                             line=dict(color='#8a8f98', width=1)), row=1, col=1)
+    for cond, nm, sym, col in [(lambda t: t['dir'] > 0, 'long entry', 'triangle-up', '#2fa572'),
+                               (lambda t: t['dir'] < 0, 'short entry', 'triangle-down', '#e0664f')]:
+        xs = [t['entry_time'] for t in trades if cond(t)]
+        ys = [t['entry'] for t in trades if cond(t)]
+        tx = [f"{t['reason']} R={t['R']:+.2f}" for t in trades if cond(t)]
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode='markers', name=nm, text=tx,
+                                 marker=dict(symbol=sym, size=9, color=col),
+                                 hovertemplate='%{x}<br>%{y:.2f}<br>%{text}<extra></extra>'), row=1, col=1)
+    ecol = ['#2fa572' if t['R'] > 0 else '#c0392b' for t in trades]
+    fig.add_trace(go.Scatter(x=[t['exit_time'] for t in trades], y=[t['exit_price'] for t in trades],
+                             mode='markers', name='exit (win/loss)',
+                             marker=dict(symbol='x', size=6, color=ecol),
+                             hovertemplate='%{x}<br>%{y:.2f}<extra>exit</extra>'), row=1, col=1)
+    eq = np.cumsum([pnl_usd(t, 0.1) for t in trades])
+    fig.add_trace(go.Scatter(x=[t['exit_time'] for t in trades], y=eq, mode='lines',
+                             name='cum $ @0.1lot', line=dict(color='#e8b84b', width=1.6),
+                             fill='tozeroy'), row=2, col=1)
+    net01 = sum(pnl_usd(t, 0.1) for t in trades)
+    fig.update_layout(template='plotly_dark', height=760, hovermode='closest',
+                      title=f"XAUUSD M1 IN-SAMPLE — {D[0]:%b %d} to {D[-1]:%b %d %Y} — "
+                            f"{nT} trades, win {winrate:.0f}%, net ${net01:,.0f} @0.1 lot "
+                            f"(optimized on this window — not tradeable forward)")
+    chart_path = os.path.join(OUTDIR, f"chart_insample_M1_{ds}_{de}.html")
+    fig.write_html(chart_path, include_plotlyjs=True, full_html=True)
+    print(f"CHART: {chart_path}")
+
 mt5.shutdown()
