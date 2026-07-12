@@ -278,30 +278,49 @@ kbd{
 .panel-meta{font-size:10px; color:var(--text-faint); font-family:var(--font-mono)}
 .panel-meta .num{color:var(--text)}
 
+/* BULK CLOSE bar (positions panel). Reads neutral by default and only takes on
+   the loss/profit colour on hover — these flatten the book irreversibly, so they
+   should not look like something you press casually. */
+.bulk-close{display:grid; grid-template-columns:repeat(3,1fr); gap:6px; padding:7px 12px;
+            border-bottom:1px solid var(--border)}
+.bulk-btn{
+  padding:7px 6px; border-radius:5px; cursor:pointer;
+  background:var(--panel-3); color:var(--text-dim); border:1px solid var(--border-2);
+  font-family:var(--font-ui); font-size:10px; font-weight:800; letter-spacing:.6px;
+  transition:var(--speed);
+}
+.bulk-btn:hover{background:var(--panel-3); filter:brightness(1.16); color:var(--text)}
+.bulk-btn:active{transform:translateY(1px)}
+.bulk-btn:disabled{opacity:.34; cursor:default; filter:grayscale(.4)}
+.bulk-btn:disabled:hover{background:var(--panel-3); filter:grayscale(.4); color:var(--text-dim)}
+.bulk-btn.losing:hover{background:var(--sell-bg); color:var(--sell); border-color:var(--sell-line)}
+.bulk-btn.profit:hover{background:var(--buy-bg); color:var(--buy); border-color:var(--buy-line)}
+
 /* RIGHT PANE: open positions + live tick chart as two columns.
    Collapsing the chart hands the full width back to the positions table. */
 .rightpane{display:grid; grid-template-columns:1fr 1fr; gap:7px; min-height:0}
 .rightpane > .positions{min-width:0}      /* allow the table to shrink in its column */
 
-/* Collapsed → the chart shrinks to a thin rail that STILL shows the expand
-   button (so it can be brought back); the positions table takes the rest. */
-.rightpane.collapsed{grid-template-columns:1fr 34px}
-.rightpane.collapsed .chart-wrap{display:none}
-.rightpane.collapsed .chartpanel .panel-meta{display:none}
-.rightpane.collapsed .chartpanel .panel-head{
-  flex-direction:column-reverse; gap:10px; padding:9px 0; border-bottom:0; justify-content:flex-start;
+/* Chart DISABLED (default) → the panel shrinks to a thin rail showing just the
+   enable checkbox + a vertical label, handing the rest of the width to the
+   positions table. No chart is created and the feed is fully torn down. */
+.rightpane.chart-off{grid-template-columns:1fr 40px}
+.rightpane.chart-off .chart-wrap{display:none}
+.rightpane.chart-off .chartpanel .panel-meta{display:none}
+.rightpane.chart-off .chartpanel .panel-head{
+  flex-direction:column; gap:10px; padding:10px 0; border-bottom:0; justify-content:flex-start; align-items:center;
 }
-.rightpane.collapsed .chartpanel .panel-title{
+.rightpane.chart-off .chart-enable{flex-direction:column; gap:9px}
+.rightpane.chart-off .chartpanel .panel-title{
   writing-mode:vertical-rl; transform:rotate(180deg); letter-spacing:1px; white-space:nowrap;
 }
-.rightpane.collapsed .chart-toggle{margin:0}
 
 .chart-wrap{flex:1; min-height:0; position:relative}
-.chart-toggle{
-  margin-left:8px; background:none; border:0; color:var(--text-dim);
-  cursor:pointer; font-size:13px; line-height:1; padding:2px 4px; border-radius:4px;
+
+.chart-enable{
+  display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none;
 }
-.chart-toggle:hover{color:var(--text); background:var(--grid-head)}
+.chart-enable input{cursor:pointer; accent-color:var(--buy); margin:0}
 
 .grid-wrap{flex:1; overflow:auto; position:relative}
 .grid{width:100%; border-collapse:collapse; font-family:var(--font-mono)}
@@ -430,6 +449,7 @@ kbd{
 .conn-text.demo   {color:var(--good); border-color:var(--good); background:rgba(25,201,138,.10)}
 .conn-text.real   {color:var(--bad);  border-color:var(--bad);  background:rgba(255,77,82,.12)}
 .conn-text.contest{color:var(--warn); border-color:var(--warn); background:rgba(255,176,32,.10)}
+.conn-text.out    {color:var(--text-faint); border-color:var(--border-2); background:var(--panel-3)}
 
 /* ---- Top-bar SYNC chip (always visible) ----
    Driven by reconcileAutoTest() in app.js. Communicates whether the
@@ -620,3 +640,84 @@ kbd{
   100% {transform:scale(1);   box-shadow:0 0 0 0   rgba(255,176,32,0)}
 }
 .atrun-pill.ping{animation:atrun-ping .9s ease-out 1}
+
+/* ============================================================
+   ACCOUNT modal — login / switch / logout
+   Reuses .modal / .modal-card / .btn / .set-row chrome. All
+   colours come from theme tokens so every theme works.
+   ============================================================ */
+.account-card{max-width:520px; width:96vw}
+
+/* Current-session banner (DEMO green / REAL red / logged-out grey) */
+.account-banner{
+  margin:10px 16px 0; padding:10px 12px; border-radius:6px;
+  font-weight:700; font-size:12px; letter-spacing:.04em;
+  border:1px solid var(--border-2);
+}
+.account-banner.loading{color:var(--text-dim); background:var(--panel-3)}
+.account-banner.out    {color:var(--text-faint); background:var(--panel-3)}
+.account-banner.demo   {color:var(--good); background:rgba(25,201,138,.10); border-color:var(--good)}
+.account-banner.real   {color:var(--bad);  background:rgba(255,77,82,.12);  border-color:var(--bad)}
+.account-banner.contest{color:var(--warn); background:rgba(255,176,32,.10); border-color:var(--warn)}
+
+.account-body{display:flex; flex-direction:column; gap:16px}
+.account-section{display:flex; flex-direction:column; gap:9px}
+.account-section-title{
+  font-size:11px; font-weight:800; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--text-faint); padding-bottom:2px; border-bottom:1px solid var(--border);
+}
+
+/* Account text inputs are wider + left-aligned (override the narrow numeric
+   .set-row input used by Auto-Test). */
+.account-body .set-row input:not([type=checkbox]){width:240px; text-align:left}
+
+/* Saved-profile list */
+.account-list{display:flex; flex-direction:column; gap:6px}
+.account-empty{font-size:12px; color:var(--text-faint); padding:6px 2px}
+.account-row{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding:8px 10px; border-radius:6px;
+  border:1px solid var(--border-2); background:var(--panel-2);
+}
+.account-row.active{border-color:var(--accent); background:var(--accent-soft)}
+.acc-info{display:flex; flex-direction:column; gap:2px; min-width:0}
+.acc-label{font-size:13px; font-weight:700; color:var(--text); display:flex; align-items:center; gap:6px}
+.acc-sub{font-family:var(--font-mono); font-size:11px; color:var(--text-faint)}
+.acc-tag{font-size:9px; font-weight:800; letter-spacing:.08em; padding:1px 5px; border-radius:3px}
+.acc-tag.demo{color:var(--good); background:rgba(25,201,138,.12)}
+.acc-tag.real{color:var(--bad);  background:rgba(255,77,82,.14)}
+.acc-actions{display:flex; gap:6px; flex-shrink:0}
+.btn.small{padding:5px 10px; font-size:11px}
+.btn.small.switch{background:var(--accent-soft); color:var(--accent); border-color:var(--accent)}
+.btn.small.del{padding:5px 8px}
+
+.account-save-row{
+  display:flex; align-items:center; gap:8px;
+  font-size:12px; color:var(--text-dim); font-weight:600;
+}
+.account-save-row input{width:16px; height:16px; accent-color:var(--accent); cursor:pointer}
+
+/* Logged-out overlay — blocks the whole UI until a session exists */
+.loggedout-overlay{
+  position:fixed; inset:0; z-index:90;
+  background:rgba(0,0,0,.72); backdrop-filter:blur(3px);
+  display:flex; align-items:center; justify-content:center;
+}
+.loggedout-card{
+  display:flex; flex-direction:column; align-items:center; gap:12px;
+  padding:28px 36px; border-radius:12px;
+  background:var(--panel); border:1px solid var(--border-2); box-shadow:var(--glow);
+  text-align:center;
+}
+.loggedout-title{font-size:18px; font-weight:800; color:var(--text)}
+.loggedout-sub{font-size:13px; color:var(--text-dim); max-width:280px; line-height:1.5}
+
+/* ---- Strategy status dot on the top-bar STRATEGY button ---- */
+.strat-dot{
+  display:inline-block; width:8px; height:8px; margin-left:6px; border-radius:50%;
+  background:var(--text-dim); vertical-align:middle;
+}
+.strat-dot.on{ background:#2fbf71; box-shadow:0 0 6px #2fbf71; animation:stratPulse 1.6s ease-in-out infinite; }
+.strat-dot.killed{ background:#e0524a; box-shadow:0 0 6px #e0524a; }
+@keyframes stratPulse{ 0%,100%{opacity:1} 50%{opacity:.35} }
+@media (prefers-reduced-motion: reduce){ .strat-dot.on{ animation:none } }

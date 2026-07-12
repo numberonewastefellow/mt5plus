@@ -14,8 +14,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
+import re
+import socket
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,6 +28,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import accounts
 import config
 from logger_setup import setup_logging
 from mt5_worker import Mt5Worker
@@ -37,7 +42,111 @@ WEBUI_DIR = Path(__file__).parent / "webui"
 setup_logging("XauOrderPad")
 log = logging.getLogger("XauOrderPad.server")
 
+
+class _RedactToken(logging.Filter):
+    """Keep the API token out of the access log.
+
+    uvicorn.access logs the request path WITH its query string, so a `/ws?token=...`
+    connect writes the shared trading secret to the console -- and on the EC2 box, to
+    whatever captures that console -- in plaintext, once per reconnect. The token has to
+    travel as a query param (the browser's WebSocket API cannot set handshake headers),
+    so the only place left to fix this is the log boundary.
+
+    Installed at MODULE level, not under `if __name__ == "__main__"`. Redaction that only
+    works when the server happens to be started one particular way is not redaction:
+    `uvicorn server:app` is a perfectly normal way to run this, and it must not leak.
+
+    It must scrub BOTH the message and the args, and it must be attached to BOTH loggers.
+    `uvicorn.access` carries ordinary HTTP requests, but the WebSocket accept line -- the
+    one that actually carries `?token=` -- is emitted on `uvicorn.error` by uvicorn's
+    websockets implementation, as a fully-formatted message with no args. An access-log-only
+    filter looks like it works and leaks the token on every single /ws connect. (Found by
+    the test, not by reading it.)
+    """
+
+    _RE = re.compile(r"(token=)[^&\s\"'\]]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._RE.sub(r"\1<redacted>", a) if isinstance(a, str) else a
+                for a in record.args
+            )
+        if isinstance(record.msg, str) and "token=" in record.msg:
+            record.msg = self._RE.sub(r"\1<redacted>", record.msg)
+        return True
+
+
+# Both loggers: HTTP requests go to `uvicorn.access`, the WebSocket accept line to
+# `uvicorn.error`. The token only ever rides on /ws, i.e. the one this would have missed.
+for _lg in ("uvicorn.access", "uvicorn.error"):
+    logging.getLogger(_lg).addFilter(_RedactToken())
+
 worker = Mt5Worker()
+
+
+def _lan_ip() -> str | None:
+    """The IP of the interface the OS would actually use to reach the outside world.
+
+    A UDP socket is `connect()`ed to a public address and then asked for its own name. UDP is
+    connectionless, so this sends NO packets and needs no reachability -- it just makes the OS
+    consult its routing table. That is what picks the Wi-Fi adapter over the pile of WSL,
+    Hyper-V and VMware virtual adapters a dev box accumulates, all of which have perfectly
+    valid private IPs that a phone cannot reach.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def _print_banner() -> None:
+    """Say exactly which URLs are reachable, and say it loudly when they are not.
+
+    Uvicorn is not a Vite dev server: it binds ONE address and offers no "Network" URL. When
+    HOST is 127.0.0.1, a phone gets connection-refused -- and that reliably gets misdiagnosed as
+    a firewall problem, because it looks like one. The socket simply is not on the network.
+
+    The second warning is the one that matters. API_TOKEN defaults to "", which is harmless on
+    loopback and is NOT harmless the moment this is on the LAN: this process sends real MT5
+    orders, so an unauthenticated network bind means any device on the Wi-Fi can place trades
+    and flatten the book.
+    """
+    port = config.PORT
+    loopback = config.HOST in ("127.0.0.1", "localhost")
+    lan = _lan_ip()
+
+    lines = ["", "  XauOrderPad listening", f"    Local:    http://127.0.0.1:{port}"]
+
+    if loopback:
+        lines += [
+            "    Network:  NOT REACHABLE -- bound to 127.0.0.1 (loopback only).",
+            "              A phone CANNOT connect. This is not a firewall issue: the",
+            "              socket does not exist on your Wi-Fi interface.",
+            "              Fix: set XAUORDERPAD_HOST=0.0.0.0 and restart.",
+        ]
+    elif lan:
+        lines.append(f"    Network:  http://{lan}:{port}     <-- type this into the Android app")
+    else:
+        lines.append(f"    Network:  bound to {config.HOST} (could not determine the LAN IP)")
+
+    if config.API_TOKEN:
+        lines.append("    Auth:     token REQUIRED")
+    elif loopback:
+        lines.append("    Auth:     none (loopback only, so nothing else can reach it)")
+    else:
+        lines += [
+            "    Auth:     *** NONE -- AND THIS SERVER IS ON THE NETWORK ***",
+            "              Every device on this Wi-Fi can now place orders and close",
+            "              your positions. This process sends REAL MT5 orders.",
+            "              Fix: set XAUORDERPAD_TOKEN and restart.",
+        ]
+    lines.append("")
+    print("\n".join(lines), flush=True)
 
 
 @asynccontextmanager
@@ -61,6 +170,7 @@ async def lifespan(app: FastAPI):
         "symbol_config": config.SYMBOL,
     })
     worker.start()
+    _print_banner()
     # Convenience: pop the UI in a Chrome/Edge "app-mode" window (no address
     # bar / tabs) once the server is accepting. Runs on a daemon thread and is
     # fully fail-safe -- a missing browser never affects the trading server.
@@ -110,18 +220,78 @@ class CloseReq(BaseModel):
     volume: float | None = None
 
 
+class CloseWhereReq(BaseModel):
+    """Bulk close, filtered by live P&L sign.
+
+    The sign is evaluated SERVER-SIDE against fresh broker state (see
+    Mt5Worker._select), not against whatever the client last saw. A client that
+    filtered its own snapshot and sent a ticket list would be racing the market:
+    a position can cross zero between the frame it rendered and the close
+    landing. It would also cost N round-trips instead of one, which matters on a
+    ~150 ms mobile link.
+    """
+    filter: str = "all"          # "all" | "losing" | "profit"
+
+
+class StrategyReq(BaseModel):
+    """Enable/disable + tune the automated volume-spike straddle strategy.
+
+    All fields optional: send just `enabled` to toggle, or any subset of params
+    to retune live. The worker enforces the DEMO-only + hedging-account guards;
+    this endpoint only forwards the request.
+    """
+    enabled: bool | None = None
+    volume: float | None = None
+    rvol_threshold: float | None = None
+    sl_atr_mult: float | None = None
+    tp_r: float | None = None
+    max_hold_min: float | None = None
+    cooldown_min: float | None = None
+    max_daily_loss: float | None = None
+    max_concurrent: int | None = None
+    vol_filter: bool | None = None
+
+
+class ProfileReq(BaseModel):
+    """Save (or overwrite) a saved account profile. The password is stored in
+    the OS credential vault by accounts.save_profile; it is never persisted to
+    profiles.json and never logged."""
+    label: str | None = None
+    login: int
+    password: str
+    server: str
+    path: str | None = None
+
+
+class LoginReq(BaseModel):
+    """Log in / switch account. Either reference a saved `profile_id`, or pass
+    ad-hoc `login`/`password`/`server` (optionally `save=True` to remember)."""
+    profile_id: str | None = None
+    login: int | None = None
+    password: str | None = None
+    server: str | None = None
+    path: str | None = None
+    save: bool = False
+    label: str | None = None
+
+
 def _check_token(token: str | None) -> None:
     if config.API_TOKEN and token != config.API_TOKEN:
         raise HTTPException(status_code=401, detail="bad or missing token")
 
 
 @app.get("/api/state")
-def get_state():
+def get_state(x_token: str | None = Header(default=None)):
+    # Token-checked for the same reason /ws is: this returns the FULL snapshot --
+    # balance, equity, login, and every open position. Leaving it open while /ws was
+    # locked would have been security theatre: an attacker who can reach the port just
+    # polls this instead of opening a socket.
+    _check_token(x_token)
     return worker.get_state()
 
 
 @app.get("/api/account/safety")
-def account_safety():
+def account_safety(x_token: str | None = Header(default=None)):
     """Lightweight endpoint the UI calls BEFORE enabling Auto-Test.
 
     Returns just the fields the browser needs to make the demo/real decision —
@@ -129,6 +299,7 @@ def account_safety():
     the account block from worker.get_state(); kept thin so the safety check
     on the START button doesn't pull positions, stats, ticks, etc.
     """
+    _check_token(x_token)
     st = worker.get_state()
     acc = st.get("account") or {}
     return {
@@ -145,6 +316,106 @@ def account_safety():
 async def _do(cmd: dict):
     fut = worker.submit(cmd)
     return await asyncio.wrap_future(fut)
+
+
+# ---- automated strategy: status + enable/disable + tune ------------------
+@app.get("/api/strategy/status")
+def strategy_status(x_token: str | None = Header(default=None)):
+    """Current strategy status (also included in /ws state under `strategy`)."""
+    _check_token(x_token)
+    return worker.get_state().get("strategy") or worker.strategy.status()
+
+
+@app.post("/api/strategy")
+async def strategy_control(req: StrategyReq, x_token: str | None = Header(default=None)):
+    """Enable/disable or retune the strategy. Runs through the worker queue so it
+    is serialized with ticks/orders. Params with value None are left unchanged."""
+    _check_token(x_token)
+    params = {k: v for k, v in req.model_dump().items() if k != "enabled" and v is not None}
+    log.info("strategy control", extra={"event": "strategy_control_http",
+                                        "enabled": req.enabled, "params": params})
+    return JSONResponse(await _do({"action": "strategy",
+                                   "enabled": req.enabled, "params": params or None}))
+
+
+# ---- account profiles: list / save / delete -----------------------------
+@app.get("/api/accounts")
+def list_accounts(x_token: str | None = Header(default=None)):
+    _check_token(x_token)
+    return {"accounts": accounts.list_profiles()}
+
+
+@app.post("/api/accounts")
+def save_account(req: ProfileReq, x_token: str | None = Header(default=None)):
+    _check_token(x_token)
+    try:
+        return accounts.save_profile(req.label, req.login, req.password,
+                                     req.server, req.path or "")
+    except RuntimeError as exc:           # keyring backend unavailable -> fail closed
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/accounts/{profile_id}")
+def delete_account(profile_id: str, x_token: str | None = Header(default=None)):
+    _check_token(x_token)
+    return {"deleted": accounts.delete_profile(profile_id)}
+
+
+# ---- account session: login / switch / logout ---------------------------
+@app.post("/api/login")
+async def login(req: LoginReq, x_token: str | None = Header(default=None)):
+    """Log in or switch the terminal's account.
+
+    Resolves a saved `profile_id` to credentials (password read from the OS
+    vault) or uses ad-hoc credentials. The password is handed to the worker and
+    is never logged here. Returns the worker result incl. `is_demo` and
+    `prev_open` (positions left open on the previous account).
+    """
+    _check_token(x_token)
+    login_id, password, server = req.login, req.password, req.server
+    path = req.path
+
+    if req.profile_id:
+        prof = accounts.get_profile(req.profile_id)
+        if not prof:
+            raise HTTPException(status_code=404,
+                                detail=f"profile {req.profile_id!r} not found")
+        login_id, server = prof["login"], prof["server"]
+        path = prof.get("path") or None
+        password = accounts.get_password(req.profile_id)
+        if not password:
+            raise HTTPException(
+                status_code=400,
+                detail="stored password missing for this profile — re-add it")
+
+    if not (login_id and password and server):
+        raise HTTPException(status_code=400,
+                            detail="login, password and server are required")
+
+    res = await _do({"action": "login", "login": login_id,
+                     "password": password, "server": server, "path": path})
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "login failed")
+
+    # Persist on ad-hoc login if asked; best-effort (login already succeeded).
+    if req.save and not req.profile_id:
+        try:
+            accounts.save_profile(req.label, login_id, password, server,
+                                  path or "", res.get("trade_mode"))
+        except RuntimeError:
+            log.warning("login ok but profile not saved (no keyring backend)")
+    elif req.profile_id:
+        try:
+            accounts.update_trade_mode(req.profile_id, res.get("trade_mode"))
+        except Exception:
+            pass
+    return res
+
+
+@app.post("/api/logout")
+async def logout(x_token: str | None = Header(default=None)):
+    _check_token(x_token)
+    return JSONResponse(await _do({"action": "logout"}))
 
 
 @app.post("/buy")
@@ -247,13 +518,105 @@ async def close_all(x_token: str | None = Header(default=None)):
     return JSONResponse(await _do({"action": "close_all"}))
 
 
+@app.post("/close_where")
+async def close_where(req: CloseWhereReq,
+                      x_token: str | None = Header(default=None)):
+    """Bulk close filtered by live P&L sign: "all" | "losing" | "profit".
+
+    `/close_all` remains as an alias for filter="all" -- the web UI's Esc hotkey
+    and the Auto-Test stop path both call it, so it must keep working.
+    """
+    _check_token(x_token)
+    if req.filter not in ("all", "losing", "profit"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"filter must be one of all|losing|profit, got {req.filter!r}")
+    log.info("close-where requested", extra={"event": "close_where_http",
+                                             "filter": req.filter})
+    return JSONResponse(await _do({"action": "close_where", "filter": req.filter}))
+
+
+@app.get("/api/config")
+def client_config():
+    """Unauthenticated capability probe, so a client knows whether to ask the
+    user for a token BEFORE it fires a request and eats a 401. Deliberately
+    leaks nothing: it reports THAT a token is required, never what it is."""
+    return {"auth_required": bool(config.API_TOKEN), "poll_hz": int(config.POLL_HZ)}
+
+
 @app.websocket("/ws")
-async def ws(websocket: WebSocket):
+async def ws(websocket: WebSocket, token: str | None = None, hz: float | None = None):
+    """Live state stream.
+
+    `token` is a QUERY PARAM, not a header, because the browser's WebSocket API
+    cannot set headers on the handshake. OkHttp can, but using one mechanism for
+    both clients keeps this from silently diverging.
+
+    Auth here is not optional paranoia: this stream carries balance, equity and
+    every open position. Before this check existed, `/ws` was readable by anyone
+    who could reach the port even when API_TOKEN was set on every other route.
+
+    `hz` lets a client ask for a slower push than the server's POLL_HZ. The phone
+    asks for 5: at 15 Hz the full-snapshot stream is ~0.1-0.3 GB/hr, which is a
+    lot of mobile data for a screen showing a quote and a few rows. Unchanged
+    snapshots are skipped entirely.
+    """
+    # Accept FIRST, then close with 4401 on a bad token. This ordering is load-bearing:
+    # calling close() *before* accept() makes Starlette reject the HTTP handshake with a
+    # 403, and a browser cannot read a close code from a failed handshake -- it reports
+    # 1006 (abnormal). The client's "stop retrying, the token is wrong" branch keys on
+    # 4401, so a pre-accept close would send it into an infinite 1s reconnect loop
+    # against a server that will never let it in. Accepting costs nothing: we send no
+    # state before closing.
     await websocket.accept()
-    period = 1.0 / max(1, config.POLL_HZ)
+    if config.API_TOKEN and token != config.API_TOKEN:
+        await websocket.close(code=4401)   # 4401: app-level "unauthorized"
+        return
+
+    # Clamp to [1, POLL_HZ]: a client cannot poll faster than the worker refreshes,
+    # and 0/negative would be a busy-loop.
+    #
+    # NaN needs its own guard, because it does NOT clamp: it propagates through both
+    # min() and max() unchanged (max(nan, 1.0) is nan), so `period` becomes nan and
+    # asyncio.sleep(nan) returns instantly. `/ws?hz=nan` is accepted by pydantic as a
+    # float and spins this loop ~87k times/sec, each pass taking the worker lock --
+    # starving the thread that actually sends orders.
+    if hz is None or not math.isfinite(hz):
+        rate = float(config.POLL_HZ)
+    else:
+        rate = min(max(float(hz), 1.0), float(config.POLL_HZ))
+    period = 1.0 / rate
+
+    # Skipping unchanged snapshots saves real bandwidth, but SILENCE IS NOT FREE.
+    #
+    # webui/chart.js drives a synthetic random walk whenever no real frame has arrived
+    # in the last 1500 ms (chart.js:178), and it starts that generator for every enabled
+    # chart, not just in demo mode (chart.js:198). Before the skip existed, a snapshot
+    # went out every 67 ms unconditionally, so the synthetic path could never fire
+    # against a live feed. With the skip, a quiet market -- a weekend, thin rollover
+    # hours, or a frozen MT5 feed -- produces byte-identical snapshots, the server goes
+    # quiet, and after 1.5 s the chart begins plotting INVENTED candles around 2400 on
+    # a live XAUUSD chart. A trader would be reading fabricated prices.
+    #
+    # A forced resend well inside that 1.5 s window keeps the feed provably alive while
+    # still cutting an idle stream from 15 Hz to 1 Hz. It also restores dead-socket
+    # detection: this loop never calls receive(), so a client that vanished is only
+    # noticed when a send fails -- which, while skipping, might never happen.
+    HEARTBEAT_S = 1.0
+
+    last: dict | None = None
+    last_sent = 0.0
     try:
         while True:
-            await websocket.send_json(worker.get_state())
+            state = worker.get_state()
+            # `ts` changes on every poll, so compare everything else -- otherwise
+            # nothing would ever look unchanged and the skip would never fire.
+            cmp = {k: v for k, v in state.items() if k != "ts"}
+            now = time.monotonic()
+            if cmp != last or (now - last_sent) >= HEARTBEAT_S:
+                await websocket.send_json(state)
+                last = cmp
+                last_sent = now
             await asyncio.sleep(period)
     except WebSocketDisconnect:
         pass

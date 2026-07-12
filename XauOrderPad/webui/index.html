@@ -68,7 +68,10 @@
       <span class="sync-text" id="syncText">SYNC</span>
     </div>
 
+    <button class="tb-btn" id="accountBtn" title="Login / switch MT5 account">ACCOUNT</button>
     <button class="tb-btn" id="autoTestBtn" title="Open Auto-Test (demo only)">AUTO-TEST</button>
+    <button class="tb-btn" id="strategyBtn" title="Automated strategy (demo only)">
+      STRATEGY<span class="strat-dot" id="stratDot" hidden></span></button>
 
     <!-- Compact running-status pill shown ONLY while an auto-test is active or
          immediately after it completes. Click anywhere except STOP to re-open
@@ -211,6 +214,17 @@
           <span class="panel-title">OPEN POSITIONS</span>
           <span class="panel-meta">total <span id="posTotal" class="num">0.00</span></span>
         </div>
+        <!-- Bulk close. The P&L sign is evaluated SERVER-SIDE against live broker
+             state (POST /close_where), not against the snapshot rendered below —
+             a position can cross zero between this frame and the close landing. -->
+        <div class="bulk-close" id="bulkClose">
+          <button class="bulk-btn" id="closeAllBtn" type="button"
+                  title="Close every open position (Esc)">CLOSE ALL</button>
+          <button class="bulk-btn losing" id="closeLosingBtn" type="button"
+                  title="Close only positions currently in loss">CLOSE LOSING</button>
+          <button class="bulk-btn profit" id="closeProfitBtn" type="button"
+                  title="Close only positions currently in profit">CLOSE PROFIT</button>
+        </div>
         <div class="grid-wrap">
           <table class="grid">
             <thead>
@@ -226,12 +240,14 @@
         </div>
       </section>
 
-      <!-- LIVE TICK CHART -->
+      <!-- LIVE TICK CHART (disabled by default; checkbox enables the whole feed) -->
       <section class="chartpanel" id="chartPanel">
         <div class="panel-head">
-          <span class="panel-title">TICK CHART</span>
+          <label class="chart-enable" title="Enable / disable the live tick chart">
+            <input type="checkbox" id="chartEnable">
+            <span class="panel-title">TICK CHART</span>
+          </label>
           <span class="panel-meta">price · volume</span>
-          <button class="chart-toggle" id="chartToggle" title="Collapse / expand chart" aria-label="Collapse or expand chart">⮜</button>
         </div>
         <div class="chart-wrap" id="chartWrap"></div>
       </section>
@@ -438,8 +454,158 @@
   </div>
 </div>
 
+<!-- ===================== STRATEGY (automated, demo-only) =====================
+     The one automated strategy: a volume-spike STRADDLE. On a rare M1 volume
+     spike it opens a long AND a short (each: tight ATR stop, larger target); one
+     leg stops out small, the other is meant to run. Direction-agnostic — a
+     volatility bet, not a hedge. Requires a DEMO + HEDGING account (the backend
+     refuses otherwise). Disabled until you flip Enable. -->
+<div class="modal" id="strategyModal" hidden>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Strategy — Volume-Spike Straddle</h2>
+      <button class="modal-x" id="strategyClose">✕</button>
+    </div>
+
+    <div class="autotest-banner loading" id="stratBanner">checking account…</div>
+
+    <div class="modal-body">
+      <div class="set-note" style="margin-bottom:10px">
+        On a volume spike (M1 volume ≥ threshold × its recent median) the bot opens
+        a <b>long AND a short</b> at once — tight ATR stop each, larger target — so it
+        profits from a big move <b>either way</b>. Backtests show this works in
+        <b>volatile</b> regimes and chops in quiet ones (keep the volatility filter on).
+        <b>Demo + hedging only.</b>
+      </div>
+
+      <div class="set-row toggle">
+        <label><b>Enable strategy</b> (starts placing real demo orders)</label>
+        <input type="checkbox" id="stratEnabled">
+      </div>
+      <div class="set-row">
+        <label>Lot per leg</label>
+        <input id="stratVolume" type="number" min="0.01" step="0.01" value="0.01">
+      </div>
+      <div class="set-row">
+        <label>Volume-spike threshold (× median)</label>
+        <input id="stratRvol" type="number" min="2" step="0.5" value="8">
+      </div>
+      <div class="set-row">
+        <label>Stop = ATR ×</label>
+        <input id="stratSlAtr" type="number" min="0.2" step="0.1" value="1.0">
+      </div>
+      <div class="set-row">
+        <label>Target = R × (stop)</label>
+        <input id="stratTpR" type="number" min="1" step="0.5" value="4">
+      </div>
+      <div class="set-row">
+        <label>Max hold (minutes)</label>
+        <input id="stratHold" type="number" min="1" step="1" value="30">
+      </div>
+      <div class="set-row">
+        <label>Cooldown between straddles (min)</label>
+        <input id="stratCooldown" type="number" min="0" step="1" value="15">
+      </div>
+      <div class="set-row">
+        <label>Max concurrent straddles</label>
+        <input id="stratConcurrent" type="number" min="1" max="5" step="1" value="1">
+      </div>
+      <div class="set-row">
+        <label>Daily-loss kill-switch (USD)</label>
+        <input id="stratMaxLoss" type="number" min="0" step="10" value="200">
+      </div>
+      <div class="set-row toggle">
+        <label>Volatility filter (only fire when ATR is expanding)</label>
+        <input type="checkbox" id="stratVolFilter" checked>
+      </div>
+
+      <div class="autotest-status" id="strategyStatus">
+        <div class="kv"><div class="atk">State</div>       <div class="atv" id="stState">disabled</div></div>
+        <div class="kv"><div class="atk">Active</div>      <div class="atv" id="stActive">0</div></div>
+        <div class="kv"><div class="atk">Signals today</div><div class="atv" id="stSignals">0</div></div>
+        <div class="kv"><div class="atk">Last RVOL</div>   <div class="atv" id="stRvol">0.0</div></div>
+        <div class="kv"><div class="atk">Cooldown</div>    <div class="atv" id="stCooldown">0s</div></div>
+        <div class="kv"><div class="atk">Realized today</div><div class="atv" id="stRealized">0.00</div></div>
+      </div>
+      <div class="autotest-verdict" id="stError" hidden></div>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn ghost" id="stratFlatten" title="Close all strategy positions now">FLATTEN</button>
+      <button class="btn primary" id="stratApply">APPLY / SAVE</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== ACCOUNT (login / switch) ===================== -->
+<div class="modal" id="accountModal" hidden>
+  <div class="modal-card account-card">
+    <div class="modal-head">
+      <h2>MT5 Account</h2>
+      <button class="modal-x" id="accountClose">✕</button>
+    </div>
+
+    <!-- Current session banner — DEMO green / REAL red / logged-out grey. -->
+    <div class="account-banner loading" id="accountBanner">checking…</div>
+
+    <div class="modal-body account-body">
+      <!-- Saved profiles: one-click switch / delete. Populated by fetchAccounts(). -->
+      <div class="account-section">
+        <div class="account-section-title">Saved accounts</div>
+        <div class="account-list" id="accountList">
+          <div class="account-empty" id="accountEmpty">No saved accounts yet.</div>
+        </div>
+      </div>
+
+      <!-- Add / login form. `save` persists the password to the OS vault. -->
+      <div class="account-section">
+        <div class="account-section-title">Login to an account</div>
+        <div class="set-row">
+          <label>Label (optional)</label>
+          <input id="accLabel" type="text" placeholder="e.g. Exness Demo">
+        </div>
+        <div class="set-row">
+          <label>Login (account number)</label>
+          <input id="accLogin" type="number" inputmode="numeric" placeholder="12345678">
+        </div>
+        <div class="set-row">
+          <label>Password</label>
+          <input id="accPassword" type="password" placeholder="master password" autocomplete="off">
+        </div>
+        <div class="set-row">
+          <label>Server</label>
+          <input id="accServer" type="text" placeholder="Exness-MT5Trial16" autocomplete="off">
+        </div>
+        <div class="set-row">
+          <label>Terminal path (optional)</label>
+          <input id="accPath" type="text" placeholder="leave blank to use the running terminal">
+        </div>
+        <label class="account-save-row">
+          <input id="accSave" type="checkbox" checked>
+          Remember this account (password encrypted in Windows Credential Manager)
+        </label>
+      </div>
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn ghost" id="accLogoutBtn">LOG OUT</button>
+      <button class="btn primary" id="accLoginBtn">LOG IN</button>
+    </div>
+  </div>
+</div>
+
+<!-- Logged-out overlay — blocks trading until a session exists. -->
+<div class="loggedout-overlay" id="loggedOutOverlay" hidden>
+  <div class="loggedout-card">
+    <div class="loggedout-title">Logged out</div>
+    <div class="loggedout-sub">No MT5 account is connected. Log in to start trading.</div>
+    <button class="btn primary" id="loggedOutLogin">LOG IN</button>
+  </div>
+</div>
+
 <script src="vendor/lightweight-charts.standalone.production.js" defer></script>
 <script src="chart.js" defer></script>
 <script src="app.js" defer></script>
+<script src="strategy.js" defer></script>
 </body>
 </html>

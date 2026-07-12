@@ -19,6 +19,7 @@ from typing import Any
 import MetaTrader5 as mt5
 
 import config
+from strategy import VolumeSpikeStraddle
 
 
 # Logger for every worker-side event. Configured by logger_setup.setup_logging()
@@ -51,8 +52,18 @@ class Mt5Worker:
         self._stop = threading.Event()
         self._symbol = config.SYMBOL
         self._initialized = False
+        # When False the user has logged out from the UI: stop attaching to the
+        # terminal and report "logged out" until an explicit login command.
+        # Start False: on a headless/cloud box the terminal boots with no account
+        # logged in, so auto-attaching would call mt5.initialize() with no creds ->
+        # a ~65s IPC-timeout that blocks the GIL and freezes uvicorn, so the UI
+        # can never load to log in. An explicit /api/login flips this True.
+        self._session_active = False
         self._poll_count = 0
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        # The one automated, demo-only strategy. Disabled until enabled from the
+        # UI; evaluated on THIS worker thread so it never races ticks/orders.
+        self.strategy = VolumeSpikeStraddle()
         # Health-transition tracking: log only when these flip, not on every poll.
         self._last_healthy: bool | None = None
         # Account snapshot throttle: log a snapshot at most once per N polls.
@@ -112,6 +123,11 @@ class Mt5Worker:
         and one `mt5_connected` event the first time we successfully attach.
         Suppresses spam: only logs on state transitions, not on every poll.
         """
+        # Logged out from the UI: do not auto-attach. A `login` command clears
+        # this flag. (The terminal itself stays running and logged in; we just
+        # refuse to drive it until the user logs in again.)
+        if not self._session_active:
+            return False
         if self._initialized:
             ti = mt5.terminal_info()
             if ti is not None and ti.connected:
@@ -170,9 +186,13 @@ class Mt5Worker:
         st: dict[str, Any] = {"ts": time.time(), "symbol": self._symbol}
         try:
             if not self._ensure_connected():
-                code, msg = mt5.last_error()
-                st.update(connected=False, healthy=False,
-                          error=f"terminal not connected ({code}: {msg})")
+                if not self._session_active:
+                    st.update(connected=False, healthy=False,
+                              logged_out=True, error="logged out")
+                else:
+                    code, msg = mt5.last_error()
+                    st.update(connected=False, healthy=False,
+                              error=f"terminal not connected ({code}: {msg})")
                 self._swap(st)
                 return
 
@@ -268,7 +288,18 @@ class Mt5Worker:
             st.update(connected=False, healthy=False, error=f"poll error: {exc}")
             log.exception("poll_state crashed",
                           extra={"event": "poll_state_exception"})
+        # Expose strategy status in the pushed snapshot so the UI can render it.
+        st["strategy"] = self.strategy.status()
         self._swap(st)
+
+        # Drive the automated strategy AFTER the swap so any orders it places show
+        # up on the next poll. Fully sandboxed: a crash here never kills the worker
+        # and never affects manual trading (strategy is a no-op unless enabled).
+        try:
+            self.strategy.evaluate(self, st)
+        except Exception:
+            log.exception("strategy evaluate crashed",
+                          extra={"event": "strategy_exception"})
 
         # --- Structured event emission (post-swap, deliberately throttled) ---
         # We poll 15 times/sec; we do NOT want one log line every 67ms. Instead:
@@ -321,7 +352,199 @@ class Mt5Worker:
             return self._close_ticket(cmd.get("ticket"), cmd.get("volume"))
         if action == "close_all":
             return self._close_all()
+        if action == "close_where":
+            return self._close_where(cmd.get("filter") or "all")
+        if action == "login":
+            return self._login(cmd)
+        if action == "logout":
+            return self._logout(cmd)
+        if action == "strategy":
+            return self.strategy.update(cmd.get("params"), cmd.get("enabled"))
         return {"ok": False, "error": f"unknown action {action!r}"}
+
+    # ---- strategy support (worker-thread only; called from strategy.evaluate) ----
+    def recent_m1(self, count: int):
+        """Last `count` M1 bars for the active symbol (structured np array)."""
+        return mt5.copy_rates_from_pos(self._symbol, mt5.TIMEFRAME_M1, 0, int(count))
+
+    def strategy_positions(self) -> list:
+        """Open positions belonging to the strategy (STRATEGY_MAGIC only)."""
+        poss = mt5.positions_get(symbol=self._symbol) or []
+        return [p for p in poss if int(p.magic) == int(config.STRATEGY_MAGIC)]
+
+    def strategy_place(self, side: str, volume: float,
+                       sl_dist: float, tp_dist: float) -> dict:
+        """Market order for one straddle leg with absolute SL/TP derived from the
+        fill side price. Tagged STRATEGY_MAGIC so it is never touched by manual
+        close-all and is independently attributable in the log."""
+        si = mt5.symbol_info(self._symbol)
+        tick = mt5.symbol_info_tick(self._symbol)
+        if si is None or tick is None:
+            return {"ok": False, "error": "symbol unavailable"}
+        is_buy = side == "buy"
+        price = tick.ask if is_buy else tick.bid
+        sl = (price - sl_dist) if is_buy else (price + sl_dist)
+        tp = (price + tp_dist) if is_buy else (price - tp_dist)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self._symbol,
+            "volume": float(volume),
+            "type": mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
+            "price": price,
+            "sl": round(sl, si.digits),
+            "tp": round(tp, si.digits),
+            "deviation": int(config.DEFAULT_DEVIATION),
+            "magic": int(config.STRATEGY_MAGIC),
+            "comment": "XauStraddle",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": _pick_filling(si),
+        }
+        res = mt5.order_send(request)
+        if res is None:
+            code, msg = mt5.last_error()
+            return {"ok": False, "error": f"{code}: {msg}"}
+        ok = res.retcode == mt5.TRADE_RETCODE_DONE
+        return {"ok": ok, "ticket": getattr(res, "order", 0),
+                "price": getattr(res, "price", price), "retcode": res.retcode,
+                "error": None if ok else f"retcode {res.retcode}: {res.comment}"}
+
+    def strategy_close_ticket(self, ticket: int) -> dict:
+        """Close one strategy position by ticket (closing deal keeps STRATEGY_MAGIC)."""
+        poss = mt5.positions_get(ticket=int(ticket))
+        if not poss:
+            return {"ok": False, "error": "ticket not found"}
+        p = poss[0]
+        si = mt5.symbol_info(self._symbol)
+        tick = mt5.symbol_info_tick(self._symbol)
+        is_buy = p.type == mt5.POSITION_TYPE_BUY
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self._symbol,
+            "volume": p.volume,
+            "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+            "position": p.ticket,
+            "price": tick.bid if is_buy else tick.ask,
+            "deviation": int(config.DEFAULT_DEVIATION),
+            "magic": int(config.STRATEGY_MAGIC),
+            "comment": "XauStraddle close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": _pick_filling(si),
+        }
+        res = mt5.order_send(request)
+        if res is None:
+            code, msg = mt5.last_error()
+            return {"ok": False, "ticket": int(ticket), "error": f"{code}: {msg}"}
+        return {"ok": res.retcode == mt5.TRADE_RETCODE_DONE, "ticket": int(ticket)}
+
+    def strategy_daily_realized(self) -> float:
+        """Today's realized P/L (profit+swap+commission) for STRATEGY_MAGIC deals."""
+        now = datetime.datetime.now()
+        start = datetime.datetime(now.year, now.month, now.day)
+        deals = mt5.history_deals_get(start, now) or []
+        out = (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT, mt5.DEAL_ENTRY_OUT_BY)
+        total = 0.0
+        for d in deals:
+            if int(getattr(d, "magic", 0)) == int(config.STRATEGY_MAGIC) and d.entry in out:
+                total += d.profit + d.swap + d.commission
+        return round(total, 2)
+
+    # ---- account session (login / logout / switch) ----------------------
+    def _open_position_count(self) -> int:
+        """Open positions on the CURRENTLY logged-in account (all symbols),
+        captured before a switch/logout so the UI can warn what gets left
+        behind. Best-effort: returns 0 if we can't read them."""
+        try:
+            if self._initialized and self._session_active:
+                return len(mt5.positions_get() or [])
+        except Exception:
+            pass
+        return 0
+
+    def _log_login_failed(self, stage: str, login, server, code, msg) -> None:
+        """Record WHY a login was refused. Without this the only trace of a failed
+        switch is a bare `400` in the access log, which is indistinguishable from a
+        dead button. The password is deliberately absent from every field here."""
+        log.warning("account login failed",
+                    extra={"event": "account_login_failed", "stage": stage,
+                           "login": login, "server": server,
+                           "code": code, "mt5_last_error_msg": msg})
+
+    def _login(self, cmd: dict) -> dict:
+        """Log the terminal into the given account (switch if already attached).
+
+        Runs on the worker thread, so it is serialized with ticks and orders.
+        `path` falls back to config.MT5_PATH; password is used but never logged.
+        """
+        login = cmd.get("login")
+        password = cmd.get("password")
+        server = cmd.get("server")
+        path = cmd.get("path") or config.MT5_PATH or None
+        if not (login and password and server):
+            return {"ok": False, "error": "login, password and server are required"}
+
+        prev_open = self._open_position_count()    # outgoing account's open trades
+
+        if not self._initialized:
+            # Terminal not attached yet -> initialize WITH credentials (launches
+            # terminal64.exe if needed).
+            kwargs: dict[str, Any] = {}
+            if path:
+                kwargs["path"] = path
+            kwargs.update(login=int(login), password=password, server=server)
+            if not mt5.initialize(**kwargs):
+                code, msg = mt5.last_error()
+                self._log_login_failed("initialize", login, server, code, msg)
+                return {"ok": False, "prev_open": prev_open,
+                        "error": f"initialize/login failed ({code}: {msg})"}
+            self._initialized = True
+        else:
+            # Terminal already attached -> switch account in place.
+            if not mt5.login(int(login), password=password, server=server):
+                code, msg = mt5.last_error()
+                self._log_login_failed("switch", login, server, code, msg)
+                return {"ok": False, "prev_open": prev_open,
+                        "error": f"login failed ({code}: {msg})"}
+
+        self._session_active = True
+        self._resolve_symbol()
+        # daily realized / wins / losses belong to the account -> reset on switch.
+        self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        self._poll_count = 0
+        self._last_healthy = None
+
+        acc = mt5.account_info()
+        tmode = int(acc.trade_mode) if acc is not None else None
+        log.info("account login",
+                 extra={"event": "account_login",
+                        "login": getattr(acc, "login", None),
+                        "server": getattr(acc, "server", None),
+                        "trade_mode": tmode,
+                        "prev_open": prev_open})
+        return {
+            "ok": True,
+            "login": getattr(acc, "login", None),
+            "server": getattr(acc, "server", None),
+            "trade_mode": tmode,
+            "is_demo": (tmode != 2) if tmode is not None else None,
+            "prev_open": prev_open,
+        }
+
+    def _logout(self, cmd: dict) -> dict:
+        """Drop the Python<->terminal link and stop auto-attaching until the
+        next login. (MT5 has no real account-logout; the terminal keeps its
+        session — we simply refuse to drive it.)"""
+        prev_open = self._open_position_count()
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        self._initialized = False
+        self._session_active = False
+        self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        self._last_healthy = None
+        log.info("account logout",
+                 extra={"event": "account_logout", "prev_open": prev_open})
+        return {"ok": True, "prev_open": prev_open}
 
     def _place_order(self, cmd: dict) -> dict:
         """Unified entry for the new UI: market or pending(limit)."""
@@ -615,40 +838,72 @@ class Mt5Worker:
         return to_price(sl, True), to_price(tp, False)
 
     def _close_all(self) -> dict:
-        """Flatten every open position for the active symbol (optionally
-        restricted to this app's magic). Up to 5 retry passes; logs both
-        the request and the final result so the broker round-trip is
-        independently reconstructable from disk.
+        """Flatten every open position for the active symbol. Kept as a thin
+        alias so the existing /close_all endpoint (and the web UI's Esc hotkey /
+        Auto-Test stop path) behave exactly as before."""
+        return self._close_where("all")
+
+    def _select(self, filt: str) -> list:
+        """Open positions on the active symbol matching `filt`.
+
+        The profit sign is read from LIVE broker state every time this is called
+        -- never from a client-supplied snapshot. A position's sign can flip
+        between the browser/phone seeing it and the close landing, so filtering
+        here (rather than having the client send a ticket list) is what makes
+        close-losing / close-profit correct rather than merely usually-right.
         """
+        positions = mt5.positions_get(symbol=self._symbol) or []
+        if config.RESTRICT_CLOSE_TO_MAGIC:
+            positions = [p for p in positions if p.magic == config.MAGIC]
+        if filt == "losing":
+            return [p for p in positions if p.profit < 0]
+        if filt == "profit":
+            return [p for p in positions if p.profit > 0]
+        return list(positions)          # "all"
+
+    def _close_where(self, filt: str) -> dict:
+        """Close every open position on the active symbol matching `filt`
+        ("all" | "losing" | "profit"), optionally restricted to this app's magic.
+
+        Up to 5 retry passes; the filter is re-evaluated against fresh broker
+        state on each pass. Logs both the request and the final result so the
+        broker round-trip is reconstructable from disk alone.
+
+        Note `remaining` counts only positions still matching the filter -- for
+        "losing" a leftover *winner* is not a failure, so `ok` must not consider
+        it one. A position that crosses zero mid-flight simply stops matching and
+        is left alone, which is the correct behaviour.
+        """
+        if filt not in ("all", "losing", "profit"):
+            return {"ok": False, "error": f"unknown filter {filt!r}"}
         if not self._ensure_connected():
             return {"ok": False, "error": "terminal not connected"}
-        log.info("close-all requested",
-                 extra={"event": "close_all_request",
+        log.info("close-where requested",
+                 extra={"event": "close_where_request",
                         "symbol": self._symbol,
+                        "filter": filt,
                         "restrict_to_magic": bool(config.RESTRICT_CLOSE_TO_MAGIC)})
         results = []
-        for _ in range(5):  # retry loop until flat
-            positions = mt5.positions_get(symbol=self._symbol) or []
-            if config.RESTRICT_CLOSE_TO_MAGIC:
-                positions = [p for p in positions if p.magic == config.MAGIC]
+        for _ in range(5):  # retry loop until no position matches
+            positions = self._select(filt)
             if not positions:
                 break
             for p in positions:
                 results.append(self._close_one(p))
             time.sleep(0.05)
-        remaining = mt5.positions_get(symbol=self._symbol) or []
-        if config.RESTRICT_CLOSE_TO_MAGIC:
-            remaining = [p for p in remaining if p.magic == config.MAGIC]
+        remaining = self._select(filt)
         closed_count = len([r for r in results if r.get("ok")])
-        log.info("close-all completed",
-                 extra={"event": "close_all_completed",
+        log.info("close-where completed",
+                 extra={"event": "close_where_completed",
                         "symbol": self._symbol,
+                        "filter": filt,
                         "closed_count": closed_count,
                         "remaining_count": len(remaining),
                         "attempts": len(results),
                         "flat": len(remaining) == 0})
         return {
             "ok": len(remaining) == 0,
+            "filter": filt,
             "closed": closed_count,
             "remaining": len(remaining),
             "results": results,

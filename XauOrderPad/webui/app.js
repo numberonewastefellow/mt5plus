@@ -64,6 +64,76 @@ const API = {
   base:'',          // same origin — served by the FastAPI backend
   demo:false,       // LIVE: wired to the XauOrderPad backend
 
+  // Shared secret for the backend's _check_token. Blank when the server runs on
+  // loopback with API_TOKEN="" (the desktop default) — in that case the header is
+  // simply absent and every route behaves as it always did.
+  //
+  // This EXISTS because the server is now also reachable from the Android app over
+  // Tailscale. Without it, setting API_TOKEN on the server would 401 every /order,
+  // /close and /close_all while /, /api/state and /ws kept working — i.e. a
+  // healthy-looking UI with a dead Buy button, discovered only when you press it.
+  token: localStorage.getItem('xop.token') || '',
+
+  // Headers. Omits x-token entirely when we have none, so the no-auth loopback path
+  // sends a byte-identical request to what it always did.
+  hdrs(extra){
+    const h = Object.assign({}, extra || {});
+    if(this.token) h['x-token'] = this.token;
+    return h;
+  },
+
+  setToken(t){
+    this.token = t || '';
+    if(this.token) localStorage.setItem('xop.token', this.token);
+    else localStorage.removeItem('xop.token');
+  },
+
+  /* Re-authenticate after a 401/4401.
+     `usedToken` is the token the FAILING request actually sent.
+
+     The comparison is the whole point. Clearing unconditionally is a real bug: two
+     requests can be in flight at once (boot fires /api/config and /api/accounts
+     together; a close-loop fires several /close calls). The first 401 prompts, the
+     user types the CORRECT token — and then the second, still-in-flight, stale-token
+     401 lands and wipes it again. The user ends up re-typing a good token forever.
+     So: only discard the token if nobody has replaced it since. */
+  async reauth(usedToken){
+    if(this.token && this.token !== usedToken) return true;   // already fixed by someone else
+    this.setToken('');
+    const t = promptForToken('Token rejected by the server. Re-enter it:');
+    if(!t) return false;
+    this.setToken(t);
+    // The socket authenticates at handshake time, so a new token means the old
+    // socket is dead and will never come back on its own. Kick it.
+    if(typeof restartLive === 'function') restartLive();
+    return true;
+  },
+
+  /* fetch, plus: on 401, re-auth and RETRY THE REQUEST ONCE.
+     Without the retry the press is simply lost. Pressing Esc to flatten with a stale
+     token would prompt for the token, the user would fix it, and the positions would
+     still be open — the emergency close silently never happened. */
+  async req(path, opts, retried){
+    const used = this.token;
+    const o = Object.assign({}, opts);
+    o.headers = this.hdrs(o.headers);          // built at SEND time, so a retry uses the NEW token
+    const r = await fetch(this.base + path, o);
+    if(r.status === 401 && !retried){
+      if(await this.reauth(used)) return this.req(path, opts, true);
+    }
+    return r;
+  },
+
+  // POST helper — every trade-capable call goes through here so none can forget
+  // the x-token header.
+  post(path, body){
+    return this.req(path, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body || {}),
+    });
+  },
+
   // Set to TRUE by AutoTest.start() and back to FALSE in AutoTest._finish().
   // Causes every /order POST to carry `auto_test:true` so the backend's
   // demo-only guard can refuse live-account requests in defense-in-depth.
@@ -76,11 +146,7 @@ const API = {
     // Bug #2 fix: inject `auto_test:true` ONLY while a run is active.
     // Without this the backend 403 demo-guard was completely dead code.
     const body = this.autoTestActive ? { ...req, auto_test:true } : req;
-    const r = await fetch(this.base+'/order', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body),
-    });
+    const r = await this.post('/order', body);
     if(!r.ok){
       // Backend returns a STRUCTURED 400 detail: {message, retcode, comment}
       // (old string-detail kept as a fallback for any legacy proxy in front).
@@ -108,22 +174,52 @@ const API = {
   },
   async closePosition(ticket){
     if(this.demo) return demoClose(ticket);
-    const r = await fetch(this.base+'/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ticket})});
+    const r = await this.post('/close', {ticket});
     if(!r.ok) throw new Error('close failed');
     return r.json();
   },
   async reducePosition(ticket, volume){
     // partial close — in MT5 this is an opposite deal of `volume` against the ticket
     if(this.demo) return demoReduce(ticket, volume);
-    const r = await fetch(this.base+'/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ticket, volume})});
+    const r = await this.post('/close', {ticket, volume});
     if(!r.ok) throw new Error('partial close failed');
     return r.json();
   },
+  /* A bulk close that FAILED to flatten still returns HTTP 200.
+     `_close_all` / `_close_where` give up after 5 retry passes and return
+     {ok:false, closed:N, remaining:M} — with a 200 status, because it is a
+     well-formed answer, not a protocol error.
+
+     So checking `r.ok` (the HTTP status) is NOT enough. Doing only that meant an
+     emergency CLOSE LOSING that shut 0 of 8 positions reported "Closed 0 losing
+     position(s)" as a SUCCESS toast, while the losers stayed open. The body is the
+     only thing that knows. */
+  async _bulk(path, body, what){
+    const r = await this.post(path, body);
+    if(!r.ok) throw new Error(what + ' failed');
+    const d = await r.json();
+    if(d && d.ok === false){
+      const err = new Error(
+        `${what}: ${d.remaining} position(s) STILL OPEN after ${d.closed} closed`);
+      err.partial = d;
+      throw err;
+    }
+    return d;
+  },
   async closeAll(symbol){
+    // Kept as its own method (rather than closeWhere('all')) because Esc and the
+    // Auto-Test stop path both call it — /close_all remains a server-side alias.
     if(this.demo) return demoCloseAll();
-    const r = await fetch(this.base+'/close_all', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({symbol})});
-    if(!r.ok) throw new Error('close-all failed');
-    return r.json();
+    return this._bulk('/close_all', {symbol}, 'close-all');
+  },
+  // Bulk close filtered by LIVE P&L sign, evaluated server-side against fresh
+  // broker state. Deliberately NOT done here by filtering state.positions and
+  // firing N /close calls: a position can cross zero between the frame we
+  // rendered and the close landing, so a client-side filter would close the
+  // wrong things. filt: 'all' | 'losing' | 'profit'.
+  async closeWhere(filt){
+    if(this.demo) return demoCloseAll();
+    return this._bulk('/close_where', {filter: filt}, 'close-' + filt);
   },
   // The demo provides ticks locally. For live data, poll or open a WebSocket and
   // call applyTick({symbol, bid, ask}) + applyPositions([...]) yourself.
@@ -503,7 +599,56 @@ async function closeAll(){
     logLine('CLOSE', `Closed all ${r.closed??n} ${state.symbol} position(s)`, true);
     toast('info','Closed all', `${state.symbol} flattened (${r.closed??n})`);
     renderPositions(); renderMetrics(); saveBook();
-  }catch(e){ toast('fail','Close-all failed', e.message); beep('fail'); }
+  }catch(e){
+    // Includes the "200 OK but still open" case — see API._bulk. This MUST read as a
+    // failure: the user pressed the panic button and the book did not flatten.
+    logLine('CLOSE', `CLOSE-ALL FAILED — ${e.message}`, false);
+    toast('fail','CLOSE-ALL FAILED', e.message); beep('fail');
+  }
+}
+
+/* Bulk close by live P&L sign. filt: 'losing' | 'profit'.
+
+   The count below is ONLY cosmetic — it fills in the confirm prompt. It must never
+   VETO the request:
+
+     - our snapshot is up to POLL_HZ stale, and stale by much more if the feed just
+       dropped;
+     - a position sitting at exactly 0.00 is neither <0 nor >0 and would be counted
+       as "nothing";
+     - a position opened seconds ago may not be in a frame yet;
+     - the server additionally filters by RESTRICT_CLOSE_TO_MAGIC, which we do not
+       model here at all.
+
+   A risk-reducing button that refuses to fire because a stale frame said "nothing to
+   close" is far worse than one that fires and is told "closed 0". Send it, and let the
+   server — which reads live broker state in Mt5Worker._select — decide. */
+async function closeWhere(filt){
+  const label = filt==='losing' ? 'losing' : 'profitable';
+  const open  = state.positions.filter(p=>p.symbol===state.symbol && p.state==='open');
+  // Only bail when the book is empty outright; never on the P&L-sign count.
+  if(!open.length){ toast('info','Nothing to close', `No open ${state.symbol} positions`); return; }
+  const n = open.filter(p=> filt==='losing' ? pnlOf(p) < 0 : pnlOf(p) > 0).length;
+  const approx = n ? `${n} ` : '';   // "0" would be a lie — the server may find some
+  if(S.confirmClose &&
+     !confirm(`Close ${approx}${label} ${state.symbol} position(s)?\n\n` +
+              `The server picks them using live broker prices at the moment of the close, ` +
+              `so the exact count may differ.`)) return;
+  try{ const r = await API.closeWhere(filt);
+    if(r.closed === 0){
+      // Not a failure (ok:true means nothing MATCHED), but it must not read as a win.
+      logLine('CLOSE', `No ${label} ${state.symbol} positions to close`, true);
+      toast('info', `No ${label} positions`, 'Nothing matched at broker prices');
+    } else {
+      logLine('CLOSE', `Closed ${r.closed} ${label} ${state.symbol} position(s)`, true);
+      toast('info', `Closed ${label}`, `${r.closed} position(s)`);
+    }
+    renderPositions(); renderMetrics(); saveBook();
+  }catch(e){
+    // Includes the "HTTP 200 but positions STILL OPEN" case — see API._bulk.
+    logLine('CLOSE', `CLOSE ${label.toUpperCase()} FAILED — ${e.message}`, false);
+    toast('fail', `Close-${filt} FAILED`, e.message); beep('fail');
+  }
 }
 
 /* ============================== FORM CONTROLS ============================= */
@@ -793,6 +938,12 @@ window.addEventListener('keydown', e=>{
     if(e.key==='Escape'){ e.preventDefault(); $('#autoTestModal').hidden = true; }
     return;
   }
+  // account modal open → Esc closes it (must intercept BEFORE the close-all
+  // Esc handler below, or pressing Esc on the login screen would flatten).
+  if($('#accountModal') && !$('#accountModal').hidden){
+    if(e.key==='Escape'){ e.preventDefault(); closeAccountModal(); }
+    return;
+  }
   if(isTyping()){
     if(e.key==='Enter'||e.key==='Escape'){ e.preventDefault(); document.activeElement.blur(); syncFormFromInputs(); }
     return;
@@ -853,6 +1004,12 @@ function bind(){
   $('#sellBtn').addEventListener('click', ()=>placeOrder('sell', false));
   $('#bidCell').addEventListener('click', ()=>arm('sell'));
   $('#askCell').addEventListener('click', ()=>arm('buy'));
+
+  // Bulk close. CLOSE ALL stays pointed at closeAll() (not closeWhere('all')) so
+  // it shares the exact path Esc and the Auto-Test stop handler already use.
+  $('#closeAllBtn').addEventListener('click', ()=>closeAll());
+  $('#closeLosingBtn').addEventListener('click', ()=>closeWhere('losing'));
+  $('#closeProfitBtn').addEventListener('click', ()=>closeWhere('profit'));
   ['#slInput','#tpInput','#limitPrice'].forEach(s=>$(s).addEventListener('input', syncFormFromInputs));
 
   // positions close (delegated)
@@ -893,6 +1050,7 @@ function init(){
   applyTheme(S.theme);
   bind();
   bindAutoTest();                  // wire the AUTO-TEST modal buttons (open / close / start / stop / download)
+  bindAccount();                   // wire the ACCOUNT login/switch/logout modal + logged-out overlay
   setSymbol(state.symbol);
   setTf(state.tf);
   setLot(S.defaultLot);
@@ -909,6 +1067,7 @@ function init(){
     lockSingleSymbol();
     startLive();                   // real prices/positions over WebSocket
     fetchAccountSafety();          // initial DEMO/REAL badge probe (canonical source)
+    fetchAccounts();               // warm the saved-account list for the ACCOUNT modal
   }
   setInterval(tickClock, 250);     // clock + candle
   tickClock();
@@ -1013,19 +1172,128 @@ function onState(s){
   try { if(typeof AutoTest !== 'undefined') AutoTest._onState(s); } catch(e){ console.warn('AutoTest._onState', e); }
   try { if(typeof reconcileAutoTest === 'function') reconcileAutoTest(s); } catch(e){ console.warn('reconcileAutoTest', e); }
   try { if(typeof updateAccountBadgeFromState === 'function') updateAccountBadgeFromState(s); } catch(e){}
+  try { if(typeof applySession === 'function') applySession(s); } catch(e){}
+}
+
+/* ---------------------------------------------------------------------------
+   TOKEN GATE
+
+   The server's API_TOKEN is blank on the desktop/loopback default, in which case
+   none of this fires and the page behaves exactly as it always has. It is
+   non-blank once the server is exposed on Tailscale for the Android client, and
+   then EVERY trade-capable route (and /ws itself) needs the secret.
+
+   /api/config is an unauthenticated probe that reports THAT a token is required,
+   never what it is — so we can ask the user up front instead of letting them
+   discover it by pressing Buy and getting a silent 401.                       */
+/* Ask the user for the token. Returns the trimmed token, or '' if they cancelled.
+
+   `window.prompt` blocks the JS event loop synchronously, so two prompts can never be
+   open at once — the hazard is SEQUENTIAL, not concurrent: N failing requests produce
+   N prompts back to back. Chrome then offers "Prevent this page from creating
+   additional dialogs", and once ticked, prompt() returns null FOREVER — the terminal is
+   dead with no explanation and no way back but F5.
+
+   So we ask at most once per "auth episode": once the user cancels, we stay quiet until
+   something explicitly resets the episode (a successful token, or a reload). */
+let authEpisodeDeclined = false;
+
+function promptForToken(msg){
+  if(authEpisodeDeclined) return '';
+  const t = window.prompt(msg || 'Server requires an API token:', '');
+  const tok = (t || '').trim();
+  if(!tok){
+    authEpisodeDeclined = true;         // do not nag; one refusal is enough
+    setHealth(false, 'unauthorized — reload and enter the API token');
+    return '';
+  }
+  authEpisodeDeclined = false;
+  return tok;
+}
+
+async function ensureToken(){
+  let cfg = null;
+  try {
+    cfg = await (await fetch('/api/config', {cache:'no-store'})).json();
+  } catch(e){
+    return;                             // server down; the ws retry loop handles it
+  }
+  if(!cfg) return;
+
+  if(!cfg.auth_required){
+    // The server has no token. Drop any stale one we are holding, so we don't keep
+    // putting a dead secret in the /ws query string (where it lands in access logs
+    // and browser history) — and so a blank-token server really is byte-identical.
+    if(API.token) API.setToken('');
+    return;
+  }
+  if(!API.token){
+    const t = promptForToken('This server requires an API token (XAUORDERPAD_TOKEN):');
+    if(t) API.setToken(t);
+  }
+}
+
+/* The live /ws feed. `restartLive` is called by API.reauth after a new token is
+   entered: the socket authenticates at HANDSHAKE time, so an existing socket can
+   never pick up a new token — without this, a user who fixed their token via a
+   button's 401 prompt would keep a dead feed (no ticks, frozen positions, and
+   placeOrder hard-blocked on !healthy) until they guessed to press F5. */
+let liveWs = null;
+let liveTimer = null;
+
+function connectLive(){
+  const proto = location.protocol==='https:' ? 'wss' : 'ws';
+  // The token rides in the QUERY STRING because the browser's WebSocket API cannot
+  // set handshake headers. chart.js taps this same socket by substring-matching
+  // '/ws', so the query params do not disturb it.
+  const qs = API.token ? `?token=${encodeURIComponent(API.token)}` : '';
+  const ws = new WebSocket(`${proto}://${location.host}/ws${qs}`);
+  liveWs = ws;
+
+  ws.onmessage = ev=>{ try{ onState(JSON.parse(ev.data)); }catch(e){} };
+
+  ws.onclose = (ev)=>{
+    if(ws !== liveWs) return;           // superseded by restartLive; ignore its death
+    liveWs = null;
+
+    // 4401 = the server rejected our token (app-level close code; the server closes
+    // AFTER accept() precisely so this code survives to us -- a pre-accept close is
+    // an HTTP 403 handshake rejection and would arrive as an opaque 1006).
+    //
+    // This MUST NOT fall through to the 1s retry: retrying a rejected token is an
+    // infinite loop hammering a server that will never let us in, while the UI just
+    // says "disconnected".
+    if(ev && ev.code === 4401){
+      const used = API.token;
+      if(API.token === used) API.setToken('');
+      setHealth(false,'unauthorized — token rejected');
+      const t = promptForToken('Token rejected by the server. Re-enter it:');
+      if(t){ API.setToken(t); scheduleLive(250); }
+      return;                            // cancelled → stay down, no spin
+    }
+    setHealth(false,'disconnected from server');
+    scheduleLive(1000);
+  };
+
+  ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
+}
+
+function scheduleLive(ms){
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(connectLive, ms);
+}
+
+/** Tear down the current socket and reconnect with whatever token API now holds. */
+function restartLive(){
+  const old = liveWs;
+  liveWs = null;                        // so its onclose is ignored as superseded
+  try { if(old) old.close(); } catch(e){}
+  scheduleLive(50);
 }
 
 function startLive(){
-  const proto = location.protocol==='https:' ? 'wss' : 'ws';
-  let ws;
-  const connect = ()=>{
-    ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onmessage = ev=>{ try{ onState(JSON.parse(ev.data)); }catch(e){} };
-    ws.onclose = ()=>{ setHealth(false,'disconnected from server'); setTimeout(connect, 1000); };
-    ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
-  };
   setHealth(false,'connecting…');
-  connect();
+  ensureToken().then(connectLive);
 }
 
 /* ============================================================================
@@ -1364,7 +1632,7 @@ const AutoTest = {
   /* Hit /api/account/safety to confirm DEMO status. Returns the safety object. */
   async _verifyDemo(){
     try {
-      const r = await fetch('/api/account/safety', {cache:'no-store'});
+      const r = await API.req('/api/account/safety', {cache:'no-store'});
       if(!r.ok) return { is_demo:false, login:'?', server:'?', trade_mode:-1, healthy:false };
       return await r.json();
     } catch(e){
@@ -1716,7 +1984,15 @@ function reconcileAutoTest(s){
 function setAccountBadge(safety){
   const txt = document.getElementById('connText');
   if(!txt) return;
-  txt.classList.remove('loading','demo','real','contest');
+  txt.classList.remove('loading','demo','real','contest','out');
+  if(safety && safety.logged_out){
+    txt.classList.add('out');
+    txt.textContent = 'LOGGED OUT';
+    const ab0 = document.getElementById('accountBanner');
+    if(ab0){ ab0.className = 'account-banner out'; ab0.textContent = 'Logged out — no account connected'; }
+    window.__lastSafety = null;
+    return;
+  }
   if(!safety || safety.trade_mode == null){
     txt.classList.add('loading');
     txt.textContent = '…';
@@ -1751,6 +2027,22 @@ function setAccountBadge(safety){
   set('atMargin', safety.margin_mode === 0 ? 'NETTING' :
                   safety.margin_mode === 2 ? 'HEDGING' : '—');
   set('atHealthy', safety.healthy ? 'YES' : 'NO');
+  // Account-modal session banner (DEMO green / REAL red).
+  const accBanner = document.getElementById('accountBanner');
+  if(accBanner){
+    accBanner.classList.remove('loading','demo','real','contest','out');
+    if(safety.is_demo){
+      accBanner.classList.add('demo');
+      accBanner.textContent = `DEMO ${login} @ ${safety.server || '?'}`;
+    } else if(safety.trade_mode === 1){
+      accBanner.classList.add('contest');
+      accBanner.textContent = `CONTEST ${login} @ ${safety.server || '?'}`;
+    } else {
+      accBanner.classList.add('real');
+      accBanner.textContent = `REAL ${login} @ ${safety.server || '?'} — live money`;
+    }
+  }
+  window.__lastSafety = safety;        // cache for active-row highlight in the list
   // START button is gated on DEMO + healthy
   const startBtn = document.getElementById('atStart');
   if(startBtn) startBtn.disabled = !(safety.is_demo && safety.healthy);
@@ -1758,6 +2050,7 @@ function setAccountBadge(safety){
 
 /* Refresh badge from the /ws frame so it stays current without re-fetching. */
 function updateAccountBadgeFromState(s){
+  if(s && s.logged_out){ setAccountBadge({logged_out:true}); return; }
   if(!s || !s.account) return;
   const a = s.account;
   setAccountBadge({
@@ -1772,7 +2065,7 @@ function updateAccountBadgeFromState(s){
 /* Fetched explicitly on page load + Auto-Test modal open (canonical source). */
 async function fetchAccountSafety(){
   try {
-    const r = await fetch('/api/account/safety', {cache:'no-store'});
+    const r = await API.req('/api/account/safety', {cache:'no-store'});
     if(!r.ok) return null;
     const s = await r.json();
     setAccountBadge(s);
@@ -1781,6 +2074,224 @@ async function fetchAccountSafety(){
     setAccountBadge(null);
     return null;
   }
+}
+
+/* ============================================================================
+   ACCOUNT LOGIN / SWITCH / LOGOUT  —  /api/accounts, /api/login, /api/logout
+   ============================================================================
+   The terminal can drive MT5 login from the browser. One account is active at a
+   time; "switch" = a sequential login(). Passwords are stored encrypted in the
+   OS vault server-side (never in the page). Trading is gated by health, and a
+   logged-out overlay blocks the UI until a session exists. */
+let accountProfiles = [];     // cached saved profiles (no secrets)
+let accountBusy = false;      // true while a login/logout request is in flight
+
+function accEsc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function openAccountModal(){
+  const m = $('#accountModal'); if(!m) return;
+  m.hidden = false;
+  // The logged-out overlay has a higher z-index than the modal, so hide it while
+  // the Account modal is open — otherwise it stacks on top and blocks the form.
+  const ov = $('#loggedOutOverlay'); if(ov) ov.hidden = true;
+  fetchAccounts();
+  fetchAccountSafety();      // refresh the session banner
+}
+function closeAccountModal(){ const m = $('#accountModal'); if(m) m.hidden = true; }
+
+/* Hide/show the logged-out overlay from each /ws frame. Trading is already
+   gated by setHealth(false,'logged out'); the overlay is the visible block. */
+function applySession(s){
+  const overlay = $('#loggedOutOverlay');
+  if(!overlay) return;
+  // Show the overlay only when logged out AND the Account modal isn't already
+  // open — the modal is the login flow, so stacking the overlay over it (higher
+  // z-index) would just block the form. They are mutually exclusive.
+  const acct = $('#accountModal');
+  const modalOpen = acct && !acct.hidden;
+  overlay.hidden = !(s && s.logged_out) || modalOpen;
+}
+
+async function fetchAccounts(){
+  try {
+    const r = await API.req('/api/accounts', {cache:'no-store', headers:API.hdrs()});
+    if(!r.ok) return;
+    const data = await r.json();
+    accountProfiles = data.accounts || [];
+    renderAccountList();
+  } catch(e){ /* offline — keep last list */ }
+}
+
+function renderAccountList(){
+  const list = $('#accountList'); if(!list) return;
+  const empty = $('#accountEmpty');
+  Array.from(list.querySelectorAll('.account-row')).forEach(n=>n.remove());
+  if(!accountProfiles.length){ if(empty) empty.hidden = false; return; }
+  if(empty) empty.hidden = true;
+  const cur = window.__lastSafety && window.__lastSafety.login;
+  for(const p of accountProfiles){
+    const active = cur != null && Number(cur) === Number(p.login);
+    const tag = p.last_trade_mode === 2 ? '<span class="acc-tag real">REAL</span>'
+              : p.last_trade_mode === 0 ? '<span class="acc-tag demo">DEMO</span>' : '';
+    const row = document.createElement('div');
+    row.className = 'account-row' + (active ? ' active' : '');
+    row.innerHTML =
+      `<div class="acc-info">`+
+        `<div class="acc-label">${accEsc(p.label || p.login)} ${tag}</div>`+
+        `<div class="acc-sub">${accEsc(p.login)} · ${accEsc(p.server)}</div>`+
+      `</div>`+
+      `<div class="acc-actions">`+
+        `<button class="btn small switch" data-id="${accEsc(p.id)}" data-active="${active?'1':'0'}">${active?'Active':'Switch'}</button>`+
+        `<button class="btn small ghost del" data-id="${accEsc(p.id)}" title="Remove">✕</button>`+
+      `</div>`;
+    list.appendChild(row);
+  }
+  list.querySelectorAll('button.switch').forEach(b =>
+    b.addEventListener('click', () => doSwitch(b.dataset.id)));
+  list.querySelectorAll('button.del').forEach(b =>
+    b.addEventListener('click', () => deleteAccount(b.dataset.id)));
+}
+
+/* Mirror a saved profile into the login form — everything EXCEPT the password, which
+   stays server-side in the OS vault and is never sent to the page. This is what makes a
+   rejected switch recoverable: the form is already filled, so the user only has to type
+   the one thing we cannot know. */
+function fillFormFromProfile(p){
+  if(!p) return;
+  const set = (id, v) => { const el = $(id); if(el) el.value = v == null ? '' : v; };
+  set('#accLabel', p.label || '');
+  set('#accLogin', p.login);
+  set('#accServer', p.server);
+  set('#accPath', p.path || '');
+  const pw = $('#accPassword'); if(pw) pw.value = '';
+  const save = $('#accSave'); if(save) save.checked = true;  // re-saving repairs the vault entry
+}
+
+/* Switch to a saved profile. Real accounts get a confirm BEFORE the switch
+   (we know the last trade_mode); ad-hoc logins are warned AFTER (see postLogin). */
+async function doSwitch(profileId){
+  const p = accountProfiles.find(x => x.id === profileId);
+  if(p && p.last_trade_mode === 2){
+    if(!confirm(`Switch to REAL account ${p.login} (${p.server})?\n` +
+                `Manual orders will trade REAL money.`)) return;
+  }
+  fillFormFromProfile(p);   // prefill first, so a failure leaves a ready-to-fix form
+  const ok = await postLogin({ profile_id: profileId });
+  if(!ok){
+    // The vault password was refused (or is stale). The form is already populated;
+    // point the user at the only field they can actually correct.
+    const pw = $('#accPassword');
+    if(pw){ pw.focus(); pw.placeholder = 'stored password was rejected — re-enter it'; }
+  }
+}
+
+async function doLoginFromForm(){
+  const login = parseInt(($('#accLogin').value || '').trim(), 10);
+  const password = $('#accPassword').value || '';
+  const server = ($('#accServer').value || '').trim();
+  const path = ($('#accPath').value || '').trim();
+  const label = ($('#accLabel').value || '').trim();
+  const save = $('#accSave').checked;
+  if(!login || !password || !server){
+    toast('fail','Missing fields','login, password and server are required'); return;
+  }
+  await postLogin({ login, password, server, path: path || null, save, label: label || null });
+}
+
+/* Show a login failure where the user is actually looking: in the modal, and until
+   they act on it. A 4s toast alone is why a rejected login reads as "the button did
+   nothing". fetchAccountSafety() repaints this banner, but only runs on success. */
+function showAccountError(msg){
+  const b = $('#accountBanner');
+  if(b){ b.className = 'account-banner out'; b.textContent = '⚠ ' + msg; }
+}
+
+/* Returns true on a successful login, false otherwise — callers (doSwitch) use this to
+   steer the user to the password field when the vault credential is refused. */
+async function postLogin(body){
+  // Not a silent no-op: a swallowed click here is indistinguishable from a dead button.
+  if(accountBusy){ toast('info','Please wait','A login is already in progress'); return false; }
+  accountBusy = true; setAccountBusy(true, body && body.profile_id);
+  try {
+    const r = await API.post('/api/login', body);
+    const data = await r.json().catch(() => ({}));
+    if(!r.ok){
+      const detail = (data && data.detail) || 'could not log in';
+      showAccountError(detail);
+      toast('fail','Login failed', detail);
+      return false;
+    }
+    const who = `#${data.login} · ${data.server || ''}`;
+    if(data.is_demo === false) toast('fail','REAL account active', `${who} — manual orders trade REAL money`);
+    else toast('ok','Logged in', who);
+    if(data.prev_open) toast('info','Positions left open',
+      `${data.prev_open} position(s) remain on the previous account`);
+    const pw = $('#accPassword');
+    if(pw){ pw.value = ''; pw.placeholder = 'master password'; }  // never keep the password in the DOM
+    await fetchAccountSafety();
+    await fetchAccounts();
+    closeAccountModal();
+    return true;
+  } catch(e){
+    const m = e.message || 'request failed';
+    showAccountError(m);
+    toast('fail','Login error', m);
+    return false;
+  }
+  finally { accountBusy = false; setAccountBusy(false); }
+}
+
+async function doLogout(){
+  if(accountBusy) return;
+  if(!confirm('Log out of the current MT5 account?\n' +
+              'The order pad will stop trading until you log in again.')) return;
+  accountBusy = true; setAccountBusy(true);
+  try {
+    const r = await API.post('/api/logout', {});
+    const data = await r.json().catch(() => ({}));
+    if(data && data.prev_open) toast('info','Positions left open',
+      `${data.prev_open} position(s) remain on the account`);
+    toast('ok','Logged out','Log in to resume trading');
+    await fetchAccountSafety();
+  } catch(e){ toast('fail','Logout error', e.message || 'request failed'); }
+  finally { accountBusy = false; setAccountBusy(false); }
+}
+
+async function deleteAccount(profileId){
+  const p = accountProfiles.find(x => x.id === profileId);
+  if(!confirm(`Remove saved account ${p ? (p.label || p.login) : profileId}?`)) return;
+  try {
+    await API.req('/api/accounts/' + encodeURIComponent(profileId),
+                  { method:'DELETE', headers:API.hdrs() });
+    await fetchAccounts();
+    toast('ok','Removed','Saved account deleted');
+  } catch(e){ toast('fail','Delete failed', e.message || ''); }
+}
+
+/* `busyProfileId` is the saved-account row being switched to, if any. Without it the
+   Switch buttons show no state at all — the user clicks, MT5 takes seconds to refuse,
+   and the UI looks frozen. Disable every Switch and mark the one actually working. */
+function setAccountBusy(on, busyProfileId){
+  const li = $('#accLoginBtn'), lo = $('#accLogoutBtn');
+  if(li){ li.disabled = on; li.textContent = on ? 'WORKING…' : 'LOG IN'; }
+  if(lo) lo.disabled = on;
+  document.querySelectorAll('#accountList button.switch').forEach(b => {
+    b.disabled = on;
+    if(on && busyProfileId && b.dataset.id === busyProfileId) b.textContent = '…';
+    else if(!on) b.textContent = b.dataset.active === '1' ? 'Active' : 'Switch';
+  });
+}
+
+function bindAccount(){
+  const on = (id, ev, fn) => { const el = document.getElementById(id); if(el) el.addEventListener(ev, fn); };
+  on('accountBtn',     'click', openAccountModal);
+  on('accountClose',   'click', closeAccountModal);
+  on('accLoginBtn',    'click', doLoginFromForm);
+  on('accLogoutBtn',   'click', doLogout);
+  on('loggedOutLogin', 'click', openAccountModal);
+  const modal = document.getElementById('accountModal');
+  if(modal) modal.addEventListener('click', e => { if(e.target.id === 'accountModal') closeAccountModal(); });
 }
 
 /* Small numeric stats used by AutoTest._buildAudit for slippage aggregation.

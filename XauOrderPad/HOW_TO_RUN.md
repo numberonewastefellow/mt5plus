@@ -43,6 +43,67 @@ cd /d d:\llm\ios\mt5plus\XauOrderPad
 - Health dot is **green** = terminal connected + AutoTrading on + symbol tradable.
 - Open <http://127.0.0.1:8765/api/state> to see the raw status JSON.
 
+## Reach it from a phone on the LAN
+
+By default the server binds **`127.0.0.1`** — loopback. A phone **cannot** reach that, and **no
+firewall rule will change it**: uvicorn listens on exactly one address, and that address is not on
+your network. (It is not a Vite dev server; there is no hidden "Network" URL.) `netstat` shows the
+truth:
+
+```
+TCP    127.0.0.1:8765    LISTENING       <- loopback only. A phone gets connection-refused.
+TCP    0.0.0.0:8765      LISTENING       <- reachable from the LAN.
+```
+
+### 1. Bind to the network, **with a token**
+
+```powershell
+$env:XAUORDERPAD_HOST  = "0.0.0.0"
+$env:XAUORDERPAD_TOKEN = "<strong random string>"
+.venv\Scripts\python.exe server.py
+```
+
+> **The token is not optional here.** `API_TOKEN` defaults to `""` — *no authentication*. On the
+> LAN that means any phone, laptop or smart TV on the Wi-Fi can `POST /order` and flatten your book,
+> on a server that sends **real MT5 orders**. The startup banner shouts if you get this wrong.
+
+The banner then prints the exact URL to type into the Android app:
+
+```
+  Network:  http://192.168.0.116:8765     <-- type this into the Android app
+  Auth:     token REQUIRED
+```
+
+### 2. Open the Windows Firewall — inbound TCP 8765
+
+Needs an **Administrator** PowerShell, once:
+
+```powershell
+New-NetFirewallRule -DisplayName "XauOrderPad 8765 (LAN only)" `
+  -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8765 `
+  -RemoteAddress LocalSubnet -Profile Any
+```
+
+`-RemoteAddress LocalSubnet` limits it to devices on your own LAN — never the internet.
+
+### 3. When the phone still cannot connect
+
+Two causes, in order of likelihood. Neither is an app bug, and both look identical from the phone.
+
+| Cause | How to spot it | Fix |
+|---|---|---|
+| **Windows has your Wi-Fi as a *Public* network.** Inbound is blocked outright, and a Private-profile rule never applies. | `Get-NetConnectionProfile` → `NetworkCategory : Public` | Use `-Profile Any` (as above), or set the network to Private. |
+| **Router AP isolation** — the router blocks client↔client traffic on Wi-Fi entirely. | The PC can reach its own LAN IP, but the phone cannot reach *anything* on the PC. | Turn off AP/client isolation on the router, or use a different network. |
+
+A useful discriminator: from *another* device on the Wi-Fi, open
+`http://<pc-lan-ip>:8765/api/config`. It is unauthenticated by design, so it should answer
+`{"auth_required": true, ...}`. If it hangs, the problem is the network, not the app.
+
+> Testing the PC's own LAN IP **from the PC itself** proves nothing — that traffic never traverses
+> the inbound firewall.
+
+The phone app is documented in **[../android/README.md](../android/README.md)**.
+
 ## Controls
 
 | Key            | Action            |
@@ -52,6 +113,63 @@ cd /d d:\llm\ios\mt5plus\XauOrderPad
 | Esc            | CLOSE ALL         |
 
 (Buttons do the same. Keys only work while the page/tab is focused.)
+
+## Account login / switch / logout (web-driven)
+
+The MT5 desktop terminal must be **installed and running** — the app drives it, it
+does not replace it. But the *account* can be logged in from the browser. Click
+**ACCOUNT** in the top bar.
+
+### The two ways a session gets established — this is the thing that confuses people
+
+1. **Attach to an already-logged-in terminal.** If you log into MT5 on the desktop
+   yourself, the app just attaches — **no password needed**, because MT5 hands over
+   the existing session. This is the path all the `analysis/` scripts use
+   (`mt5.initialize()` with no arguments).
+2. **Log in from the browser** (ACCOUNT panel). Here the password **is** required and
+   is sent to MT5 for real.
+
+The trap: the app can look perfectly healthy for weeks on path (1) while the password
+saved in the vault has **never once been tested**. The day the terminal is logged out,
+path (2) kicks in, the stale password gets used for the first time, and the login is
+refused. See `-6: Terminal: Authorization failed` in *Common issues* below.
+
+### Using the panel
+
+- **Log in:** enter the account number (login), **master** password (not the *investor*
+  password — that is read-only and is rejected the same way a wrong password is), and
+  server (e.g. `Exness-MT5Trial16`), then **LOG IN**. Tick *Remember this account* to
+  save it for one-click switching.
+- **Switch:** pick a saved account → **Switch**. It logs in using the password held in
+  Windows Credential Manager, and **prefills the form** with that profile's
+  login/server/label at the same time (never the password — that stays server-side and
+  is never sent to the page). So if the stored password is refused, the form is already
+  filled in and the cursor lands in the password box: just retype it and hit **LOG IN**.
+  With *Remember this account* ticked, that repairs the stored copy and Switch works
+  silently from then on.
+  Switching is sequential — MT5 allows **one logged-in account at a time**, and it
+  switches the *same* terminal the desktop shows.
+- **Log out:** **LOG OUT** disconnects and shows a logged-out overlay; trading is
+  blocked until you log in again. (MT5 has no true account-logout — the terminal
+  keeps its session; the app simply stops driving it.)
+
+**Security:** the server binds to `127.0.0.1` only. Passwords are stored
+encrypted in **Windows Credential Manager** (via `keyring`) — never in a plain
+file, never logged, and never sent to the browser. The `profiles.json` index holds only
+login/server/label. If the credential store is unavailable, saving fails closed (no
+plaintext fallback).
+
+**A password is only *verified* when you log in with it.** Logging in via the form with
+*Remember* ticked saves it **only after MT5 accepts it**, so that stored copy is
+known-good. Credential Manager is a safe, not a bouncer — it will faithfully store and
+return a wrong password without complaint.
+
+**Real accounts** are allowed: a red **REAL** banner shows, real logins/switches
+require a confirm, and Auto-Test still refuses to run on any non-demo account.
+
+**Open positions on switch/logout:** the switch proceeds and warns you how many
+positions remain open on the *previous* account (they are **not** auto-closed —
+flatten first if you want them closed). They reappear when you switch back.
 
 ## Auto-Test (demo only)
 
@@ -197,9 +315,33 @@ doesn't have that field. That's the whole point of choosing JSON Lines:
 | Symptom | Fix |
 |---|---|
 | Health dot stays **red**, "terminal offline" | Start MT5 and log in; the worker auto-reconnects. |
+| **`-6: Terminal: Authorization failed`** on login/Switch | MT5 **rejected the credentials**. The stored password is wrong or stale (see below). Retype the **master** password in the ACCOUNT form with *Remember* ticked. |
+| **`logged_out` / `"error": "logged out"`** in `/api/state` | Normal on a fresh start — the worker does **not** auto-attach on boot. Click **ACCOUNT → LOG IN**. |
+| Clicking **Switch** seems to do nothing | It isn't dead — the login is being refused. The reason now appears in the ACCOUNT banner and in the log as `account_login_failed`. |
 | Dot amber, "trading not allowed" / order says `10027` | Turn on **AutoTrading** (Ctrl+E) in MT5. |
 | Browser can't reach the page | Make sure the console window is still running; check the port is **8765**. |
 | Port 8765 already in use | Change `PORT` in `config.py` (e.g. 8770) and restart; also update the URL. |
 | Wrong/empty symbol | Set `SYMBOL` in `config.py` to your exact name (e.g. `XAUUSDm`). |
+
+### Diagnosing a refused login
+
+`-6` means the **broker** said no — the request reached MT5 fine. Rule the causes out in
+this order:
+
+1. **Is the terminal itself logged in?** Run the check below; if it *also* returns `-6`,
+   the terminal has no account, so every login now depends on the stored password being
+   correct. (This call passes no credentials at all — it only tries to attach.)
+
+   ```powershell
+   .\.venv\Scripts\python.exe -c "import MetaTrader5 as m; print(m.initialize(), m.last_error())"
+   ```
+
+2. **Master vs investor password.** The investor (read-only) password fails identically.
+3. **Server name** must match exactly, e.g. `Exness-MT5Trial16`.
+4. **Demo account expired.** Exness archives idle demo accounts — if a password you are
+   certain about still gives `-6`, create a fresh demo and log in with it.
+
+The failure is always recorded in the log as `account_login_failed` (with the MT5 code
+and message; never the password).
 
 > Always test on an **Exness demo** account first.
