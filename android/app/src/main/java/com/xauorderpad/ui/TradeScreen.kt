@@ -451,26 +451,17 @@ private fun LadderControls(
     val crossed = valid && bid != null &&
         if (side == "sell") bid < typed!! else bid > typed!!
 
-    Row(Modifier.fillMaxWidth().padding(bottom = 6.dp),
-        verticalAlignment = Alignment.CenterVertically) {
-
+    // TWO rows, not one. Squeezing side + trigger + APPLY onto a single row left the field
+    // ~170dp wide, and it CLIPPED: "4118.50" rendered as "18.5" with the leading digits
+    // scrolled out of view. On a trading control that is not cosmetic -- the price you are
+    // about to arm is the one thing that must always be legible. The trigger gets the full
+    // dialog width; the side chips and APPLY share the row above it.
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         SideChip("SELL", side == "sell", Red, live) { side = "sell" }
         Spacer(Modifier.width(6.dp))
         SideChip("BUY", side == "buy", Green, live) { side = "buy" }
-        Spacer(Modifier.width(8.dp))
 
-        OutlinedTextField(
-            value = trig,
-            onValueChange = { trig = it },
-            enabled = live,
-            singleLine = true,
-            label = { Text("trigger", fontSize = 10.sp) },
-            textStyle = MaterialTheme.typography.bodyMedium.copy(
-                fontFamily = FontFamily.Monospace),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-            modifier = Modifier.weight(1f),
-        )
-        Spacer(Modifier.width(6.dp))
+        Spacer(Modifier.weight(1f))
 
         // Disabled rather than toasting: a blank or zero trigger is not an error to report,
         // it is simply nothing to send. The server would reject it anyway ("waiting: no
@@ -485,6 +476,19 @@ private fun LadderControls(
             enabled = live && valid,
         ) { Text("APPLY", fontWeight = FontWeight.Bold) }
     }
+
+    OutlinedTextField(
+        value = trig,
+        onValueChange = { trig = it },
+        enabled = live,
+        singleLine = true,
+        label = { Text("trigger price", fontSize = 10.sp) },
+        textStyle = MaterialTheme.typography.titleMedium.copy(
+            fontFamily = FontFamily.Monospace),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        isError = crossed,
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+    )
 
     if (crossed) {
         Text(
