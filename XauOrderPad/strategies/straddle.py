@@ -91,11 +91,46 @@ class VolumeSpikeStraddle(StrategyBase):
     def _on_killed(self) -> None:
         self._straddles.clear()
 
+    # ---- crash recovery ---------------------------------------------------
+    def _adopt(self, worker, positions: list) -> int:
+        """Rebuild open straddles from the broker after a restart.
+
+        Without this a restart mid-straddle strands both legs: they keep their broker
+        SL/TP, but the TIME-STOP and the kill-switch both live in this object, so
+        nothing would ever flatten a straddle that simply went nowhere.
+
+        Legs are re-paired by open time -- the two legs of a straddle are placed
+        back-to-back, so grouping by second is reliable. A leg whose partner has
+        already been stopped out is adopted alone; that is correct, it still needs the
+        time-stop, and `_manage` handles a one-leg straddle already.
+        """
+        groups: dict[int, list[int]] = {}
+        for p in sorted(positions, key=lambda p: int(p.time)):
+            groups.setdefault(int(p.time), []).append(int(p.ticket))
+
+        self._straddles = [{"open_ts": float(ts), "legs": legs}
+                           for ts, legs in groups.items()]
+        log.warning("straddle adopted %d open position(s) in %d straddle(s)",
+                    len(positions), len(self._straddles),
+                    extra={"event": "straddle_adopted", "strategy": self.ID,
+                           "straddles": self._straddles})
+        return len(positions)
+
+    def _adopt_detail(self) -> dict:
+        return {"straddles": len(self._straddles)}
+
     # ---- main loop --------------------------------------------------------
     def _tick(self, worker, st: dict) -> None:
         """Cheap position management runs each tick; new-signal detection runs
         only once per freshly CLOSED M1 bar."""
-        self._manage(worker)
+        self._manage(worker)          # time-stop + prune -- ALWAYS, adopted or not
+        if not self.can_enter:
+            # Managing an adopted book: work the exits, open nothing new.
+            self._state = (f"managing {len(self._straddles)} adopted straddle(s)"
+                           if self._straddles else "managing")
+            if not self._straddles:
+                self._clear_managing_if_flat(worker)
+            return
         self._maybe_signal(worker)
         self._state = "active" if self._straddles else "armed"
 

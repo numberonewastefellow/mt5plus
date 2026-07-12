@@ -173,6 +173,10 @@ class Mt5Worker:
                 "symbol": self._symbol,
             },
         )
+        # The terminal is up and we can see the book, so this is the first moment we
+        # can find out whether a previous run left positions behind. Do it here rather
+        # than at boot: at boot there is no MT5 connection to ask.
+        self.reconcile_strategies()
         return True
 
     def _resolve_symbol(self) -> None:
@@ -382,6 +386,30 @@ class Mt5Worker:
         """Last `count` M1 bars for the active symbol (structured np array)."""
         return mt5.copy_rates_from_pos(self._symbol, mt5.TIMEFRAME_M1, 0, int(count))
 
+    def ticks_since(self, ts: int):
+        """Every tick from unix time `ts` to now, for the active symbol.
+
+        Used by crash recovery to rebuild a ladder's EXTREME (the lowest bid it
+        reached), which is what its retrace stop measures from and the one piece of
+        state the broker does not keep. Returns None when the broker has nothing --
+        the caller must fall back rather than treat that as "no move happened"."""
+        start = datetime.datetime.fromtimestamp(int(ts))
+        end = datetime.datetime.now() + datetime.timedelta(seconds=1)
+        return mt5.copy_ticks_range(self._symbol, start, end, mt5.COPY_TICKS_ALL)
+
+    def reconcile_strategies(self) -> None:
+        """Rebuild every engine from the broker's open book.
+
+        Called once the terminal is connected, and again after any login/switch: a
+        different account means a different book, and an engine still holding the old
+        account's tickets would be closing trades that are no longer even visible."""
+        for sid, s in self.strategies.items():
+            try:
+                s.reconcile(self)
+            except Exception:
+                log.exception("strategy reconcile crashed",
+                              extra={"event": "strategy_exception", "strategy": sid})
+
     def strategy_positions(self, magic: int) -> list:
         """Open positions belonging to ONE engine.
 
@@ -542,6 +570,10 @@ class Mt5Worker:
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
         self._poll_count = 0
         self._last_healthy = None
+        # The book belongs to the account too. Re-derive every engine from THIS
+        # account's positions: an engine still holding the previous account's tickets
+        # would be trying to close trades that are no longer even visible.
+        self.reconcile_strategies()
 
         acc = mt5.account_info()
         tmode = int(acc.trade_mode) if acc is not None else None

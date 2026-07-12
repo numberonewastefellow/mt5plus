@@ -25,6 +25,7 @@ import logging
 import threading
 
 import config
+from . import state
 
 log = logging.getLogger("XauOrderPad.strategy")
 
@@ -37,9 +38,14 @@ class StrategyBase:
         self._lock = threading.Lock()
         self.enabled = False
         self.max_daily_loss = 200.0
-        self._state = "disabled"          # disabled|armed|active|killed|waiting:…
+        self._state = "disabled"          # disabled|armed|active|managing|killed|waiting:…
         self._error: str | None = None
         self._killed = False              # daily-loss kill-switch, latched
+        # Adopted positions but NOT re-armed: manage the exits, open nothing new.
+        # Without this flag `evaluate()` returns early on `not enabled` and the
+        # adopted book would sit unmanaged -- which is the exact bug reconcile()
+        # exists to fix.
+        self._managing = False
 
     @property
     def MAGIC(self) -> int:
@@ -62,7 +68,81 @@ class StrategyBase:
                          "enabled" if self.enabled else "disabled",
                          extra={"event": "strategy_toggle", "strategy": self.ID,
                                 "enabled": self.enabled, "params": self._params()})
+        state.save(self.ID, self.enabled, self._params())
         return self.status()
+
+    # ---- crash recovery ---------------------------------------------------
+    def reconcile(self, worker) -> None:
+        """Rebuild this engine from the BROKER after a (re)start or account switch.
+
+        The engine's memory dies with the process; the positions do not. They sit at
+        the broker, still open, still carrying risk. So the open book is rebuilt from
+        `positions_get()` -- never from anything remembered on disk -- and then handed
+        to `_adopt()` for engine-specific reconstruction (a ladder needs its extreme
+        back; a straddle needs its legs paired).
+
+        Resume policy, and why it is split in two:
+
+          * ADOPT ALWAYS. Managing an open position only ever REDUCES risk, so it
+            never needs a human to authorise it. A position nobody is managing is
+            the whole problem this method exists to solve.
+
+          * RE-ARM ONLY IF FRESH. Taking NEW risk unattended is a different matter. A
+            crash-restart loop that re-armed on every boot would pyramid forever --
+            that is how an unattended bot does real damage. So new entries resume
+            only when the saved state is recent (config.LADDER_RESUME_MAX_AGE_S);
+            anything older is managed but disarmed, and says so.
+        """
+        rec = state.load(self.ID)
+        if rec and rec.get("params"):
+            self._apply(rec["params"])        # restore tuning either way
+
+        try:
+            positions = self.positions(worker)
+        except Exception:
+            log.exception("reconcile: could not read positions",
+                          extra={"event": "strategy_reconcile_failed",
+                                 "strategy": self.ID})
+            return
+
+        adopted = 0
+        if positions:
+            try:
+                adopted = int(self._adopt(worker, positions) or 0)
+            except Exception:
+                log.exception("reconcile: adopt failed",
+                              extra={"event": "strategy_reconcile_failed",
+                                     "strategy": self.ID})
+
+        age = state.age_s(rec)
+        was_on = bool(rec and rec.get("enabled"))
+        fresh = age <= float(config.LADDER_RESUME_MAX_AGE_S)
+        rearmed = was_on and fresh
+
+        if rearmed:
+            self.enabled = True
+            self._managing = False
+            self._error = None
+            self._state = "armed"
+        else:
+            self.enabled = False
+            self._managing = bool(adopted)   # keep working the exits, open nothing new
+            self._state = "managing" if adopted else "disabled"
+            if adopted and was_on:
+                # Loud, and in the UI -- not just the log. Somebody has to know that
+                # the book is being babysat but nothing new will be opened.
+                self._error = (
+                    f"resumed management of {adopted} open position(s) after a restart "
+                    f"({int(age)}s old state) — re-enable to take new entries")
+            elif adopted:
+                self._error = (f"adopted {adopted} orphaned position(s) from the broker "
+                               f"— managing exits only")
+
+        log.info("strategy %s reconciled", self.ID,
+                 extra={"event": "strategy_reconciled", "strategy": self.ID,
+                        "adopted": adopted, "state_age_s": None if age == float("inf") else int(age),
+                        "was_enabled": was_on, "rearmed": rearmed,
+                        "detail": self._adopt_detail()})
 
     def status(self) -> dict:
         s = {
@@ -79,9 +159,19 @@ class StrategyBase:
         return s
 
     # ---- main loop hook (worker thread only) ------------------------------
+    @property
+    def can_enter(self) -> bool:
+        """May this engine open NEW positions? Managing-only engines may not."""
+        return self.enabled and not self._managing
+
     def evaluate(self, worker, st: dict) -> None:
-        """Gates that every engine must pass, then hands off to `_tick`."""
-        if not self.enabled:
+        """Gates that every engine must pass, then hands off to `_tick`.
+
+        Runs when armed OR when merely MANAGING an adopted book -- an engine holding
+        real positions must keep working its exits even though it will not open
+        anything new. Gating this on `enabled` alone was the bug: after a stale-state
+        restart the positions would have been adopted and then ignored."""
+        if not (self.enabled or self._managing):
             self._state = "disabled"
             return
 
@@ -110,11 +200,16 @@ class StrategyBase:
     needs_hedging = False
 
     def _disable_with(self, msg: str) -> None:
-        if self.enabled or self._error != msg:
+        if self.enabled or self._managing or self._error != msg:
             log.warning("strategy %s auto-disabled: %s", self.ID, msg,
                         extra={"event": "strategy_auto_disabled",
                                "strategy": self.ID, "reason": msg})
         self.enabled = False
+        # Managing must stop too. These gates fire on "this is not the demo account"
+        # and "this account cannot hedge" -- i.e. we are looking at a DIFFERENT book
+        # than the one we adopted. Continuing to "manage" positions on it would mean
+        # sending closes against someone else's trades.
+        self._managing = False
         self._error = msg
         self._state = "disabled"
 
@@ -165,3 +260,28 @@ class StrategyBase:
 
     def _on_killed(self) -> None:
         """Drop engine-local bookkeeping after the kill-switch flattened us."""
+
+    def _adopt(self, worker, positions: list) -> int:
+        """Rebuild engine-local state from the broker's OPEN POSITIONS.
+
+        Called by reconcile() on boot and after an account switch. `positions` are
+        already filtered to this engine's magic. Return how many were adopted.
+
+        Whatever cannot be read off a position must be RECONSTRUCTED, not guessed --
+        and if it cannot be reconstructed, say so in the log. A silently wrong stop
+        basis is worse than an obviously missing one."""
+        return 0
+
+    def _adopt_detail(self) -> dict:
+        """Anything worth putting in the strategy_reconciled log line."""
+        return {}
+
+    def _clear_managing_if_flat(self, worker) -> None:
+        """Managing ends when the adopted book empties -- otherwise the engine would
+        stay in `managing` forever, blocking a clean `disabled` state."""
+        if self._managing and not self.positions(worker):
+            self._managing = False
+            self._state = "disabled"
+            self._error = None
+            log.info("strategy %s finished managing its adopted book", self.ID,
+                     extra={"event": "strategy_managing_done", "strategy": self.ID})

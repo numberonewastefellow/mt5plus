@@ -145,6 +145,25 @@ class LadderState:
                 self._last_entry_ms = t_ms
         return acts
 
+    def rollback_entry(self, price: float) -> None:
+        """Undo an entry the broker REFUSED.
+
+        on_tick() appends to `entries` and then emits the "enter" action, so by the
+        time the order is actually sent the state already believes it holds the
+        position. If order_send then fails -- market closed, no money, bad stops --
+        the state is left holding a PHANTOM: an entry with no ticket behind it.
+
+        That is not cosmetic. The phantom consumes a max_positions slot, makes the
+        engine "manage" a position that does not exist, and sends the retrace stop
+        chasing a ticket the broker has never heard of. The model must match the
+        broker, so an order that did not happen must not appear to have happened.
+        """
+        for i in range(len(self.entries) - 1, -1, -1):
+            if abs(self.entries[i] - price) < 1e-9:
+                self.entries.pop(i)
+                self.n_taken = max(0, self.n_taken - 1)
+                return
+
     @property
     def done(self) -> bool:
         """Ladder is finished: it fired, and nothing is left open."""
@@ -178,6 +197,8 @@ class TrendLadder(StrategyBase):
         self._paper_trades = 0
         self._ladders_done = 0
         self._last_spread = 0.0
+        self._adopt_basis: str | None = None     # how the extreme was reconstructed
+        self._adopt_extreme: float | None = None
 
     # ---- params -----------------------------------------------------------
     def _defaults(self) -> dict:
@@ -229,6 +250,75 @@ class TrendLadder(StrategyBase):
         self._ladder = None
         self._tickets = []
 
+    # ---- crash recovery ---------------------------------------------------
+    def _adopt(self, worker, positions: list) -> int:
+        """Rebuild the ladder from the broker's open positions after a restart.
+
+        Entries, tickets and side all come straight off the positions. The one thing
+        the broker does NOT store is the EXTREME -- the lowest bid (highest ask) the
+        ladder reached -- and that is precisely what the retrace stop measures from.
+        Lose it and the stop is meaningless.
+
+        So reconstruct it from tick history: the earliest position's open time is when
+        this ladder began, and min(bid) over that window IS the extreme, exactly.
+
+        If the ticks are unavailable (weekend, gap, broker returns nothing) fall back
+        to the best ENTRY price. Entries are only ever added at a new extreme, so the
+        best entry is a genuinely OBSERVED extreme -- not a guess. It is conservative
+        (the true extreme can only be further on), and the log says the basis is
+        approximate. Never silently invent a stop basis.
+        """
+        poss = sorted(positions, key=lambda p: int(p.time))
+        is_sell = int(poss[0].type) == 1                # MT5: 0=BUY, 1=SELL
+        side = "sell" if is_sell else "buy"
+        entries = [float(p.price_open) for p in poss]
+        # Same {entry, ticket} shape _enter() builds, so exit_one can close a single
+        # adopted position by its entry price exactly as it would a live one.
+        tickets = [{"entry": float(p.price_open), "ticket": int(p.ticket)} for p in poss]
+
+        # best entry = a real observed extreme (fallback + a floor on the tick scan)
+        best_entry = min(entries) if is_sell else max(entries)
+
+        extreme, basis = best_entry, "entries (approximate — no ticks)"
+        try:
+            ticks = worker.ticks_since(int(poss[0].time))
+            if ticks is not None and len(ticks):
+                if is_sell:
+                    tx = float(min(t["bid"] for t in ticks))
+                    extreme, basis = min(tx, best_entry), "ticks"
+                else:
+                    tx = float(max(t["ask"] for t in ticks))
+                    extreme, basis = max(tx, best_entry), "ticks"
+        except Exception:
+            log.exception("ladder adopt: tick replay failed; using entry-price basis",
+                          extra={"event": "ladder_adopt_ticks_failed", "strategy": self.ID})
+
+        self.side = side
+        st = LadderState(side, trigger=self.trigger, target=self.target,
+                         retrace=self.retrace, max_positions=max(self.max_positions,
+                                                                 len(entries)),
+                         entry_mode=self.entry_mode, entry_step=self.entry_step,
+                         entry_gap_ms=self.entry_gap_ms)
+        st.armed = True                 # it already fired -- do not re-trigger
+        st.entries = entries
+        st.n_taken = len(entries)
+        st.extreme = extreme
+        self._ladder = st
+        self._tickets = tickets
+        self._adopt_basis = basis
+        self._adopt_extreme = extreme
+
+        log.warning("ladder adopted %d orphaned position(s) from the broker",
+                    len(entries),
+                    extra={"event": "ladder_adopted", "strategy": self.ID,
+                           "side": side, "entries": entries,
+                           "tickets": [x["ticket"] for x in tickets],
+                           "extreme": round(extreme, 3), "extreme_basis": basis})
+        return len(entries)
+
+    def _adopt_detail(self) -> dict:
+        return {"extreme": self._adopt_extreme, "extreme_basis": self._adopt_basis}
+
     # ---- control ----------------------------------------------------------
     def update(self, params: dict | None, enabled: bool | None) -> dict:
         """Enable, then immediately re-check the spread guard.
@@ -262,6 +352,27 @@ class TrendLadder(StrategyBase):
             return
         spread = float(ask) - float(bid)
         self._last_spread = spread
+
+        # MANAGING an adopted book: work the exits (target + retrace) on the positions
+        # we inherited, but open nothing new. Note this runs BEFORE the trigger and
+        # spread guards -- those gate NEW entries, and a position already open must be
+        # managed regardless of whether a fresh one would be allowed. Bailing out here
+        # on "no trigger set" would strand exactly the positions we just rescued.
+        if self._managing:
+            if self._ladder is None:
+                self._clear_managing_if_flat(worker)
+                return
+            acts = self._ladder.on_tick(float(bid), float(ask), int(time.time() * 1000))
+            for a in acts:
+                if a[0] == "enter":
+                    continue                       # managing-only: never open new risk
+                self._do(worker, a)
+            self._state = (f"managing {len(self._ladder.entries)} adopted position(s)"
+                           if self._ladder.entries else "managing")
+            if not self._ladder.entries:
+                self._ladder = None
+                self._clear_managing_if_flat(worker)
+            return
 
         if self.trigger <= 0:
             self._state = "waiting: no trigger price set"
@@ -320,17 +431,26 @@ class TrendLadder(StrategyBase):
         r = worker.strategy_place(self.MAGIC, self.side, round(self.volume, 2),
                                   sl, 0.0, comment="XauLadder")
         if not r.get("ok"):
+            # The broker said no, so the ladder must un-believe the entry. Leaving it
+            # in place would leave the engine managing a position that does not exist.
+            if self._ladder is not None:
+                self._ladder.rollback_entry(price)
             self._error = f"entry failed: {r.get('error')}"
-            log.warning("ladder entry failed",
+            log.warning("ladder entry failed — entry rolled back",
                         extra={"event": "ladder_entry_failed", "strategy": self.ID,
-                               "error": r.get("error")})
+                               "error": r.get("error"), "rolled_back": round(price, 3)})
             return
-        self._tickets.append(int(r["ticket"]))
+        # Pair the ticket with the price the LadderState thinks it entered at, so a
+        # single position hitting its target can be closed on its own. Keyed on the
+        # state's price rather than the broker's fill: the state is what emits
+        # exit_one, and matching on a slipped fill price would never find the ticket.
+        self._tickets.append({"entry": float(price), "ticket": int(r["ticket"])})
         self._error = None
         log.info("ladder entry",
                  extra={"event": "ladder_entry", "strategy": self.ID,
                         "side": self.side, "ticket": r.get("ticket"),
-                        "fill": r.get("price"), "volume": self.volume})
+                        "requested": round(price, 3), "fill": r.get("price"),
+                        "volume": self.volume})
 
     def _exit(self, worker, price: float, why: str, entry: float | None = None) -> None:
         if self.paper:
@@ -347,9 +467,25 @@ class TrendLadder(StrategyBase):
                                 "exit": round(price, 3), "pl_per_oz": round(pl, 3),
                                 "cum_pl_per_oz": round(self._paper_pl, 3)})
             return
-        for t in list(self._tickets):
-            r = worker.strategy_close_ticket(self.MAGIC, t)
+
+        # exit_one carries the entry price of the ONE position that hit its target, so
+        # close only that one. Closing the whole list here (as this used to) meant the
+        # first position to reach its target flattened the entire ladder -- silently
+        # throwing away every other position, including ones still running.
+        if entry is not None:
+            doomed = [x for x in self._tickets if abs(x["entry"] - entry) < 1e-9]
+            if not doomed:                       # already gone (broker SL/TP beat us)
+                return
+        else:
+            doomed = list(self._tickets)
+
+        for x in doomed:
+            r = worker.strategy_close_ticket(self.MAGIC, x["ticket"])
+            ok = bool(r.get("ok"))
             log.info("ladder exit",
                      extra={"event": "ladder_exit", "strategy": self.ID,
-                            "why": why, "ticket": t, "ok": bool(r.get("ok"))})
-        self._tickets = []
+                            "why": why, "ticket": x["ticket"],
+                            "entry": round(x["entry"], 3), "ok": ok,
+                            "error": r.get("error")})
+            if ok:
+                self._tickets.remove(x)

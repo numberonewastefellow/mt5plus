@@ -52,6 +52,17 @@ STRATEGY_MAGICS = {
     "ladder": 532028,
 }
 
+# Crash recovery. On (re)start each engine rebuilds its open book from the BROKER
+# -- positions_get(), filtered by magic -- because the broker is the only thing
+# that survives a kill -9. It ALWAYS adopts them and resumes managing their exits;
+# managing an open position only ever reduces risk, so it needs no human.
+#
+# Resuming NEW entries is a different matter. An engine that re-armed on every boot
+# would, in a crash-restart loop, pyramid forever -- which is how an unattended bot
+# does real damage. So new entries resume only if the persisted state is younger
+# than this. Anything older is managed but left disarmed, and says so in the UI.
+LADDER_RESUME_MAX_AGE_S = 600      # 10 minutes
+
 # --- Trend-Ladder (experimental, DEMO-ONLY) -------------------------------
 # Arm a side + trigger price; pyramid into the move; exit on a retrace.
 #
