@@ -52,6 +52,25 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
 
     val link: StateFlow<Link> get() = Feed.link
 
+    /**
+     * Is the feed actually LIVE right now?
+     *
+     * This exists because `snapshot` is NOT cleared when the socket dies -- the last frame just
+     * sits there. Everything derived from it (health, quote, P&L) therefore keeps reading as
+     * current: `health.healthy` stays true, so BUY/SELL would stay enabled and the bid/ask would
+     * keep displaying a frozen price as if it were live.
+     *
+     * That is the dangerous case, and it is not hypothetical: the WebSocket can die while plain
+     * HTTP still works (proxy or idle timeout). A tap on BUY then places a REAL order against a
+     * price that has since moved, and it SUCCEEDS.
+     *
+     * So: one source of truth for staleness, derived from the socket rather than the data.
+     */
+    val live: StateFlow<Boolean> = Feed.link
+        .map { it is Link.Up }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
     // ---- derived UI slices (C2) -----------------------------------------
     // Each one is distinctUntilChanged, so a field that did not move does not invalidate the
     // composable that reads it. A price tick touches `quote` and `positions` (profit moves)
@@ -303,6 +322,15 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
     // ---- trading ---------------------------------------------------------
 
     fun placeOrder(side: String) = viewModelScope.launch {
+        // Checked BEFORE health, because `health` is derived from a snapshot that may be stale --
+        // it would happily report "healthy" from a frame received before the socket died. The
+        // UI already greys out BUY/SELL when the feed is not live; this is the guard in depth,
+        // so a stale entry cannot slip through even if that gate is bypassed. ENTRY only --
+        // closing is never blocked (see closeWhere).
+        if (!live.value) {
+            say("Feed is stale — price may have moved. Reconnecting…", error = true)
+            return@launch
+        }
         val h = health.value
         if (!h.healthy) {
             // h.error carries the SPECIFIC reason -- "market closed / symbol not tradable",

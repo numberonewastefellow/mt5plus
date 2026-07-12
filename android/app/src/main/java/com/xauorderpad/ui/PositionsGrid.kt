@@ -40,6 +40,8 @@ fun PositionsGrid(
     onClose: (Long) -> Unit,
     modifier: Modifier = Modifier,
     connected: Boolean = true,
+    /** Socket is Up. False => these rows are a frozen last-known frame, not live P&L. */
+    live: Boolean = true,
 ) {
     Column(modifier) {
         Row(
@@ -69,6 +71,26 @@ fun PositionsGrid(
                 )
             }
             return@Column
+        }
+
+        // The book is NOT hidden when the feed dies -- these rows are still the best information
+        // available, and blanking the grid during a disconnect would read as "you are flat",
+        // which is the most dangerous lie this screen could tell. They just stop claiming to be
+        // current: the P&L below is frozen at the last frame received.
+        if (!live) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Amber.copy(alpha = 0.18f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    "NOT LIVE — P&L frozen at last update",
+                    color = Amber,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
         }
 
         // key = ticket: Compose DIFFS the rows instead of recreating them on every frame --

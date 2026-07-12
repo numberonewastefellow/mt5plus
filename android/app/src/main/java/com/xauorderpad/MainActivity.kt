@@ -83,6 +83,7 @@ class MainActivity : ComponentActivity() {
                 val toast by vm.toast.collectAsStateWithLifecycle()
                 val profiles by vm.profiles.collectAsStateWithLifecycle()
                 val confirmCloses by vm.confirmCloses.collectAsStateWithLifecycle()
+                val live by vm.live.collectAsStateWithLifecycle()
 
                 val snackbar = remember { SnackbarHostState() }
 
@@ -190,6 +191,7 @@ class MainActivity : ComponentActivity() {
                             onToggleConfirm = callbacks.onToggleConfirm,
                             confirmCloses = confirmCloses,
                             serverUrl = vm.baseUrl,
+                            live = live,
                             modifier = inset,
                         )
                     }

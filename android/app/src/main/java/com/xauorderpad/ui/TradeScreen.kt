@@ -2,6 +2,7 @@ package com.xauorderpad.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -31,6 +32,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
@@ -71,6 +73,8 @@ fun TradeScreen(
     onToggleConfirm: (Boolean) -> Unit,
     confirmCloses: Boolean,
     serverUrl: String,
+    /** Socket is Up. False => everything on this screen is a frozen last-known frame. */
+    live: Boolean,
     modifier: Modifier = Modifier,
     closing: Boolean = false,
 ) {
@@ -95,10 +99,13 @@ fun TradeScreen(
         StatusBanner(health, link, onLogin)
         Spacer(Modifier.height(8.dp))
 
-        QuoteBlock(quote)
+        QuoteBlock(quote, live)
         Spacer(Modifier.height(10.dp))
 
-        OrderFormBlock(form, canTrade = health.healthy && !busy, digits = positions.digits,
+        // `live` gates ENTRY only. `health.healthy` alone is not enough: it is derived from the
+        // last snapshot, which survives the socket's death -- so it still reports "healthy" from
+        // a frame that may be minutes old, and BUY/SELL would stay armed against a frozen price.
+        OrderFormBlock(form, canTrade = health.healthy && !busy && live, digits = positions.digits,
             onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp,
             onBuy = onBuy, onSell = onSell)
         Spacer(Modifier.height(10.dp))
@@ -118,6 +125,12 @@ fun TradeScreen(
         // With CONFIRM off, the tap goes straight to the server -- that is the whole point of the
         // switch (flattening fast in a spike). The switch itself is the deliberate act; making
         // the user re-confirm after they explicitly turned confirmation off would be absurd.
+        //
+        // NOT gated on `live`, deliberately -- unlike BUY/SELL. A dead socket does not mean a dead
+        // server: the WebSocket can drop while HTTP still works, and this is the panic path. The
+        // server re-evaluates the filter against live broker prices, and if the network really is
+        // down the call fails loudly with a toast. Refusing to even ask, at the moment gold is
+        // gapping against you, is the worse failure.
         BulkCloseBar(enabled = !closing) { filter ->
             if (confirmCloses) confirm = filter else onCloseWhere(filter)
         }
@@ -130,6 +143,7 @@ fun TradeScreen(
             state = positions,
             onClose = onClosePosition,
             connected = health.connected,
+            live = live,
             // weight(1f), not fillMaxSize(): as the last child of a Column, fillMaxSize is a
             // fragile idiom that can fight the siblings for space.
             modifier = Modifier.weight(1f),
@@ -275,31 +289,60 @@ private fun StatusBanner(h: Health, link: Link, onLogin: () -> Unit) {
     }
 }
 
+/**
+ * The quote.
+ *
+ * When the feed is not live these numbers are FROZEN -- the last frame before the socket died --
+ * but nothing about a price on a dark screen says so. The status banner alone is not enough: the
+ * eye is on the digits, not the banner. So the cells dim and a STALE stamp sits across them. A
+ * frozen price that still looks live is the actual hazard here, not the disconnection itself.
+ */
 @Composable
-private fun QuoteBlock(q: Quote) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        QuoteCell("BID", Fmt.price(q.bid, q.digits), Red, Modifier.weight(1f))
-
-        Card(
-            Modifier.width(88.dp),
-            colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceVariant),
+private fun QuoteBlock(q: Quote, live: Boolean) {
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().alpha(if (live) 1f else 0.35f),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Column(
-                Modifier.fillMaxWidth().padding(vertical = 10.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
+            QuoteCell("BID", Fmt.price(q.bid, q.digits), Red, Modifier.weight(1f))
+
+            Card(
+                Modifier.width(88.dp),
+                colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceVariant),
             ) {
-                Text("SPREAD", fontSize = 9.sp, fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                // spreadPoints, NOT the raw `spread` field: the server sends a PRICE
-                // difference. Rendering it raw prints "0.22" where a trader expects "22".
+                Column(
+                    Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("SPREAD", fontSize = 9.sp, fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // spreadPoints, NOT the raw `spread` field: the server sends a PRICE
+                    // difference. Rendering it raw prints "0.22" where a trader expects "22".
+                    Text(
+                        Fmt.points(q.spreadPoints),
+                        fontFamily = FontFamily.Monospace, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+
+            QuoteCell("ASK", Fmt.price(q.ask, q.digits), Green, Modifier.weight(1f))
+        }
+
+        if (!live) {
+            Box(
+                Modifier
+                    .align(Alignment.Center)
+                    .background(Amber, RoundedCornerShape(4.dp))
+                    .padding(horizontal = 10.dp, vertical = 3.dp),
+            ) {
                 Text(
-                    Fmt.points(q.spreadPoints),
-                    fontFamily = FontFamily.Monospace, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                    "STALE",
+                    color = Color.Black,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
                 )
             }
         }
-
-        QuoteCell("ASK", Fmt.price(q.ask, q.digits), Green, Modifier.weight(1f))
     }
 }
 
