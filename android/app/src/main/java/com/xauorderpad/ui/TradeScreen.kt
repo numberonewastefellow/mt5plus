@@ -12,16 +12,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -46,10 +43,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xauorderpad.net.Link
-import com.xauorderpad.net.StrategyStatus
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.buildJsonObject
 
 /**
  * The trading screen.
@@ -71,19 +64,20 @@ fun TradeScreen(
     onStepLot: (Int) -> Unit,
     onSl: (String) -> Unit,
     onTp: (String) -> Unit,
-    onBuy: () -> Unit,
-    onSell: () -> Unit,
+    onEnterArmed: () -> Unit,
+    onCloseArmed: () -> Unit,
+    onArmedSide: (String) -> Unit,
+    armed: ArmedUi,
     onCloseWhere: (String) -> Unit,
     onClosePosition: (Long) -> Unit,
     onLogin: () -> Unit,
-    onDisconnect: () -> Unit,
+    onSettings: () -> Unit,
     onToggleConfirm: (Boolean) -> Unit,
     confirmCloses: Boolean,
     serverUrl: String,
     /** Socket is Up. False => everything on this screen is a frozen last-known frame. */
     live: Boolean,
     strategies: StrategiesUi,
-    onSetStrategy: (String, Boolean?, JsonObject) -> Unit,
     modifier: Modifier = Modifier,
     closing: Boolean = false,
 ) {
@@ -91,21 +85,14 @@ fun TradeScreen(
     // whole book. `confirm` holds the pending filter, or null.
     var confirm by remember { mutableStateOf<String?>(null) }
 
-    // Disconnecting is confirmed too. It is not destructive to the BOOK -- open positions stay
-    // open on the server, which the dialog says plainly, because a "logout" button on a trading
-    // screen absolutely reads like it might flatten you.
-    var confirmDisconnect by remember { mutableStateOf(false) }
-    var showStrategies by remember { mutableStateOf(false) }
-
     Column(modifier.fillMaxSize().padding(12.dp)) {
         ServerBar(
             serverUrl = serverUrl,
             confirmCloses = confirmCloses,
             onToggleConfirm = onToggleConfirm,
-            onDisconnect = { confirmDisconnect = true },
             strategyDot = strategies.items.any { it.enabled },
             strategyKilled = strategies.items.any { it.killed },
-            onStrategies = { showStrategies = true },
+            onSettings = onSettings,
         )
         Spacer(Modifier.height(6.dp))
 
@@ -115,12 +102,16 @@ fun TradeScreen(
         QuoteBlock(quote, live)
         Spacer(Modifier.height(10.dp))
 
+        ArmedTabs(armed.side, onArmedSide)
+        Spacer(Modifier.height(8.dp))
+
         // `live` gates ENTRY only. `health.healthy` alone is not enough: it is derived from the
         // last snapshot, which survives the socket's death -- so it still reports "healthy" from
         // a frame that may be minutes old, and BUY/SELL would stay armed against a frozen price.
         OrderFormBlock(form, canTrade = health.healthy && !busy && live, digits = positions.digits,
+            armed = armed, quote = quote, busy = busy,
             onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp,
-            onBuy = onBuy, onSell = onSell)
+            onEnterArmed = onEnterArmed, onCloseArmed = onCloseArmed)
         Spacer(Modifier.height(10.dp))
 
         // Gated ONLY on a bulk close already being in flight.
@@ -187,366 +178,30 @@ fun TradeScreen(
             dismissButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } },
         )
     }
-
-    if (showStrategies) {
-        StrategiesDialog(
-            strategies = strategies,
-            quote = quote,
-            live = live,
-            onSet = onSetStrategy,
-            onDismiss = { showStrategies = false },
-        )
-    }
-
-    if (confirmDisconnect) {
-        AlertDialog(
-            onDismissRequest = { confirmDisconnect = false },
-            title = { Text("Disconnect from this server?") },
-            text = {
-                Text(
-                    "You will go back to the Connect screen and the API token will be forgotten. " +
-                        "The server address stays filled in.\n\n" +
-                        "Any OPEN POSITIONS are NOT closed — they stay open on the server."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { confirmDisconnect = false; onDisconnect() }) {
-                    Text("DISCONNECT", fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDisconnect = false }) { Text("Cancel") }
-            },
-        )
-    }
 }
 
 /**
- * The server-side strategy engines.
+ * Shows WHICH server this app is talking to, and the way into everything else.
  *
- * The phone is a REMOTE CONTROL: it renders what the server says and asks it to
- * change. Every guard -- demo-only, hedging, target-vs-spread, the kill-switch --
- * lives on the server, where a stale phone or a forged request cannot get round it.
+ * The address is on screen because without it there is no way to tell a phone pointed at the
+ * right box from one pointed at a stale baked-in default.
  *
- * Three rules this UI does enforce, because they are about what the user is told:
+ * CONFIRM stays HERE rather than moving behind the gear: it is the switch you reach for in a
+ * spike, and burying a panic-path setting two taps deep would defeat it. Strategies and logout
+ * moved to Settings — neither is something you need mid-trade.
  *
- *  1. `live` gates arming. Arming a real trader from a screen whose prices are frozen
- *     is the exact scenario the stale-feed guard exists for.
- *  2. Turning PAPER off gets its OWN confirm, separate from enabling. It is the moment
- *     real orders begin -- a different decision, and folding the two into one dialog
- *     would let someone arm a live trader without ever being asked about it.
- *  3. `error` and `warning` come from real measurements on the server. Render them.
- */
-@Composable
-private fun StrategiesDialog(
-    strategies: StrategiesUi,
-    quote: Quote,
-    live: Boolean,
-    onSet: (String, Boolean?, JsonObject) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    var confirmArm by remember { mutableStateOf<StrategyStatus?>(null) }
-    var confirmPaperOff by remember { mutableStateOf<StrategyStatus?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Strategies") },
-        text = {
-            // Scrollable: two engines plus the ladder's side/trigger row overflow a phone
-            // dialog, and an AlertDialog CLIPS its body rather than scrolling it -- the PAPER
-            // switch would simply be unreachable on a short screen.
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Text(
-                    "These run on the SERVER, not on this phone — they keep running with the " +
-                        "app closed.",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                if (!live) {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "⚠ Feed is stale — controls disabled. You are looking at a frozen screen.",
-                        fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Amber,
-                    )
-                }
-                Spacer(Modifier.height(10.dp))
-
-                if (strategies.items.isEmpty()) {
-                    Text("No strategies reported by the server.",
-                         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                for (s in strategies.items) {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(s.name.ifBlank { s.id },
-                                 fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                            Text(s.state, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
-                                 color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Switch(
-                            checked = s.enabled,
-                            enabled = live,
-                            onCheckedChange = { want ->
-                                if (want) confirmArm = s else onSet(s.id, false, JsonObject(emptyMap()))
-                            },
-                        )
-                    }
-
-                    // Ladder only. `paper != null` is the marker: engines without a paper mode
-                    // do not have a trigger either.
-                    if (s.paper != null) {
-                        LadderControls(s, quote, live, onSet)
-
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                if (s.paper) "PAPER — logs only, places NO orders"
-                                else "LIVE — placing REAL orders",
-                                Modifier.weight(1f),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = if (s.paper) Amber else Red,
-                            )
-                            Switch(
-                                checked = s.paper,
-                                enabled = live,
-                                onCheckedChange = { wantPaper ->
-                                    if (!wantPaper) confirmPaperOff = s
-                                    else onSet(s.id, null, buildJsonObject {
-                                        put("paper", JsonPrimitive(true))
-                                    })
-                                },
-                            )
-                        }
-                    }
-
-                    // Server-computed, from real measurements. Never swallow these.
-                    s.warning?.let {
-                        Text("⚠ $it", fontSize = 10.sp, color = Amber)
-                    }
-                    s.error?.let {
-                        Text("⚠ $it", fontSize = 10.sp, color = Red)
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                    Spacer(Modifier.height(6.dp))
-                }
-                Text(
-                    "Full tuning is in the web panel. This is a remote control.",
-                    fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("CLOSE") } },
-    )
-
-    confirmArm?.let { s ->
-        val livePaper = s.paper == false
-
-        // The APPLIED trigger, not the one in the text field -- arming acts on what the server
-        // holds. If that level is already behind the market, this engine does not wait for
-        // anything: it enters on the next tick. Say so at the moment of arming, which is the
-        // last point at which it can still be stopped.
-        val t = s.params?.trigger?.takeIf { it > 0.0 }
-        val bid = quote.bid
-        val armsNow = t != null && bid != null &&
-            if ((s.params?.side ?: "sell") == "sell") bid < t else bid > t
-
-        AlertDialog(
-            onDismissRequest = { confirmArm = null },
-            title = { Text("Enable ${s.name.ifBlank { s.id }}?") },
-            text = {
-                Column {
-                    if (armsNow) {
-                        Text(
-                            "⚠ The trigger is ALREADY crossed — this will ENTER IMMEDIATELY, " +
-                                "not wait for a level.",
-                            fontWeight = FontWeight.Bold, color = Red,
-                        )
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    Text(
-                        if (livePaper)
-                            "PAPER MODE IS OFF — this will place REAL orders on the demo account " +
-                                "when it triggers."
-                        else if (s.paper == true)
-                            "Paper mode is ON — it will log what it would do and place NO orders."
-                        else
-                            "It will place REAL orders on the demo account when it signals."
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    onSet(s.id, true, JsonObject(emptyMap())); confirmArm = null
-                }) { Text("ENABLE", fontWeight = FontWeight.Bold,
-                          color = if (livePaper) Red else Green) }
-            },
-            dismissButton = { TextButton(onClick = { confirmArm = null }) { Text("Cancel") } },
-        )
-    }
-
-    confirmPaperOff?.let { s ->
-        AlertDialog(
-            onDismissRequest = { confirmPaperOff = null },
-            title = { Text("Turn PAPER MODE off?") },
-            text = {
-                Text(
-                    "It will place REAL orders on the demo account from the next trigger.\n\n" +
-                        "Measured on 37,500 real ticks: with no directional edge this loses about " +
-                        "one spread (0.24/oz) per trade, and the ladder multiplies that cost. Only " +
-                        "your trigger can beat it — and paper mode is how you find out whether it does."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    onSet(s.id, null, buildJsonObject { put("paper", JsonPrimitive(false)) })
-                    confirmPaperOff = null
-                }) { Text("GO LIVE", color = Red, fontWeight = FontWeight.Bold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmPaperOff = null }) { Text("Keep paper") }
-            },
-        )
-    }
-}
-
-/**
- * Side + trigger for the ladder — the "SELL if it goes below 4119" part.
- *
- * ── The warning is the reason this exists ──
- *
- * `LadderState.on_tick` arms on `mark < trigger` for a sell. So a sell trigger ABOVE the
- * current bid is ALREADY crossed: it does not wait, it fires on the very next tick. Typing
- * 4200 while the bid is 4119 means "enter now", and it looks like a perfectly ordinary
- * number -- which is exactly why a phone keyboard makes it dangerous.
- *
- * It is a WARNING, not a block. Entering immediately is sometimes precisely what is wanted.
- * But it must never be a surprise, and the trigger is never silently rewritten: a UI that
- * quietly "corrects" a price the user typed is worse than one that tells them what it will do.
- *
- * APPLY sends `enabled = null`, so setting a level can never ARM the engine as a side effect.
- * Arming stays one deliberate act: the switch.
- */
-@Composable
-private fun LadderControls(
-    s: StrategyStatus,
-    quote: Quote,
-    live: Boolean,
-    onSet: (String, Boolean?, JsonObject) -> Unit,
-) {
-    // Keyed on the SERVER's values: a 5 Hz snapshot carrying the same trigger keeps the same
-    // key, so it cannot wipe what is being typed. When the value genuinely changes -- an APPLY
-    // landed, or the web panel moved it -- the key changes and the field re-seeds to the truth.
-    var side by remember(s.params?.side) { mutableStateOf(s.params?.side ?: "sell") }
-    var trig by remember(s.params?.trigger) {
-        mutableStateOf(s.params?.trigger?.takeIf { it > 0.0 }?.let { Fmt.price(it, 2) } ?: "")
-    }
-
-    val typed = trig.trim().toDoubleOrNull()
-    val valid = typed != null && typed > 0.0
-    val bid = quote.bid
-
-    // The bid is the mark for BOTH sides -- the chart is the bid, and the engine compares
-    // against it. (XAUUSDm is a CFD: tick.last is 0.0 on every tick, there is no LTP.)
-    val crossed = valid && bid != null &&
-        if (side == "sell") bid < typed!! else bid > typed!!
-
-    // TWO rows, not one. Squeezing side + trigger + APPLY onto a single row left the field
-    // ~170dp wide, and it CLIPPED: "4118.50" rendered as "18.5" with the leading digits
-    // scrolled out of view. On a trading control that is not cosmetic -- the price you are
-    // about to arm is the one thing that must always be legible. The trigger gets the full
-    // dialog width; the side chips and APPLY share the row above it.
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        SideChip("SELL", side == "sell", Red, live) { side = "sell" }
-        Spacer(Modifier.width(6.dp))
-        SideChip("BUY", side == "buy", Green, live) { side = "buy" }
-
-        Spacer(Modifier.weight(1f))
-
-        // Disabled rather than toasting: a blank or zero trigger is not an error to report,
-        // it is simply nothing to send. The server would reject it anyway ("waiting: no
-        // trigger price set"), and a round-trip to be told so is noise.
-        TextButton(
-            onClick = {
-                onSet(s.id, null, buildJsonObject {
-                    put("side", JsonPrimitive(side))
-                    put("trigger", JsonPrimitive(typed))
-                })
-            },
-            enabled = live && valid,
-        ) { Text("APPLY", fontWeight = FontWeight.Bold) }
-    }
-
-    OutlinedTextField(
-        value = trig,
-        onValueChange = { trig = it },
-        enabled = live,
-        singleLine = true,
-        label = { Text("trigger price", fontSize = 10.sp) },
-        textStyle = MaterialTheme.typography.titleMedium.copy(
-            fontFamily = FontFamily.Monospace),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-        isError = crossed,
-        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-    )
-
-    if (crossed) {
-        Text(
-            "⚠ Trigger is ALREADY crossed (bid ${Fmt.price(bid, quote.digits ?: 2)}) — " +
-                "arming will enter IMMEDIATELY, not wait.",
-            fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Red,
-            modifier = Modifier.padding(bottom = 6.dp),
-        )
-    }
-
-    s.spread?.let {
-        Text("spread ${Fmt.price(it, 2)}/oz — every trade pays this",
-             fontSize = 10.sp, fontFamily = FontFamily.Monospace,
-             color = MaterialTheme.colorScheme.onSurfaceVariant,
-             modifier = Modifier.padding(bottom = 6.dp))
-    }
-}
-
-@Composable
-private fun SideChip(
-    label: String,
-    selected: Boolean,
-    tint: Color,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    OutlinedButton(
-        onClick = onClick,
-        enabled = enabled,
-        shape = RoundedCornerShape(6.dp),
-        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-        colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = if (selected) tint.copy(alpha = 0.22f) else Color.Transparent,
-            contentColor = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant,
-        ),
-        modifier = Modifier.height(36.dp),
-    ) {
-        Text(label, fontSize = 11.sp,
-             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
-    }
-}
-
-/**
- * Shows WHICH server this app is talking to, and the way out.
- *
- * Both halves are the point: without the address on screen there is no way to tell a phone
- * pointed at the right box from one pointed at a stale baked-in default, and without a logout
- * there is no way to change it.
+ * The dot on the gear is the one thing that must survive the move: a strategy running on the
+ * SERVER is invisible from the phone unless we say so, and after this refactor it lives two
+ * screens away. Green = something is armed and may be trading while you are not looking.
  */
 @Composable
 private fun ServerBar(
     serverUrl: String,
     confirmCloses: Boolean,
     onToggleConfirm: (Boolean) -> Unit,
-    onDisconnect: () -> Unit,
     strategyDot: Boolean,
     strategyKilled: Boolean,
-    onStrategies: () -> Unit,
+    onSettings: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth(),
@@ -564,17 +219,6 @@ private fun ServerBar(
             modifier = Modifier.weight(1f),
         )
 
-        // A strategy running on the SERVER is invisible from the phone unless we say
-        // so. Green = something is armed and may be trading without you watching.
-        TextButton(onClick = onStrategies) {
-            Text("STRAT", fontSize = 11.sp)
-            if (strategyDot || strategyKilled) {
-                Spacer(Modifier.width(4.dp))
-                Text("●", fontSize = 11.sp,
-                     color = if (strategyKilled) Red else Green)
-            }
-        }
-
         // Turning this OFF makes CLOSE ALL / CLOSE LOSING / CLOSE PROFIT fire on a single tap.
         // Coloured red when off, because "one tap flattens the book" is a state worth seeing.
         Text(
@@ -589,7 +233,13 @@ private fun ServerBar(
             modifier = Modifier.scale(0.7f),
         )
 
-        TextButton(onClick = onDisconnect) { Text("LOGOUT", fontSize = 11.sp) }
+        TextButton(onClick = onSettings) {
+            Text("⚙", fontSize = 18.sp)
+            if (strategyDot || strategyKilled) {
+                Spacer(Modifier.width(3.dp))
+                Text("●", fontSize = 11.sp, color = if (strategyKilled) Red else Green)
+            }
+        }
     }
 }
 
@@ -732,12 +382,15 @@ private fun OrderFormBlock(
     form: OrderForm,
     canTrade: Boolean,
     digits: Int,
+    armed: ArmedUi,
+    quote: Quote,
+    busy: Boolean,
     onLot: (String) -> Unit,
     onStepLot: (Int) -> Unit,
     onSl: (String) -> Unit,
     onTp: (String) -> Unit,
-    onBuy: () -> Unit,
-    onSell: () -> Unit,
+    onEnterArmed: () -> Unit,
+    onCloseArmed: () -> Unit,
 ) {
     Column {
         Row(
@@ -802,21 +455,109 @@ private fun OrderFormBlock(
 
         Spacer(Modifier.height(8.dp))
 
+        // ── CLOSE is ALWAYS the left slot. ENTRY is ALWAYS the right slot. ──
+        //
+        // The web UI swaps them between modes ([CLOSE][BUY] vs [SELL][CLOSE]) because on a
+        // keyboard the mode cannot bite you: space and backspace are different physical keys
+        // whichever side is armed. On a PHONE you tap by POSITION. Swap the buttons and the spot
+        // that was CLOSE becomes SELL after a flip -- you meant to get out and you opened a short.
+        //
+        // So position carries the FUNCTION and never changes; colour and label carry the
+        // direction. This is the whole reason the armed mode is safe to have on a touchscreen.
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                onClick = onSell,
-                enabled = canTrade,
-                colors = ButtonDefaults.buttonColors(containerColor = Red),
+
+            val hasTarget = armed.targetTicket != null
+
+            // NOT gated on `canTrade`/`live`, deliberately -- like the bulk-close bar below. A
+            // dead socket is not a dead server, and this is the way OUT. The only thing that
+            // disables it is having nothing on this side to close.
+            OutlinedButton(
+                onClick = onCloseArmed,
+                enabled = hasTarget && !busy,
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = if (hasTarget) MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                ),
                 modifier = Modifier.weight(1f).height(56.dp),
-            ) { Text("SELL", fontWeight = FontWeight.Bold, fontSize = 17.sp) }
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("CLOSE", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    // WHICH position is about to go. "Close one" without saying which one is an
+                    // invitation to close the wrong rung of a pyramid.
+                    Text(
+                        if (hasTarget)
+                            "${Fmt.price(armed.targetEntry, armed.digits)}  (${armed.count})"
+                        else if (armed.isBuy) "no long" else "no short",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
 
             Button(
-                onClick = onBuy,
+                onClick = onEnterArmed,
                 enabled = canTrade,
-                colors = ButtonDefaults.buttonColors(containerColor = Green),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (armed.isBuy) Green else Red),
                 modifier = Modifier.weight(1f).height(56.dp),
-            ) { Text("BUY", fontWeight = FontWeight.Bold, fontSize = 17.sp) }
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(if (armed.isBuy) "BUY" else "SELL",
+                         fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                    // The price it will actually fill at: BUY lifts the ASK, SELL hits the BID.
+                    Text(
+                        Fmt.price(if (armed.isBuy) quote.ask else quote.bid, armed.digits),
+                        fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
         }
+    }
+}
+
+/**
+ * BUY ARMED / SELL ARMED.
+ *
+ * This is a MODE, and a mode that changes what a big button does is exactly how people end up in
+ * the wrong trade. Two things keep it honest, and both are deliberate:
+ *
+ *  - It is LOUD. Full width, filled with the side's colour. You never have to tap to find out
+ *    which way you are armed -- which matters because the setting PERSISTS across launches.
+ *  - The buttons below it NEVER MOVE. Only their colour and label change. See OrderFormBlock.
+ */
+@Composable
+private fun ArmedTabs(side: String, onPick: (String) -> Unit) {
+    val isBuy = side != "sell"
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        ArmedTab("BUY ARMED", selected = isBuy, tint = Green,
+                 modifier = Modifier.weight(1f)) { onPick("buy") }
+        ArmedTab("SELL ARMED", selected = !isBuy, tint = Red,
+                 modifier = Modifier.weight(1f)) { onPick("sell") }
+    }
+}
+
+@Composable
+private fun ArmedTab(
+    label: String,
+    selected: Boolean,
+    tint: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    Button(
+        onClick = onClick,
+        shape = RoundedCornerShape(6.dp),
+        contentPadding = PaddingValues(vertical = 6.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (selected) tint else MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = if (selected) Color.Black
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+        ),
+        modifier = modifier.height(38.dp),
+    ) {
+        Text(label, fontSize = 12.sp,
+             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
     }
 }
 

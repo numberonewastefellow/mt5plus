@@ -31,6 +31,9 @@ import com.xauorderpad.svc.FeedService
 import com.xauorderpad.ui.ConnectScreen
 import com.xauorderpad.ui.LoginScreen
 import com.xauorderpad.ui.Screen
+import com.xauorderpad.ui.SettingsScreen
+import com.xauorderpad.ui.StrategiesScreen
+import com.xauorderpad.ui.StrategyScreen
 import com.xauorderpad.ui.TradeScreen
 import com.xauorderpad.ui.TradingViewModel
 import kotlinx.serialization.json.JsonObject
@@ -86,6 +89,8 @@ class MainActivity : ComponentActivity() {
                 val confirmCloses by vm.confirmCloses.collectAsStateWithLifecycle()
                 val live by vm.live.collectAsStateWithLifecycle()
                 val strategies by vm.strategies.collectAsStateWithLifecycle()
+                val strategy by vm.strategy.collectAsStateWithLifecycle()
+                val armed by vm.armed.collectAsStateWithLifecycle()
 
                 val snackbar = remember { SnackbarHostState() }
 
@@ -137,8 +142,9 @@ class MainActivity : ComponentActivity() {
                         val onStepLot: (Int) -> Unit = { vm.stepLot(it) }
                         val onSl: (String) -> Unit = { vm.setSl(it) }
                         val onTp: (String) -> Unit = { vm.setTp(it) }
-                        val onBuy: () -> Unit = { vm.placeOrder("buy") }
-                        val onSell: () -> Unit = { vm.placeOrder("sell") }
+                        val onEnterArmed: () -> Unit = { vm.placeArmed() }
+                        val onCloseArmed: () -> Unit = { vm.closeArmed() }
+                        val onArmedSide: (String) -> Unit = { vm.setArmedSide(it) }
                         val onCloseWhere: (String) -> Unit = { vm.closeWhere(it) }
                         val onClosePosition: (Long) -> Unit = { vm.closeOne(it) }
                         val onLogin: () -> Unit = { vm.goto(Screen.LOGIN) }
@@ -147,6 +153,11 @@ class MainActivity : ComponentActivity() {
                         val onSaveConnection: (String, String) -> Unit = { u, t -> vm.saveConnection(u, t) }
                         val onDisconnect: () -> Unit = { vm.disconnect() }
                         val onToggleConfirm: (Boolean) -> Unit = { vm.setConfirmCloses(it) }
+                        val onSettings: () -> Unit = { vm.goto(Screen.SETTINGS) }
+                        val onStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
+                        val onBackToSettings: () -> Unit = { vm.goto(Screen.SETTINGS) }
+                        val onBackToStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
+                        val onOpenStrategy: (String) -> Unit = { vm.openStrategy(it) }
                         val onSetStrategy: (String, Boolean?, JsonObject) -> Unit =
                             { id, en, params -> vm.setStrategy(id, en, params) }
                     }
@@ -186,18 +197,46 @@ class MainActivity : ComponentActivity() {
                             onStepLot = callbacks.onStepLot,
                             onSl = callbacks.onSl,
                             onTp = callbacks.onTp,
-                            onBuy = callbacks.onBuy,
-                            onSell = callbacks.onSell,
+                            onEnterArmed = callbacks.onEnterArmed,
+                            onCloseArmed = callbacks.onCloseArmed,
+                            onArmedSide = callbacks.onArmedSide,
+                            armed = armed,
                             onCloseWhere = callbacks.onCloseWhere,
                             onClosePosition = callbacks.onClosePosition,
                             onLogin = callbacks.onLogin,
-                            onDisconnect = callbacks.onDisconnect,
+                            onSettings = callbacks.onSettings,
                             onToggleConfirm = callbacks.onToggleConfirm,
                             confirmCloses = confirmCloses,
                             serverUrl = vm.baseUrl,
                             live = live,
                             strategies = strategies,
-                            onSetStrategy = callbacks.onSetStrategy,
+                            modifier = inset,
+                        )
+
+                        Screen.SETTINGS -> SettingsScreen(
+                            serverUrl = vm.baseUrl,
+                            strategies = strategies,
+                            live = live,
+                            onStrategies = callbacks.onStrategies,
+                            onDisconnect = callbacks.onDisconnect,
+                            onBack = callbacks.onBackToTrade,
+                            modifier = inset,
+                        )
+
+                        Screen.STRATEGIES -> StrategiesScreen(
+                            strategies = strategies,
+                            live = live,
+                            onOpen = callbacks.onOpenStrategy,
+                            onBack = callbacks.onBackToSettings,
+                            modifier = inset,
+                        )
+
+                        Screen.STRATEGY -> StrategyScreen(
+                            s = strategy,
+                            quote = quote,
+                            live = live,
+                            onSet = callbacks.onSetStrategy,
+                            onBack = callbacks.onBackToStrategies,
                             modifier = inset,
                         )
                     }

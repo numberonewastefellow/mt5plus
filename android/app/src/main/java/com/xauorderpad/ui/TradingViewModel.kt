@@ -37,7 +37,15 @@ import kotlin.math.round
  */
 private const val STALE_AFTER_MS = 10_000L
 
-enum class Screen { CONNECT, LOGIN, TRADE }
+/**
+ * SETTINGS -> STRATEGIES -> STRATEGY is a real navigation stack, not a stack of dialogs.
+ *
+ * The dialog it replaces put both engines' enable switches AND the ladder's PAPER switch in
+ * one scrolling column. Nothing said which switch owned which engine, so the control that
+ * decides whether REAL orders go out sat next to an unrelated engine's toggle. On this screen
+ * an engine can only be armed from its own page, where there is exactly one thing to arm.
+ */
+enum class Screen { CONNECT, LOGIN, TRADE, SETTINGS, STRATEGIES, STRATEGY }
 
 /** One-shot message for the snackbar. `id` makes repeats of the same text fire again. */
 data class Toast(val text: String, val isError: Boolean, val id: Long)
@@ -218,8 +226,90 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         _confirmCloses.value = v
     }
 
+    // ---- armed side ------------------------------------------------------
+
+    private val _armedSide = MutableStateFlow(Feed.secrets.armedSide)
+
+    /**
+     * The armed side, plus the ticket CLOSE would actually close.
+     *
+     * On a hedging account the opposite side does NOT close a position -- it opens a new one --
+     * so the exit has to name a ticket. We pick the NEWEST on the armed side (LIFO): the natural
+     * unwind of a pyramid. `time` is broker seconds and can tie when several fills land in the
+     * same second, so ticket breaks the tie -- MT5 tickets increase with time, which makes the
+     * choice deterministic instead of dependent on list order.
+     */
+    val armed: StateFlow<ArmedUi> = combine(feed, _armedSide) { snap, side ->
+        val want = if (side == "sell") "SELL" else "BUY"
+        val mine = snap?.openPositions.orEmpty().filter { it.side == want }
+        val newest = mine.maxWithOrNull(
+            compareBy<com.xauorderpad.net.Position> { it.time ?: 0L }.thenBy { it.ticket }
+        )
+        ArmedUi(
+            side = side,
+            targetTicket = newest?.ticket,
+            targetEntry = newest?.priceOpen,
+            count = mine.size,
+            digits = snap?.digits ?: 2,
+        )
+    }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, ArmedUi(side = Feed.secrets.armedSide))
+
+    fun setArmedSide(side: String) {
+        val s = if (side == "sell") "sell" else "buy"
+        secrets.armedSide = s
+        _armedSide.value = s
+    }
+
+    /** ENTRY: trade the armed side. The button never has to know which way it points. */
+    fun placeArmed() = placeOrder(_armedSide.value)
+
+    /**
+     * EXIT: close the newest position on the armed side.
+     *
+     * Deliberately NOT gated on `live`, unlike entry -- same reasoning as the bulk-close bar. A
+     * dead socket is not a dead server (the WebSocket can drop while HTTP still works), and this
+     * is the way OUT. Refusing to even ask, while a position runs against you, is the worse
+     * failure.
+     *
+     * The ticket comes from the last snapshot, which may be stale -- but a stale ticket can only
+     * be a ticket that no longer exists, and the server rejects that loudly. It can never close
+     * the WRONG position, because tickets are unique and never reused.
+     */
+    fun closeArmed() {
+        val t = armed.value.targetTicket
+        if (t == null) {
+            say("No ${_armedSide.value.uppercase()} position to close", error = true)
+            return
+        }
+        closeOne(t)
+    }
+
     val baseUrl: String get() = secrets.baseUrl
     val token: String get() = secrets.token
+
+    // ---- strategy navigation ---------------------------------------------
+
+    private val _openId = MutableStateFlow<String?>(null)
+
+    /**
+     * The engine whose page is open, re-read from the LIVE feed every frame rather than
+     * captured when the row was tapped. A snapshot taken at tap time would freeze: the page
+     * would keep showing "disabled" while the engine armed, or -- far worse -- keep showing
+     * "armed" after the server had killed it. The page must always show the engine as it IS.
+     */
+    val strategy: StateFlow<com.xauorderpad.net.StrategyStatus?> =
+        combine(strategies, _openId) { list, id ->
+            if (id == null) null else list.items.firstOrNull { it.id == id }
+        }
+            .distinctUntilChanged()
+            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    fun openStrategy(id: String) {
+        _openId.value = id
+        _screen.value = Screen.STRATEGY
+    }
 
     // ---- connect ---------------------------------------------------------
 
@@ -472,7 +562,15 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
                 is ApiResult.Failed -> {
                     // Surface the BROKER's own words ("Market closed", "Not enough money") rather
                     // than a bare "order failed" that leaves the user guessing.
-                    val extra = r.comment?.takeIf { it.isNotBlank() }?.let { " — $it" }.orEmpty()
+                    //
+                    // The comment is appended only when it ADDS something: MT5 often sets it to
+                    // the same string as the message, which rendered as "Market closed — Market
+                    // closed". A toast that stutters reads like a bug in the app, and that is the
+                    // last thing you want to be wondering about while an order is not going in.
+                    val extra = r.comment
+                        ?.takeIf { it.isNotBlank() && !it.equals(r.message, ignoreCase = true) }
+                        ?.let { " — $it" }
+                        .orEmpty()
                     say("${r.message}$extra", error = true)
                 }
             }

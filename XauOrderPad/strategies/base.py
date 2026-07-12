@@ -53,9 +53,42 @@ class StrategyBase:
 
     # ---- control (worker thread, via a queued command) --------------------
     def update(self, params: dict | None, enabled: bool | None) -> dict:
+        """Every control change is logged, not just the enable toggle.
+
+        This used to log ONLY when `enabled` moved. So flipping `paper` to False --
+        the single change in this whole system that turns a simulator into something
+        that spends real money -- left NO record at all. When an engine was later
+        found armed and live, there was nothing to say who did it, from where, or
+        when: the most dangerous parameter was the one with no audit trail.
+
+        Now a diff of the params is logged on every change, and paper->live gets its
+        own WARNING, because "this engine may now place real orders" is not an INFO.
+        """
         with self._lock:
+            before = self._params()
             if params:
                 self._apply(params)
+            after = self._params()
+
+            changed = {k: [before.get(k), v] for k, v in after.items()
+                       if before.get(k) != v}
+            if changed:
+                log.info("strategy %s params changed: %s", self.ID,
+                         ", ".join(f"{k} {a!r}->{b!r}" for k, (a, b) in changed.items()),
+                         extra={"event": "strategy_params_changed",
+                                "strategy": self.ID, "changed": changed})
+
+            # Loud, and on its own. Paper mode is the safety; taking it off is the
+            # moment this engine starts spending money.
+            # ASCII only. The Windows console stream is cp1252, so an em-dash here comes out as
+            # a replacement char -- a mangled line in the one log you would actually be reading
+            # after something went wrong.
+            if changed.get("paper") == [True, False]:
+                log.warning("strategy %s: PAPER MODE OFF -- it will place REAL orders",
+                            self.ID,
+                            extra={"event": "strategy_live_orders_enabled",
+                                   "strategy": self.ID, "params": after})
+
             if enabled is not None:
                 self.enabled = bool(enabled)
                 if self.enabled:
@@ -67,7 +100,8 @@ class StrategyBase:
                 log.info("strategy %s %s", self.ID,
                          "enabled" if self.enabled else "disabled",
                          extra={"event": "strategy_toggle", "strategy": self.ID,
-                                "enabled": self.enabled, "params": self._params()})
+                                "enabled": self.enabled, "paper": after.get("paper"),
+                                "params": after})
         state.save(self.ID, self.enabled, self._params())
         return self.status()
 

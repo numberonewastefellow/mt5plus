@@ -75,3 +75,32 @@ data class PositionsUi(
 data class StrategiesUi(
     val items: ImmutableList<com.xauorderpad.net.StrategyStatus>,
 )
+
+/**
+ * The ARMED SIDE, and what CLOSE would actually close.
+ *
+ * ── Why the target ticket is computed here and not in the button ──
+ *
+ * On a HEDGING account (this one: margin_mode=2) SELL does not close a BUY -- it opens a new
+ * short. So "exit" cannot be "press the other side"; it has to name a ticket. This slice picks
+ * that ticket: the NEWEST position on the armed side (LIFO), which is the natural way to unwind
+ * a pyramid you just scaled into.
+ *
+ * [targetEntry] is rendered ON the CLOSE button, so you can see WHICH position is about to go
+ * rather than trusting that "close one" meant the one you had in mind.
+ *
+ * [count] == 0 means there is nothing to close on this side, and the button is disabled -- it
+ * must never fall through to closing a position on the OTHER side.
+ */
+@Immutable
+data class ArmedUi(
+    /** "buy" | "sell" */
+    val side: String = "buy",
+    val targetTicket: Long? = null,
+    val targetEntry: Double? = null,
+    /** Open positions on the armed side. */
+    val count: Int = 0,
+    val digits: Int = 2,
+) {
+    val isBuy: Boolean get() = side != "sell"
+}

@@ -72,6 +72,23 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
             prefs.edit().putBoolean(KEY_CONFIRM_CLOSES, v).apply()
         }
 
+    // Which side the ENTRY button trades: "buy" or "sell". Persisted, like the web UI, so the
+    // trader is not re-arming it every launch.
+    //
+    // A persisted MODE that changes what a big button does is exactly the thing that gets people
+    // into the wrong trade -- so the tab bar that shows it is deliberately loud, and the buttons
+    // never move between modes. You should never have to TAP to discover which side you are on.
+    @Volatile private var cachedArmedSide: String =
+        prefs.getString(KEY_ARMED_SIDE, null)?.takeIf { it == "buy" || it == "sell" } ?: "buy"
+
+    var armedSide: String
+        get() = cachedArmedSide
+        set(v) {
+            val s = if (v == "sell") "sell" else "buy"   // never store anything else
+            cachedArmedSide = s
+            prefs.edit().putString(KEY_ARMED_SIDE, s).apply()
+        }
+
     /** e.g. "http://100.101.102.103:8765" -- the box's Tailscale address. */
     var baseUrl: String
         get() = cachedBaseUrl
@@ -127,6 +144,7 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
         private const val KEY_TOKEN = "token"
         private const val KEY_CONNECTED = "connected"
         private const val KEY_CONFIRM_CLOSES = "confirm_closes"
+        private const val KEY_ARMED_SIDE = "armed_side"
 
         /**
          * Construct off the main thread where possible. Plain SharedPreferences still does a
