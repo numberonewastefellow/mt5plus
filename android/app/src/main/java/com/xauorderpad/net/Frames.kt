@@ -251,9 +251,19 @@ data class LogoutResult(
     @SerialName("prev_open") val prevOpen: Int? = null,
 )
 
-/** DELETE /api/accounts/{id}. `false` means the id was not there -- the server returns 200. */
+/**
+ * DELETE /api/accounts/{id}. `deleted=false` means the id was not there -- the server still
+ * answers 200, so the status code alone would read as success.
+ *
+ * `active=true` means we just forgot the password for the account the terminal is CURRENTLY
+ * logged into. It keeps trading -- deleting a profile does not log you out -- but the session
+ * can no longer be restored if a later login fails. The UI must say so.
+ */
 @Serializable
-data class DeleteResult(val deleted: Boolean = false)
+data class DeleteResult(
+    val deleted: Boolean = false,
+    val active: Boolean = false,
+)
 
 @Serializable
 data class OrderResult(

@@ -9,6 +9,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -248,13 +249,28 @@ class Api(
         client = tradeHttp,
     ) { json.decodeFromString<LoginResult>(it) }
 
-    /** Forget a saved profile: drops the index record AND the vault password. */
-    suspend fun deleteAccount(profileId: String): ApiResult<DeleteResult> =
-        execute(
-            Request.Builder().url(baseUrl() + "/api/accounts/" + profileId).delete(),
+    /**
+     * Forget a saved profile: drops the index record AND the vault password.
+     *
+     * The id is URL-ENCODED, not interpolated. It is `<login>@<server>`, and the server name is
+     * free text the user typed. Raw, a `#` in it becomes a URL fragment and a `?` becomes a
+     * query string -- the DELETE then hits a truncated path, the server answers
+     * 200 {"deleted": false}, and that row can never be removed while its password sits
+     * orphaned in the Windows Credential Manager. A `/` misses the route entirely (404).
+     *
+     * addPathSegment() percent-encodes the segment, so the id arrives intact whatever is in it.
+     */
+    suspend fun deleteAccount(profileId: String): ApiResult<DeleteResult> {
+        val url = (baseUrl() + "/api/accounts").toHttpUrl()
+            .newBuilder()
+            .addPathSegment(profileId)
+            .build()
+        return execute(
+            Request.Builder().url(url).delete(),
             http,
             "/api/accounts/$profileId",
         ) { json.decodeFromString<DeleteResult>(it) }
+    }
 
     /**
      * Stop driving the terminal.

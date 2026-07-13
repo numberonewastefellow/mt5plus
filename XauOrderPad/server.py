@@ -26,7 +26,7 @@ from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import accounts
 import config
@@ -287,27 +287,63 @@ class StrategyReq(BaseModel):
     max_daily_loss: float | None = None
 
 
+# An MT5 login is a positive account number. The upper bound is deliberately generous (brokers
+# use 6-10 digits) but finite: pydantic would otherwise happily accept 10**30 and write it into
+# profiles.json, where it becomes a profile you can never log into and can only delete by hand.
+_LOGIN_MIN, _LOGIN_MAX = 1, 999_999_999_999
+
+
+def _validated_server(v: str | None) -> str | None:
+    """Broker server name: collapse whitespace, reject empty.
+
+    Validated on the SERVER and not only in the phone, because the phone is not the only client
+    -- the web panel and plain curl post here too. The server string is formatted straight into
+    the profile id, so " Exness-MT5Trial16" and "Exness-MT5Trial16" would become two profiles
+    for one account, each with its own vault entry, and the one you did not mean would fail to
+    log in for reasons nobody could see.
+    """
+    if v is None:
+        return None
+    s = " ".join(v.split())
+    if not s:
+        raise ValueError("server must not be blank")
+    return s
+
+
 class ProfileReq(BaseModel):
     """Save (or overwrite) a saved account profile. The password is stored in
     the OS credential vault by accounts.save_profile; it is never persisted to
     profiles.json and never logged."""
     label: str | None = None
-    login: int
-    password: str
+    login: int = Field(ge=_LOGIN_MIN, le=_LOGIN_MAX)
+    # min_length=1: an empty password would be stored in the vault and then fail every login
+    # with an opaque broker error. NOT stripped -- an MT5 password may legitimately contain
+    # spaces, and silently trimming a user's password is how you lock them out of their account.
+    password: str = Field(min_length=1)
     server: str
     path: str | None = None
+
+    @field_validator("server")
+    @classmethod
+    def _srv(cls, v: str) -> str:
+        return _validated_server(v)
 
 
 class LoginReq(BaseModel):
     """Log in / switch account. Either reference a saved `profile_id`, or pass
     ad-hoc `login`/`password`/`server` (optionally `save=True` to remember)."""
     profile_id: str | None = None
-    login: int | None = None
+    login: int | None = Field(default=None, ge=_LOGIN_MIN, le=_LOGIN_MAX)
     password: str | None = None
     server: str | None = None
     path: str | None = None
     save: bool = False
     label: str | None = None
+
+    @field_validator("server")
+    @classmethod
+    def _srv(cls, v: str | None) -> str | None:
+        return _validated_server(v)
 
 
 def _check_token(token: str | None) -> None:
@@ -407,6 +443,19 @@ async def strategy_control(req: StrategyReq, x_token: str | None = Header(defaul
     return await strategy_control_by_id("straddle", req, x_token)
 
 
+# ---- account session state ----------------------------------------------
+# Serialises account switching.
+#
+# /api/login awaits the worker, so two clients -- the desktop web UI and the phone -- can have
+# logins in flight at the same time. Without this they interleave: the "what account are we on"
+# snapshot one request takes can be invalidated by another request's login before the first one
+# acts on it, so a restore can put the terminal on an account nobody asked for.
+#
+# Account identity is the one piece of state where "last writer wins" is not good enough,
+# because every order the app sends afterwards is aimed at whatever it resolved to.
+_account_lock = asyncio.Lock()
+
+
 # ---- account profiles: list / save / delete -----------------------------
 @app.get("/api/accounts")
 def list_accounts(x_token: str | None = Header(default=None)):
@@ -426,55 +475,97 @@ def save_account(req: ProfileReq, x_token: str | None = Header(default=None)):
 
 @app.delete("/api/accounts/{profile_id}")
 def delete_account(profile_id: str, x_token: str | None = Header(default=None)):
+    """Forget a saved profile: the index record AND the vault password.
+
+    `active` in the response is the thing the caller must not ignore. Deleting the profile you
+    are LOGGED INTO does not log you out -- the terminal keeps trading it -- but it does destroy
+    the only copy of the password, so that session can no longer be restored if a later login
+    fails. The row vanishing from the list while the account is still live is exactly the sort
+    of quiet inconsistency that gets someone trading an account they think they removed.
+    """
     _check_token(x_token)
-    return {"deleted": accounts.delete_profile(profile_id)}
+    live = _live_account()
+    was_active = bool(live and f"{live['login']}@{live['server']}" == profile_id)
+    deleted = accounts.delete_profile(profile_id)
+    if deleted and was_active:
+        log.warning("forgot the profile the terminal is CURRENTLY logged into",
+                    extra={"event": "active_profile_deleted", "profile": profile_id})
+    return {"deleted": deleted, "active": was_active}
 
 
 # ---- account session: login / switch / logout ---------------------------
-# The last profile that actually logged in. Used to put the session BACK after a failed
-# login attempt -- see _restore_session(). Just an id; no secret is held here.
-_last_good_profile: str | None = None
+
+def _live_account() -> dict | None:
+    """The account the terminal is ACTUALLY on right now, or None if it is not connected.
+
+    ── Why this is read from the worker and not remembered in a variable ──
+
+    The first version of this kept a `_last_good_profile` global, updated by hand on each
+    successful login. It was wrong, and wrong in the direction that costs money.
+
+    The global was only written for profile logins and for saved ad-hoc logins. So: log into
+    saved account A, then log in ad-hoc to B with "Remember" OFF (B succeeds; the global still
+    says A), then fat-finger a password for C. The restore would read the stale global and put
+    the terminal on **A** -- an account the user had left, possibly a REAL one -- while the
+    error text claimed "the previous account (A) is still connected". It was not the previous
+    account. B was. Every order after that would have gone to the wrong account.
+
+    Any hand-maintained mirror of "which account are we on" is free to drift from the truth.
+    The worker already knows, and reports it on every poll (`account.login` / `account.server`),
+    so ask it. There is nothing to keep in sync and nothing to race.
+    """
+    st = worker.get_state()
+    if not st.get("connected"):
+        return None
+    acc = st.get("account") or {}
+    login_id, srv = acc.get("login"), acc.get("server")
+    if not login_id or not srv:
+        return None
+    return {"login": int(login_id), "server": str(srv)}
 
 
-async def _restore_session() -> str | None:
-    """Put the terminal back on the last profile that worked.
+async def _restore_session(prev: dict) -> str | None:
+    """Put the terminal back on the account it was on before a failed login attempt.
 
     ── Why this exists (measured, not theorised) ──
 
-    `mt5.login()` with a wrong password does not merely fail -- it TEARS DOWN the session
-    that was already running, and the worker does NOT recover on its own. Reproduced against
-    a live terminal: logged in, bid streaming; one login with a bad password; and then
+    `mt5.login()` with a wrong password does not merely fail -- it TEARS DOWN the session that
+    was already running, and the worker does NOT recover on its own. Reproduced against a live
+    terminal: logged in with the bid streaming; one login with a bad password; and then
     `connected: False, error: "terminal not connected (-6: Terminal: Authorization failed)"`
     for as long as you care to wait.
 
-    So a single fat-fingered password is enough to take the order pad off the market. If
-    positions are open, the strategy engines stop managing their exits -- they cannot see an
-    account. That is a very expensive way to punish a typo, and it became a great deal easier
-    to trigger once the phone got a password field.
+    So a single fat-fingered password takes the order pad off the market. With positions open,
+    the strategy engines stop managing their exits -- they cannot see an account. That is an
+    expensive way to punish a typo, and it got far easier to trigger once the phone grew a
+    password field.
 
-    Restoring the PREVIOUS account is also the honest semantics of a failed switch: the
-    account you asked for is not available, so you are still on the one you were on.
+    Restoring is also the honest semantics of a failed switch: the account you asked for is not
+    available, so you are still on the one you were on.
 
-    Returns the restored profile id, or None if there was nothing to restore or the restore
-    itself failed (in which case the caller still reports the original error -- we must never
-    let a recovery attempt mask the thing that actually went wrong).
+    Restoring needs the password, and we hold none -- so it works only if that account is SAVED.
+    An ad-hoc session with "Remember" off cannot be restored, and the caller says so plainly
+    rather than leaving the user to discover it.
+
+    Returns the restored profile id, or None. A failed restore must never mask the original
+    error, so the caller reports both.
     """
-    pid = _last_good_profile
-    if not pid:
-        return None
+    pid = f"{prev['login']}@{prev['server']}"
     prof = accounts.get_profile(pid)
     pw = accounts.get_password(pid) if prof else None
     if not prof or not pw:
+        log.error("cannot restore the previous session: it is not a saved account",
+                  extra={"event": "session_restore_impossible", "profile": pid})
         return None
     try:
         res = await _do({"action": "login", "login": prof["login"], "password": pw,
                          "server": prof["server"], "path": prof.get("path") or None})
     except Exception:
-        log.exception("session restore failed", extra={"event": "session_restore_failed",
-                                                       "profile": pid})
+        log.exception("session restore failed",
+                      extra={"event": "session_restore_failed", "profile": pid})
         return None
     if res.get("ok"):
-        log.warning("login failed; restored previous session",
+        log.warning("login failed; restored the previous session",
                     extra={"event": "session_restored", "profile": pid})
         return pid
     log.error("login failed AND the previous session could not be restored",
@@ -487,76 +578,86 @@ async def _restore_session() -> str | None:
 async def login(req: LoginReq, x_token: str | None = Header(default=None)):
     """Log in or switch the terminal's account.
 
-    Resolves a saved `profile_id` to credentials (password read from the OS
-    vault) or uses ad-hoc credentials. The password is handed to the worker and
-    is never logged here. Returns the worker result incl. `is_demo` and
-    `prev_open` (positions left open on the previous account).
+    Resolves a saved `profile_id` to credentials (password read from the OS vault) or uses
+    ad-hoc credentials. The password is handed to the worker and is never logged here. Returns
+    the worker result incl. `is_demo` and `prev_open` (positions left open on the previous
+    account).
 
-    A FAILED attempt puts the previous session back -- see _restore_session().
+    A FAILED attempt puts the previous session back where it can -- see _restore_session() --
+    and says so either way. The whole thing is under `_account_lock`: two clients switching
+    accounts at once must not interleave.
     """
-    global _last_good_profile
     _check_token(x_token)
-    login_id, password, server = req.login, req.password, req.server
-    path = req.path
 
-    if req.profile_id:
-        prof = accounts.get_profile(req.profile_id)
-        if not prof:
-            raise HTTPException(status_code=404,
-                                detail=f"profile {req.profile_id!r} not found")
-        login_id, server = prof["login"], prof["server"]
-        path = prof.get("path") or None
-        password = accounts.get_password(req.profile_id)
-        if not password:
-            raise HTTPException(
-                status_code=400,
-                detail="stored password missing for this profile — re-add it")
+    async with _account_lock:
+        login_id, password, server = req.login, req.password, req.server
+        path = req.path
 
-    if not (login_id and password and server):
-        raise HTTPException(status_code=400,
-                            detail="login, password and server are required")
+        if req.profile_id:
+            prof = accounts.get_profile(req.profile_id)
+            if not prof:
+                raise HTTPException(status_code=404,
+                                    detail=f"profile {req.profile_id!r} not found")
+            login_id, server = prof["login"], prof["server"]
+            path = prof.get("path") or None
+            password = accounts.get_password(req.profile_id)
+            if not password:
+                raise HTTPException(
+                    status_code=400,
+                    detail="stored password missing for this profile — re-add it")
 
-    res = await _do({"action": "login", "login": login_id,
-                     "password": password, "server": server, "path": path})
-    if not res.get("ok"):
-        err = res.get("error") or "login failed"
-        # The attempt just killed whatever session was running. Put it back before answering,
-        # and SAY SO in the same breath -- a user who is told "login failed" and nothing else
-        # has no reason to suspect they are now flat on the market.
-        restored = await _restore_session()
-        if restored:
-            err = f"{err} — the previous account ({restored}) is still connected"
-        elif _last_good_profile:
-            err = (f"{err} — WARNING: the terminal is now DISCONNECTED and could not be "
-                   f"restored. Log in again.")
-        raise HTTPException(status_code=400, detail=err)
+        if not (login_id and password and server):
+            raise HTTPException(status_code=400,
+                                detail="login, password and server are required")
 
-    # Persist on ad-hoc login if asked; best-effort (login already succeeded).
-    if req.save and not req.profile_id:
-        try:
-            saved = accounts.save_profile(req.label, login_id, password, server,
-                                          path or "", res.get("trade_mode"))
-            _last_good_profile = saved.get("id")
-        except RuntimeError:
-            log.warning("login ok but profile not saved (no keyring backend)")
-    elif req.profile_id:
-        _last_good_profile = req.profile_id
-        try:
-            accounts.update_trade_mode(req.profile_id, res.get("trade_mode"))
-        except Exception:
-            pass
-    return res
+        # Snapshot what we are on BEFORE the attempt. This is the fact the restore needs, and
+        # reading it here -- rather than trusting a remembered value -- is what keeps it true.
+        prev = _live_account()
+
+        res = await _do({"action": "login", "login": login_id,
+                         "password": password, "server": server, "path": path})
+
+        if not res.get("ok"):
+            err = res.get("error") or "login failed"
+            # The attempt just killed whatever session was running. Put it back if we can, and
+            # SAY SO either way -- a user told only "login failed" has no reason to suspect they
+            # are now off the market with positions open.
+            if prev:
+                restored = await _restore_session(prev)
+                if restored:
+                    err = f"{err} — you are still on {restored}"
+                else:
+                    err = (f"{err} — WARNING: the terminal is now DISCONNECTED "
+                           f"({prev['login']}@{prev['server']} was not a saved account, so it "
+                           f"could not be restored). Log in again.")
+            raise HTTPException(status_code=400, detail=err)
+
+        # Persist on ad-hoc login if asked; best-effort (the login already succeeded).
+        if req.save and not req.profile_id:
+            try:
+                accounts.save_profile(req.label, login_id, password, server,
+                                      path or "", res.get("trade_mode"))
+            except RuntimeError:
+                log.warning("login ok but profile not saved (no keyring backend)")
+        elif req.profile_id:
+            try:
+                accounts.update_trade_mode(req.profile_id, res.get("trade_mode"))
+            except Exception:
+                pass
+        return res
 
 
 @app.post("/api/logout")
 async def logout(x_token: str | None = Header(default=None)):
     _check_token(x_token)
-    global _last_good_profile
-    # Forget the restore target. Logging out is DELIBERATE: if the next login attempt fails,
-    # silently reconnecting the account the user just walked away from would be the opposite
-    # of what they asked for.
-    _last_good_profile = None
-    return JSONResponse(await _do({"action": "logout"}))
+    # Under the same lock as login: a logout racing a login could otherwise tear down the
+    # session the login just established, leaving the server believing it is connected.
+    #
+    # Nothing to forget afterwards -- the restore target is derived from the LIVE account
+    # (_live_account), and once we are logged out there is no live account, so a subsequent
+    # failed login has nothing to restore and correctly says so.
+    async with _account_lock:
+        return JSONResponse(await _do({"action": "logout"}))
 
 
 @app.post("/buy")

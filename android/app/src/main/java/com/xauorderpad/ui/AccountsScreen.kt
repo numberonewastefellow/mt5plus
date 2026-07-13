@@ -28,9 +28,12 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,6 +41,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xauorderpad.net.Profile
@@ -68,6 +72,8 @@ fun AccountsScreen(
     health: Health,
     busy: Boolean,
     error: String?,
+    /** Bumped on every successful account action. Clears the password -- and ONLY on success. */
+    okTick: Int,
     /** True when a typed password would cross the network unencrypted. */
     passwordInClear: Boolean,
     onLoginProfile: (String) -> Unit,
@@ -79,12 +85,31 @@ fun AccountsScreen(
 ) {
     BackHandler(onBack = onBack)
 
-    var label by remember { mutableStateOf("") }
-    var login by remember { mutableStateOf("") }
+    // rememberSaveable for everything EXCEPT the password. Rotating the phone, or -- the flow
+    // that will actually happen -- switching to a password manager to copy the broker password
+    // and coming back to a process Android killed, must not wipe the four fields you already
+    // typed.
+    //
+    // The password is a plain `remember`, deliberately. rememberSaveable writes into the saved
+    // instance state Bundle, which Android may persist to disk. A broker password does not go
+    // to disk on the phone. Losing it on a process death is the correct trade.
+    var label by rememberSaveable { mutableStateOf("") }
+    var login by rememberSaveable { mutableStateOf("") }
+    var server by rememberSaveable { mutableStateOf("") }
+    var path by rememberSaveable { mutableStateOf("") }
+    var save by rememberSaveable { mutableStateOf(true) }
     var password by remember { mutableStateOf("") }
-    var server by remember { mutableStateOf("") }
-    var path by remember { mutableStateOf("") }
-    var save by remember { mutableStateOf(true) }
+
+    // Cleared on SUCCESS only. Clearing it on send meant a one-character typo in the server name
+    // cost you the whole password as well.
+    LaunchedEffect(okTick) {
+        if (okTick > 0) {
+            password = ""
+            label = ""; login = ""; server = ""; path = ""
+        }
+    }
+
+    val v = validateAccountForm(login, password, server)
 
     var confirmDelete by remember { mutableStateOf<Profile?>(null) }
     var confirmLogout by remember { mutableStateOf(false) }
@@ -123,8 +148,15 @@ fun AccountsScreen(
             }
             for (p in profiles) {
                 val isReal = p.lastTradeMode == 2
-                val active = health.server != null && p.login?.toString() != null &&
-                    health.server == p.server && !health.loggedOut
+                // Match on LOGIN **and** SERVER, from the live feed.
+                //
+                // This used to compare the server alone -- and a demo and a real account on the
+                // same broker server is the normal Exness setup, so BOTH rows lit up as active.
+                // On the one screen whose job is to tell you which account you are about to
+                // trade, that is the single thing it must not get wrong.
+                val active = !health.loggedOut &&
+                    health.login != null && p.login != null &&
+                    health.login == p.login && health.server == p.server
                 SavedRow(
                     p = p,
                     isReal = isReal,
@@ -163,11 +195,22 @@ fun AccountsScreen(
             }
 
             AccField(label, { label = it }, "Label (optional)", "e.g. Exness Demo", enabled = !busy)
+
             AccField(login, { login = it }, "Login (account number)", "12345678",
-                     keyboard = KeyboardType.Number, enabled = !busy)
+                     keyboard = KeyboardType.Number, enabled = !busy, error = v.login)
+
+            // The password is NEVER trimmed -- an MT5 password may legitimately contain spaces,
+            // and silently "fixing" one locks you out of your own account. But a pasted password
+            // with a trailing space is rejected by MT5 with the SAME opaque -6 as a wrong
+            // password, so without this warning you would retype a password that was right all
+            // along.
             AccField(password, { password = it }, "Password", "",
-                     keyboard = KeyboardType.Password, isPassword = true, enabled = !busy)
-            AccField(server, { server = it }, "Server", "Exness-MT5Trial16", enabled = !busy)
+                     keyboard = KeyboardType.Password, isPassword = true, enabled = !busy,
+                     error = v.password, warn = v.passwordWarning)
+
+            AccField(server, { server = it }, "Server", "Exness-MT5Trial16",
+                     enabled = !busy, error = v.server)
+
             AccField(path, { path = it }, "Terminal path (optional)",
                      "blank = use the running terminal", enabled = !busy)
 
@@ -176,9 +219,17 @@ fun AccountsScreen(
                 Column(Modifier.weight(1f)) {
                     Text("Remember this account", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     Text(
-                        "The password is stored in the Windows Credential Manager ON THE SERVER, " +
-                            "not on this phone. After this, logging in never sends it again.",
-                        fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        if (save)
+                            "The password is stored in the Windows Credential Manager ON THE " +
+                                "SERVER, not on this phone. After this, logging in never sends " +
+                                "it again."
+                        else
+                            "OFF — nothing is stored. Note: if a LATER login fails, MT5 drops " +
+                                "the session, and an unsaved account cannot be restored — the " +
+                                "server holds no password for it.",
+                        fontSize = 10.sp,
+                        fontWeight = if (save) FontWeight.Normal else FontWeight.Bold,
+                        color = if (save) MaterialTheme.colorScheme.onSurfaceVariant else Amber,
                     )
                 }
                 Switch(checked = save, onCheckedChange = { save = it }, enabled = !busy)
@@ -190,11 +241,10 @@ fun AccountsScreen(
             // status card turns red immediately afterwards. The confirm guards the case we CAN
             // know in advance: switching to a saved profile already marked REAL.
             Button(
-                onClick = {
-                    onLoginWith(login, password, server, path, save, label)
-                    password = ""    // out of memory the moment it is sent
-                },
-                enabled = !busy && login.isNotBlank() && password.isNotBlank() && server.isNotBlank(),
+                // The password is NOT cleared here. It is cleared on the success tick, and only
+                // there -- see the LaunchedEffect above.
+                onClick = { onLoginWith(login, password, server, path, save, label) },
+                enabled = !busy && v.valid,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
             ) {
                 Text(if (busy) "WORKING…" else "LOG IN", fontWeight = FontWeight.Bold)
@@ -355,6 +405,54 @@ private fun SavedRow(
     }
 }
 
+/**
+ * What is wrong with the form, field by field.
+ *
+ * Per-field, not one shared banner: "login, password and server are required" tells you nothing
+ * about WHICH one, and the failure that actually happens -- a wrong Exness server suffix, or a
+ * pasted password with a trailing space -- both come back from MT5 as the same opaque
+ * `-6: Authorization failed`. Indistinguishable from a wrong password. So the app has to catch
+ * what it can before the request leaves.
+ */
+@Immutable
+data class AccountFormErrors(
+    val login: String? = null,
+    val password: String? = null,
+    val server: String? = null,
+    /** Not an error -- the form still submits. A likely paste artefact worth seeing. */
+    val passwordWarning: String? = null,
+) {
+    val valid: Boolean get() = login == null && password == null && server == null
+}
+
+fun validateAccountForm(login: String, password: String, server: String): AccountFormErrors {
+    val l = login.trim()
+    val loginErr = when {
+        l.isEmpty() -> "required"
+        // KeyboardType.Number is only a keyboard HINT -- paste and hardware keyboards put
+        // letters in here happily.
+        !l.all { it.isDigit() } -> "digits only"
+        l.length > 12 -> "too long for an MT5 login"
+        l.toLongOrNull()?.let { it <= 0L } != false -> "must be a positive account number"
+        else -> null
+    }
+
+    // NOT trimmed: an MT5 password may legitimately contain spaces.
+    val pwErr = if (password.isEmpty()) "required" else null
+    val pwWarn = if (password.isNotEmpty() && password != password.trim())
+        "starts or ends with a space — usually a paste artefact. MT5 rejects it with the same " +
+            "error as a wrong password."
+    else null
+
+    val s = server.trim()
+    val srvErr = when {
+        s.isEmpty() -> "required"
+        s.any { it.isWhitespace() } -> "an MT5 server name has no spaces"
+        else -> null
+    }
+    return AccountFormErrors(loginErr, pwErr, srvErr, pwWarn)
+}
+
 @Composable
 private fun AccField(
     value: String,
@@ -364,19 +462,37 @@ private fun AccField(
     enabled: Boolean,
     keyboard: KeyboardType = KeyboardType.Text,
     isPassword: Boolean = false,
+    error: String? = null,
+    warn: String? = null,
 ) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onChange,
-        enabled = enabled,
-        singleLine = true,
-        label = { Text(label, fontSize = 11.sp) },
-        placeholder = { Text(placeholder, fontSize = 12.sp) },
-        keyboardOptions = KeyboardOptions(keyboardType = keyboard),
-        visualTransformation =
-            if (isPassword) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
-        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-    )
+    // Only complain about a field the user has actually touched: a form that lights up red the
+    // instant you open it teaches you to ignore red.
+    val touched = value.isNotEmpty()
+    val show = if (touched) error else null
+
+    Column(Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onChange,
+            enabled = enabled,
+            singleLine = true,
+            isError = show != null,
+            label = { Text(label, fontSize = 11.sp) },
+            placeholder = { Text(placeholder, fontSize = 12.sp) },
+            keyboardOptions = KeyboardOptions(keyboardType = keyboard),
+            visualTransformation =
+                if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        show?.let {
+            Text("⚠ $it", fontSize = 10.sp, color = Red,
+                 modifier = Modifier.padding(start = 4.dp, top = 2.dp))
+        }
+        if (show == null) warn?.let {
+            Text("⚠ $it", fontSize = 10.sp, color = Amber,
+                 modifier = Modifier.padding(start = 4.dp, top = 2.dp))
+        }
+    }
 }
 
 @Composable

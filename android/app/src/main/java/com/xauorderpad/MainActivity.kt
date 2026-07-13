@@ -93,6 +93,7 @@ class MainActivity : ComponentActivity() {
                 val strategy by vm.strategy.collectAsStateWithLifecycle()
                 val armed by vm.armed.collectAsStateWithLifecycle()
                 val accountError by vm.accountError.collectAsStateWithLifecycle()
+                val accountOk by vm.accountOk.collectAsStateWithLifecycle()
 
                 val snackbar = remember { SnackbarHostState() }
 
@@ -242,7 +243,9 @@ class MainActivity : ComponentActivity() {
                             health = health,
                             busy = busy,
                             error = accountError,
-                            passwordInClear = vm.passwordInClear,
+                            okTick = accountOk,
+                            // A pure function of the URL, so Compose recomposes it properly.
+                            passwordInClear = TradingViewModel.passwordInClear(vm.baseUrl),
                             onLoginProfile = callbacks.onSwitchProfile,
                             onLoginWith = callbacks.onLoginWith,
                             onDelete = callbacks.onDeleteAccount,

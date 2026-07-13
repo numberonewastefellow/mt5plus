@@ -140,6 +140,7 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
                 connected = it?.connected == true,
                 loggedOut = it?.isLoggedOut == true,
                 isDemo = it?.account?.isDemo,
+                login = it?.account?.login,
                 server = it?.account?.server,
                 error = it?.error,
             )
@@ -359,7 +360,14 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
 
     fun goto(s: Screen) {
         _screen.value = s
-        if (s == Screen.LOGIN || s == Screen.ACCOUNTS) loadProfiles()
+        if (s == Screen.LOGIN || s == Screen.ACCOUNTS) {
+            // Drop any stale banner on the way IN. The banner is deliberately sticky WITHIN a
+            // visit -- that is the whole point of it -- but it must not survive leaving and
+            // coming back, or a week-old "TIMED OUT" sits in red above a status card that reads
+            // DEMO on a perfectly healthy session.
+            _accountError.value = null
+            loadProfiles()
+        }
     }
 
     // ---- MT5 session -----------------------------------------------------
@@ -375,6 +383,18 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
     val accountError: StateFlow<String?> = _accountError.asStateFlow()
 
     fun clearAccountError() { _accountError.value = null }
+
+    /**
+     * Bumped on every SUCCESSFUL account action. The Accounts screen watches it to clear the
+     * password field -- and only then.
+     *
+     * Clearing on send (what this used to do) meant that a typo in the SERVER name -- Exness has
+     * a dozen of them, -MT5Trial6, -MT5Trial7, -MT5Trial16 -- cost you the whole password too.
+     * Worse, a non-numeric login is rejected CLIENT-side without a request ever leaving the
+     * phone, and the password was wiped anyway.
+     */
+    private val _accountOk = MutableStateFlow(0)
+    val accountOk: StateFlow<Int> = _accountOk.asStateFlow()
 
     /** Public so the Accounts screen can refresh after add/switch/delete. */
     fun loadProfiles() = viewModelScope.launch {
@@ -413,8 +433,10 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         save: Boolean,
         label: String,
     ) = viewModelScope.launch {
+        // The form is validated before this is reachable (AccountFormErrors), so this is the
+        // belt to that braces: never send a request we know the server will reject.
         val id = login.trim().toLongOrNull()
-        if (id == null || password.isBlank() || server.isBlank()) {
+        if (id == null || password.isEmpty() || server.isBlank()) {
             _accountError.value = "login, password and server are required"
             return@launch
         }
@@ -422,6 +444,9 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         val e = Feed.epoch
         try {
             handleLogin(
+                // The password is NOT trimmed. An MT5 password may legitimately contain spaces,
+                // and silently trimming one is how you lock somebody out of their own account.
+                // The UI warns about stray whitespace instead; it does not "fix" it.
                 Feed.api.loginWith(id, password, server.trim(), path.trim(), save, label.trim()),
                 e,
                 goToTrade = true,
@@ -438,6 +463,7 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         when (r) {
             is ApiResult.Ok -> {
                 _accountError.value = null          // a success is the only thing that clears it
+                _accountOk.value += 1               // ...and the only thing that clears the password
                 val prev = r.value.prevOpen ?: 0
                 when {
                     // Switching account leaves the PREVIOUS account's positions OPEN. Staying
@@ -478,8 +504,20 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
             when (val r = Feed.api.deleteAccount(profileId)) {
                 is ApiResult.Ok -> {
                     if (r.value.deleted) {
-                        _accountError.value = null
-                        say("Account forgotten", error = false)
+                        if (r.value.active) {
+                            // Forgetting a profile does NOT log you out. The terminal keeps
+                            // trading it -- but the password is gone, so if a later login fails,
+                            // this session can no longer be restored. A row vanishing while the
+                            // account stays live is exactly the kind of quiet inconsistency that
+                            // gets someone trading an account they believe they removed.
+                            _accountError.value =
+                                "Forgotten — but you are STILL LOGGED IN to it. It keeps trading, " +
+                                    "and its session can no longer be restored if a login fails."
+                        } else {
+                            _accountError.value = null
+                            say("Account forgotten", error = false)
+                        }
+                        _accountOk.value += 1
                     } else {
                         // The server answers 200 {deleted:false} for an unknown id. Reporting that
                         // as success would leave a row on screen that the server says is gone.
@@ -532,19 +570,35 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
      * True when a typed password would cross the network in the CLEAR.
      *
      * The web UI types the broker password on loopback, where plaintext HTTP is harmless. The
-     * phone types it over the network -- and that is a different risk entirely for a REAL broker
-     * credential. Tailscale (100.64.0.0/10) is WireGuard, so it is encrypted; https is encrypted;
-     * a plain http:// LAN address is not.
+     * phone types it over the network -- a different risk entirely for a REAL broker credential.
+     * Tailscale (100.64.0.0/10) is WireGuard, so it is encrypted; https is encrypted; a plain
+     * http:// LAN address is not.
      *
-     * This drives a WARNING, not a block. It is the user's own network and their call.
+     * A WARNING, not a block. It is the user's own network and their call.
+     *
+     * A pure function of the URL, and the URL is passed to the screen as a parameter -- so
+     * Compose recomposes it like any other input. It used to be a `val get()` reading a plain
+     * field, which Compose has NO invalidation source for: the one control telling you not to
+     * type a real broker password over open Wi-Fi was being re-evaluated by luck.
      */
-    val passwordInClear: Boolean
-        get() {
-            val url = secrets.baseUrl.lowercase()
+    companion object {
+        fun passwordInClear(baseUrl: String): Boolean {
+            val url = baseUrl.trim().lowercase()
             if (url.startsWith("https://")) return false
-            val host = url.removePrefix("http://").substringBefore(':').substringBefore('/')
+
+            var host = url.removePrefix("http://").substringBefore('/')
+            // IPv6 literals are bracketed: http://[::1]:8765. Strip the brackets BEFORE the port
+            // split -- splitting on ':' first turns "[::1]" into "[", which is why the old
+            // `host == "::1"` check could never fire.
+            host = if (host.startsWith("[")) {
+                host.substringAfter('[').substringBefore(']')
+            } else {
+                host.substringBefore(':')
+            }
+
             if (host == "127.0.0.1" || host == "localhost" || host == "::1") return false
-            // Tailscale hands out 100.64.x.x - 100.127.x.x. Checking the second octet matters:
+
+            // Tailscale hands out 100.64.x.x - 100.127.x.x. The second octet matters:
             // 100.0.0.0/8 at large is ordinary public space, not the CGNAT range.
             val octets = host.split('.')
             if (octets.size == 4 && octets[0] == "100") {
@@ -553,6 +607,7 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
             }
             return true
         }
+    }
 
     // ---- strategies (server-side engines; this is a remote control) --------
 

@@ -37,6 +37,13 @@ data class Health(
     val loggedOut: Boolean = false,
     /** null = unknown. `false` means a REAL account -- must be shown loudly. */
     val isDemo: Boolean? = null,
+    /**
+     * The MT5 account NUMBER. Without it, "which account am I on?" is unanswerable: the server
+     * name alone does not identify an account, and a demo and a real account on the SAME broker
+     * server is the normal setup. The Accounts screen matches on login AND server; matching on
+     * server alone lit up BOTH rows as active.
+     */
+    val login: Long? = null,
     val server: String? = null,
     /** The server's own specific reason: "market closed", "AutoTrading is OFF", etc. */
     val error: String? = null,

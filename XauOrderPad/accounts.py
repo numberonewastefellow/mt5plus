@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 log = logging.getLogger("XauOrderPad.accounts")
@@ -45,9 +46,26 @@ def _keyring():
     return keyring
 
 
+def _clean_server(server: str) -> str:
+    """Normalise the broker server name.
+
+    It goes straight into the profile id, so " Exness-MT5Trial16" and "Exness-MT5Trial16" would
+    otherwise become TWO profiles for the same account, each with its own vault entry -- and the
+    one you did not mean would quietly fail to log in. Whitespace is never part of an MT5 server
+    name, so stripping it is safe and closes the duplicate.
+    """
+    return " ".join(str(server).split())
+
+
 def _profile_id(login: int, server: str) -> str:
     # login alone can collide across servers (demo vs real); qualify with server.
-    return f"{int(login)}@{server}"
+    return f"{int(login)}@{_clean_server(server)}"
+
+
+# Guards the read-modify-write of profiles.json. Both callers (save/delete) are SYNC FastAPI
+# handlers, so they run on the threadpool and two concurrent requests genuinely interleave --
+# add-then-add would drop a record.
+_index_lock = threading.Lock()
 
 
 def _load_index() -> list[dict]:
@@ -63,7 +81,18 @@ def _load_index() -> list[dict]:
 
 
 def _save_index(items: list[dict]) -> None:
-    _index_path().write_text(json.dumps(items, indent=2), "utf-8")
+    """Write atomically: temp file in the same directory, then os.replace().
+
+    A bare write_text() truncates before it writes. A crash or a hard reboot mid-write leaves a
+    half-written file -- and _load_index() SWALLOWS the parse error and returns []. So every
+    saved profile silently disappears while the passwords stay orphaned in the Credential
+    Manager. os.replace() is atomic on Windows and POSIX: readers see the old file or the new
+    one, never a torn one.
+    """
+    p = _index_path()
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items, indent=2), "utf-8")
+    os.replace(tmp, p)
 
 
 def _public(rec: dict) -> dict:
@@ -96,6 +125,7 @@ def save_profile(label, login, password, server, path="", last_trade_mode=None) 
     """Persist a profile. Stores the password in the OS vault FIRST; if that
     fails (no keyring backend) we raise and write nothing -- never plaintext."""
     login = int(login)
+    server = _clean_server(server)
     pid = _profile_id(login, server)
     if password:
         try:
@@ -104,33 +134,44 @@ def save_profile(label, login, password, server, path="", last_trade_mode=None) 
             raise RuntimeError(
                 "cannot store the password securely (no keyring backend "
                 f"available): {exc}") from exc
-    items = [it for it in _load_index() if it.get("id") != pid]
     rec = {"id": pid, "label": (label or str(login)), "login": login,
            "server": server, "path": path or "", "last_trade_mode": last_trade_mode}
-    items.append(rec)
-    _save_index(items)
+    # Load -> mutate -> store under ONE lock. Without it, two concurrent saves both read the
+    # same index and the second write drops the first record.
+    with _index_lock:
+        items = [it for it in _load_index() if it.get("id") != pid]
+        items.append(rec)
+        _save_index(items)
     log.info("profile saved", extra={"event": "profile_saved",
                                      "login": login, "server": server})
     return _public(rec)
 
 
 def delete_profile(profile_id: str) -> bool:
-    items = _load_index()
-    kept = [it for it in items if it.get("id") != profile_id]
-    _save_index(kept)
+    with _index_lock:
+        items = _load_index()
+        kept = [it for it in items if it.get("id") != profile_id]
+        removed = len(kept) != len(items)
+        # Only rewrite when something actually changed: an unknown id must not rewrite the file
+        # (and must not delete a vault entry that some other profile might legitimately own).
+        if removed:
+            _save_index(kept)
+    if not removed:
+        return False
     try:
         _keyring().delete_password(SERVICE, profile_id)
     except Exception:
         pass  # secret may already be gone; index removal is what matters
-    return len(kept) != len(items)
+    return True
 
 
 def update_trade_mode(profile_id: str, trade_mode) -> None:
-    items = _load_index()
-    changed = False
-    for it in items:
-        if it.get("id") == profile_id:
-            it["last_trade_mode"] = trade_mode
-            changed = True
-    if changed:
-        _save_index(items)
+    with _index_lock:
+        items = _load_index()
+        changed = False
+        for it in items:
+            if it.get("id") == profile_id:
+                it["last_trade_mode"] = trade_mode
+                changed = True
+        if changed:
+            _save_index(items)
