@@ -228,10 +228,32 @@ data class LoginResult(
     val ok: Boolean = false,
     val login: Long? = null,
     val server: String? = null,
+    /**
+     * 0 = demo, 1 = contest, 2 = REAL. The server derives `is_demo` from this, but we keep the
+     * raw value: "not demo" and "real money" want to be distinguishable in a log after the fact.
+     */
+    @SerialName("trade_mode") val tradeMode: Int? = null,
     @SerialName("is_demo") val isDemo: Boolean? = null,
     /** Positions left open on the PREVIOUS account when switching. Must be surfaced. */
     @SerialName("prev_open") val prevOpen: Int? = null,
 )
+
+/**
+ * POST /api/logout.
+ *
+ * MT5 has no true "log out" -- the terminal stays logged in; the server simply refuses to drive
+ * it (mt5_worker `_logout`). So `prev_open` is not cosmetic: those positions are STILL OPEN on
+ * the account, now with nothing watching them. The UI must say so.
+ */
+@Serializable
+data class LogoutResult(
+    val ok: Boolean = false,
+    @SerialName("prev_open") val prevOpen: Int? = null,
+)
+
+/** DELETE /api/accounts/{id}. `false` means the id was not there -- the server returns 200. */
+@Serializable
+data class DeleteResult(val deleted: Boolean = false)
 
 @Serializable
 data class OrderResult(

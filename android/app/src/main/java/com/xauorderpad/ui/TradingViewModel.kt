@@ -45,7 +45,7 @@ private const val STALE_AFTER_MS = 10_000L
  * decides whether REAL orders go out sat next to an unrelated engine's toggle. On this screen
  * an engine can only be armed from its own page, where there is exactly one thing to arm.
  */
-enum class Screen { CONNECT, LOGIN, TRADE, SETTINGS, STRATEGIES, STRATEGY }
+enum class Screen { CONNECT, LOGIN, TRADE, SETTINGS, STRATEGIES, STRATEGY, ACCOUNTS }
 
 /** One-shot message for the snackbar. `id` makes repeats of the same text fire again. */
 data class Toast(val text: String, val isError: Boolean, val id: Long)
@@ -359,12 +359,25 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
 
     fun goto(s: Screen) {
         _screen.value = s
-        if (s == Screen.LOGIN) loadProfiles()
+        if (s == Screen.LOGIN || s == Screen.ACCOUNTS) loadProfiles()
     }
 
     // ---- MT5 session -----------------------------------------------------
 
-    private fun loadProfiles() = viewModelScope.launch {
+    /**
+     * The last account error, held until the next SUCCESS clears it.
+     *
+     * A toast is not enough here, and the web UI learned that the hard way: a rejected login that
+     * only flashes for four seconds reads as "the button did nothing", and the user taps it again
+     * and again. This banner stays on the Accounts screen until something actually works.
+     */
+    private val _accountError = MutableStateFlow<String?>(null)
+    val accountError: StateFlow<String?> = _accountError.asStateFlow()
+
+    fun clearAccountError() { _accountError.value = null }
+
+    /** Public so the Accounts screen can refresh after add/switch/delete. */
+    fun loadProfiles() = viewModelScope.launch {
         val e = Feed.epoch
         when (val r = Feed.api.accounts()) {
             is ApiResult.Ok -> _profiles.value = r.value.accounts
@@ -374,42 +387,172 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun login(profileId: String) = viewModelScope.launch {
+    /** Log into a SAVED profile. No password leaves the phone -- the server has it. */
+    fun login(profileId: String, goToTrade: Boolean = true) = viewModelScope.launch {
         _busy.value = true
         val e = Feed.epoch
         try {
-            when (val r = Feed.api.login(profileId)) {
+            handleLogin(Feed.api.login(profileId), e, goToTrade)
+        } finally {
+            _busy.value = false
+        }
+    }
+
+    /**
+     * Log in with TYPED credentials, optionally saving them to the server's vault.
+     *
+     * The password is a plain parameter and is deliberately not held anywhere: it goes straight
+     * into the request and out of scope. It is never put in a StateFlow, never in the form state,
+     * and never logged.
+     */
+    fun loginWith(
+        login: String,
+        password: String,
+        server: String,
+        path: String,
+        save: Boolean,
+        label: String,
+    ) = viewModelScope.launch {
+        val id = login.trim().toLongOrNull()
+        if (id == null || password.isBlank() || server.isBlank()) {
+            _accountError.value = "login, password and server are required"
+            return@launch
+        }
+        _busy.value = true
+        val e = Feed.epoch
+        try {
+            handleLogin(
+                Feed.api.loginWith(id, password, server.trim(), path.trim(), save, label.trim()),
+                e,
+                goToTrade = true,
+            )
+            // Whether or not it worked, the saved list may have changed (save happens only on a
+            // SUCCESSFUL login server-side, so this is how the new row appears).
+            loadProfiles()
+        } finally {
+            _busy.value = false
+        }
+    }
+
+    private fun handleLogin(r: ApiResult<com.xauorderpad.net.LoginResult>, epoch: Int, goToTrade: Boolean) {
+        when (r) {
+            is ApiResult.Ok -> {
+                _accountError.value = null          // a success is the only thing that clears it
+                val prev = r.value.prevOpen ?: 0
+                when {
+                    // Switching account leaves the PREVIOUS account's positions OPEN. Staying
+                    // silent here would let the user believe they were flat when they are not.
+                    prev > 0 ->
+                        say("Logged in — $prev position(s) STILL OPEN on the previous account", error = true)
+                    r.value.isDemo == false ->
+                        say("Logged in — REAL ACCOUNT", error = true)
+                    else ->
+                        say("Logged in (demo)", error = false)
+                }
+                if (goToTrade) _screen.value = Screen.TRADE
+            }
+            is ApiResult.Unauthorized -> onUnauthorized(epoch)
+
+            // MT5 login is slow (terminal handshake + broker auth, and a cold start LAUNCHES
+            // terminal64.exe). A timeout here does not mean it failed -- it may already be logged
+            // in, and retrying a login that is still in flight is how you end up switching
+            // accounts under yourself. The feed is the authority: if it went through, the next
+            // frame stops saying logged_out.
+            is ApiResult.TimedOut -> {
+                _accountError.value =
+                    "TIMED OUT — the login may still have SUCCEEDED. Watch the status above before retrying."
+                say("Timed out — check the status before retrying", error = true)
+            }
+
+            is ApiResult.Failed -> {
+                _accountError.value = r.message
+                say(r.message, error = true)
+            }
+        }
+    }
+
+    fun deleteAccount(profileId: String) = viewModelScope.launch {
+        _busy.value = true
+        val e = Feed.epoch
+        try {
+            when (val r = Feed.api.deleteAccount(profileId)) {
                 is ApiResult.Ok -> {
-                    val prev = r.value.prevOpen ?: 0
-                    when {
-                        // Switching account leaves the PREVIOUS account's positions OPEN. Staying
-                        // silent here would let the user believe they were flat when they are not.
-                        prev > 0 ->
-                            say("Logged in — $prev position(s) STILL OPEN on the previous account", error = true)
-                        r.value.isDemo == false ->
-                            say("Logged in — REAL ACCOUNT", error = true)
-                        else ->
-                            say("Logged in (demo)", error = false)
+                    if (r.value.deleted) {
+                        _accountError.value = null
+                        say("Account forgotten", error = false)
+                    } else {
+                        // The server answers 200 {deleted:false} for an unknown id. Reporting that
+                        // as success would leave a row on screen that the server says is gone.
+                        _accountError.value = "Nothing was deleted — the server did not know that id"
                     }
-                    _screen.value = Screen.TRADE
+                    loadProfiles()
                 }
                 is ApiResult.Unauthorized -> onUnauthorized(e)
-
-                // MT5 login is slow (terminal handshake + broker auth). A timeout here does not
-                // mean it failed -- it may already be logged in, and retrying a login that is
-                // still in flight is how you end up switching accounts under yourself. The feed
-                // is the authority: if it went through, the next frame stops saying logged_out.
-                is ApiResult.TimedOut -> say(
-                    "TIMED OUT — the login may still have succeeded. Watch the banner before retrying.",
-                    error = true,
-                )
-
-                is ApiResult.Failed -> say(r.message, error = true)
+                is ApiResult.TimedOut -> _accountError.value =
+                    "TIMED OUT — the account may still have been deleted."
+                is ApiResult.Failed -> _accountError.value = r.message
             }
         } finally {
             _busy.value = false
         }
     }
+
+    /**
+     * Stop driving the terminal.
+     *
+     * This is NOT a broker logout and it does NOT close anything: MT5 has no real logout, so the
+     * positions stay open on the account with nothing watching them. `prev_open` is the count, and
+     * it is reported loudly rather than swallowed.
+     */
+    fun logoutMt5() = viewModelScope.launch {
+        _busy.value = true
+        val e = Feed.epoch
+        try {
+            when (val r = Feed.api.logout()) {
+                is ApiResult.Ok -> {
+                    val prev = r.value.prevOpen ?: 0
+                    _accountError.value = null
+                    if (prev > 0) {
+                        say("Logged out — $prev position(s) STILL OPEN on the account", error = true)
+                    } else {
+                        say("Logged out of MT5", error = false)
+                    }
+                }
+                is ApiResult.Unauthorized -> onUnauthorized(e)
+                is ApiResult.TimedOut -> _accountError.value =
+                    "TIMED OUT — the logout may still have gone through."
+                is ApiResult.Failed -> _accountError.value = r.message
+            }
+        } finally {
+            _busy.value = false
+        }
+    }
+
+    /**
+     * True when a typed password would cross the network in the CLEAR.
+     *
+     * The web UI types the broker password on loopback, where plaintext HTTP is harmless. The
+     * phone types it over the network -- and that is a different risk entirely for a REAL broker
+     * credential. Tailscale (100.64.0.0/10) is WireGuard, so it is encrypted; https is encrypted;
+     * a plain http:// LAN address is not.
+     *
+     * This drives a WARNING, not a block. It is the user's own network and their call.
+     */
+    val passwordInClear: Boolean
+        get() {
+            val url = secrets.baseUrl.lowercase()
+            if (url.startsWith("https://")) return false
+            val host = url.removePrefix("http://").substringBefore(':').substringBefore('/')
+            if (host == "127.0.0.1" || host == "localhost" || host == "::1") return false
+            // Tailscale hands out 100.64.x.x - 100.127.x.x. Checking the second octet matters:
+            // 100.0.0.0/8 at large is ordinary public space, not the CGNAT range.
+            val octets = host.split('.')
+            if (octets.size == 4 && octets[0] == "100") {
+                val second = octets[1].toIntOrNull()
+                if (second != null && second in 64..127) return false
+            }
+            return true
+        }
 
     // ---- strategies (server-side engines; this is a remote control) --------
 

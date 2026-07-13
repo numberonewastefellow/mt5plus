@@ -28,6 +28,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xauorderpad.data.Feed
 import com.xauorderpad.net.Link
 import com.xauorderpad.svc.FeedService
+import com.xauorderpad.ui.AccountsScreen
 import com.xauorderpad.ui.ConnectScreen
 import com.xauorderpad.ui.LoginScreen
 import com.xauorderpad.ui.Screen
@@ -91,6 +92,7 @@ class MainActivity : ComponentActivity() {
                 val strategies by vm.strategies.collectAsStateWithLifecycle()
                 val strategy by vm.strategy.collectAsStateWithLifecycle()
                 val armed by vm.armed.collectAsStateWithLifecycle()
+                val accountError by vm.accountError.collectAsStateWithLifecycle()
 
                 val snackbar = remember { SnackbarHostState() }
 
@@ -154,7 +156,15 @@ class MainActivity : ComponentActivity() {
                         val onDisconnect: () -> Unit = { vm.disconnect() }
                         val onToggleConfirm: (Boolean) -> Unit = { vm.setConfirmCloses(it) }
                         val onSettings: () -> Unit = { vm.goto(Screen.SETTINGS) }
+                        val onAccounts: () -> Unit = { vm.goto(Screen.ACCOUNTS) }
                         val onStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
+                        val onLoginWith: (String, String, String, String, Boolean, String) -> Unit =
+                            { l, p, s, path, save, label -> vm.loginWith(l, p, s, path, save, label) }
+                        val onDeleteAccount: (String) -> Unit = { vm.deleteAccount(it) }
+                        val onLogoutMt5: () -> Unit = { vm.logoutMt5() }
+                        // Stay on the Accounts page after switching: you may want to check the
+                        // status card, or fix a second account. Only the LOGIN screen jumps away.
+                        val onSwitchProfile: (String) -> Unit = { vm.login(it, goToTrade = false) }
                         val onBackToSettings: () -> Unit = { vm.goto(Screen.SETTINGS) }
                         val onBackToStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
                         val onOpenStrategy: (String) -> Unit = { vm.openStrategy(it) }
@@ -180,6 +190,7 @@ class MainActivity : ComponentActivity() {
                             profiles = profiles,
                             busy = busy,
                             onPick = callbacks.onPickProfile,
+                            onAddAccount = callbacks.onAccounts,
                             onBack = callbacks.onBackToTrade,
                             modifier = inset,
                         )
@@ -217,10 +228,26 @@ class MainActivity : ComponentActivity() {
                             strategies = strategies,
                             live = live,
                             confirmCloses = confirmCloses,
+                            health = health,
                             onToggleConfirm = callbacks.onToggleConfirm,
+                            onAccounts = callbacks.onAccounts,
                             onStrategies = callbacks.onStrategies,
                             onDisconnect = callbacks.onDisconnect,
                             onBack = callbacks.onBackToTrade,
+                            modifier = inset,
+                        )
+
+                        Screen.ACCOUNTS -> AccountsScreen(
+                            profiles = profiles,
+                            health = health,
+                            busy = busy,
+                            error = accountError,
+                            passwordInClear = vm.passwordInClear,
+                            onLoginProfile = callbacks.onSwitchProfile,
+                            onLoginWith = callbacks.onLoginWith,
+                            onDelete = callbacks.onDeleteAccount,
+                            onLogout = callbacks.onLogoutMt5,
+                            onBack = callbacks.onBackToSettings,
                             modifier = inset,
                         )
 

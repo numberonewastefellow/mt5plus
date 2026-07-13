@@ -30,6 +30,7 @@ fun LoginScreen(
     profiles: List<Profile>,
     busy: Boolean,
     onPick: (String) -> Unit,
+    onAddAccount: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -55,14 +56,20 @@ fun LoginScreen(
 
         if (profiles.isEmpty()) {
             Box(Modifier.fillMaxSize(), Alignment.Center) {
-                Text(
-                    // Being specific about the fix: the phone cannot create a profile,
-                    // because that would require typing the broker password here.
-                    "No saved accounts on the server.\n\nAdd one from the desktop web UI "
-                        + "(Account panel) — it stores the password in the Windows vault.",
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        // This used to be a dead end -- "go to the desktop web UI". On an EC2 box
+                        // with no saved profile that left the phone unable to trade at all, which
+                        // is the one situation the phone exists for.
+                        "No saved accounts on the server.",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    TextButton(onClick = onAddAccount) {
+                        Text("ADD AN ACCOUNT", fontWeight = FontWeight.Bold)
+                    }
+                }
             }
             return@Column
         }

@@ -115,10 +115,23 @@ def _print_banner() -> None:
     loopback and is NOT harmless the moment this is on the LAN: this process sends real MT5
     orders, so an unauthenticated network bind means any device on the Wi-Fi can place trades
     and flatten the book.
+
+    Three binds, three different answers to "what do I type into the phone?":
+
+      127.0.0.1   nothing -- the socket is not on the network at all.
+      0.0.0.0     every interface, so the address to dial is not in HOST. Ask the routing
+                  table (_lan_ip). This is the desktop-on-your-LAN case.
+      100.x.y.z   an EXPLICIT bind (the box's Tailscale address). The answer IS HOST, and
+                  _lan_ip() is actively wrong here: on EC2 it returns the AWS private
+                  172.31.x.x, because that is the route to 8.8.8.8. Handing the operator an
+                  unreachable address while captioning it "type this into the Android app"
+                  is worse than printing nothing.
     """
     port = config.PORT
     loopback = config.HOST in ("127.0.0.1", "localhost")
-    lan = _lan_ip()
+    all_ifaces = config.HOST in ("0.0.0.0", "::")
+    # Only ask the routing table when the bind itself doesn't name an address.
+    dialable = _lan_ip() if all_ifaces else config.HOST
 
     lines = ["", "  XauOrderPad listening", f"    Local:    http://127.0.0.1:{port}"]
 
@@ -127,10 +140,12 @@ def _print_banner() -> None:
             "    Network:  NOT REACHABLE -- bound to 127.0.0.1 (loopback only).",
             "              A phone CANNOT connect. This is not a firewall issue: the",
             "              socket does not exist on your Wi-Fi interface.",
-            "              Fix: set XAUORDERPAD_HOST=0.0.0.0 and restart.",
+            "              Fix (desktop, phone on the same Wi-Fi): XAUORDERPAD_HOST=0.0.0.0",
+            "              Fix (EC2 box): XAUORDERPAD_HOST=<the 100.x.y.z Tailscale address>.",
+            "              Never 0.0.0.0 on EC2 -- that publishes a trading API to the internet.",
         ]
-    elif lan:
-        lines.append(f"    Network:  http://{lan}:{port}     <-- type this into the Android app")
+    elif dialable:
+        lines.append(f"    Network:  http://{dialable}:{port}     <-- type this into the Android app")
     else:
         lines.append(f"    Network:  bound to {config.HOST} (could not determine the LAN IP)")
 
@@ -141,8 +156,9 @@ def _print_banner() -> None:
     else:
         lines += [
             "    Auth:     *** NONE -- AND THIS SERVER IS ON THE NETWORK ***",
-            "              Every device on this Wi-Fi can now place orders and close",
-            "              your positions. This process sends REAL MT5 orders.",
+            "              Every device that can reach the address above can now place",
+            "              orders and close your positions. This process sends REAL MT5",
+            "              orders.",
             "              Fix: set XAUORDERPAD_TOKEN and restart.",
         ]
     lines.append("")
@@ -415,6 +431,58 @@ def delete_account(profile_id: str, x_token: str | None = Header(default=None)):
 
 
 # ---- account session: login / switch / logout ---------------------------
+# The last profile that actually logged in. Used to put the session BACK after a failed
+# login attempt -- see _restore_session(). Just an id; no secret is held here.
+_last_good_profile: str | None = None
+
+
+async def _restore_session() -> str | None:
+    """Put the terminal back on the last profile that worked.
+
+    ── Why this exists (measured, not theorised) ──
+
+    `mt5.login()` with a wrong password does not merely fail -- it TEARS DOWN the session
+    that was already running, and the worker does NOT recover on its own. Reproduced against
+    a live terminal: logged in, bid streaming; one login with a bad password; and then
+    `connected: False, error: "terminal not connected (-6: Terminal: Authorization failed)"`
+    for as long as you care to wait.
+
+    So a single fat-fingered password is enough to take the order pad off the market. If
+    positions are open, the strategy engines stop managing their exits -- they cannot see an
+    account. That is a very expensive way to punish a typo, and it became a great deal easier
+    to trigger once the phone got a password field.
+
+    Restoring the PREVIOUS account is also the honest semantics of a failed switch: the
+    account you asked for is not available, so you are still on the one you were on.
+
+    Returns the restored profile id, or None if there was nothing to restore or the restore
+    itself failed (in which case the caller still reports the original error -- we must never
+    let a recovery attempt mask the thing that actually went wrong).
+    """
+    pid = _last_good_profile
+    if not pid:
+        return None
+    prof = accounts.get_profile(pid)
+    pw = accounts.get_password(pid) if prof else None
+    if not prof or not pw:
+        return None
+    try:
+        res = await _do({"action": "login", "login": prof["login"], "password": pw,
+                         "server": prof["server"], "path": prof.get("path") or None})
+    except Exception:
+        log.exception("session restore failed", extra={"event": "session_restore_failed",
+                                                       "profile": pid})
+        return None
+    if res.get("ok"):
+        log.warning("login failed; restored previous session",
+                    extra={"event": "session_restored", "profile": pid})
+        return pid
+    log.error("login failed AND the previous session could not be restored",
+              extra={"event": "session_restore_failed", "profile": pid,
+                     "error": res.get("error")})
+    return None
+
+
 @app.post("/api/login")
 async def login(req: LoginReq, x_token: str | None = Header(default=None)):
     """Log in or switch the terminal's account.
@@ -423,7 +491,10 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
     vault) or uses ad-hoc credentials. The password is handed to the worker and
     is never logged here. Returns the worker result incl. `is_demo` and
     `prev_open` (positions left open on the previous account).
+
+    A FAILED attempt puts the previous session back -- see _restore_session().
     """
+    global _last_good_profile
     _check_token(x_token)
     login_id, password, server = req.login, req.password, req.server
     path = req.path
@@ -448,16 +519,28 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
     res = await _do({"action": "login", "login": login_id,
                      "password": password, "server": server, "path": path})
     if not res.get("ok"):
-        raise HTTPException(status_code=400, detail=res.get("error") or "login failed")
+        err = res.get("error") or "login failed"
+        # The attempt just killed whatever session was running. Put it back before answering,
+        # and SAY SO in the same breath -- a user who is told "login failed" and nothing else
+        # has no reason to suspect they are now flat on the market.
+        restored = await _restore_session()
+        if restored:
+            err = f"{err} — the previous account ({restored}) is still connected"
+        elif _last_good_profile:
+            err = (f"{err} — WARNING: the terminal is now DISCONNECTED and could not be "
+                   f"restored. Log in again.")
+        raise HTTPException(status_code=400, detail=err)
 
     # Persist on ad-hoc login if asked; best-effort (login already succeeded).
     if req.save and not req.profile_id:
         try:
-            accounts.save_profile(req.label, login_id, password, server,
-                                  path or "", res.get("trade_mode"))
+            saved = accounts.save_profile(req.label, login_id, password, server,
+                                          path or "", res.get("trade_mode"))
+            _last_good_profile = saved.get("id")
         except RuntimeError:
             log.warning("login ok but profile not saved (no keyring backend)")
     elif req.profile_id:
+        _last_good_profile = req.profile_id
         try:
             accounts.update_trade_mode(req.profile_id, res.get("trade_mode"))
         except Exception:
@@ -468,6 +551,11 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
 @app.post("/api/logout")
 async def logout(x_token: str | None = Header(default=None)):
     _check_token(x_token)
+    global _last_good_profile
+    # Forget the restore target. Logging out is DELIBERATE: if the next login attempt fails,
+    # silently reconnecting the account the user just walked away from would be the opposite
+    # of what they asked for.
+    _last_good_profile = None
     return JSONResponse(await _do({"action": "logout"}))
 
 

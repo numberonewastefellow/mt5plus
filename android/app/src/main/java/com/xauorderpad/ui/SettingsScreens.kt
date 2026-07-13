@@ -71,7 +71,9 @@ fun SettingsScreen(
     strategies: StrategiesUi,
     live: Boolean,
     confirmCloses: Boolean,
+    health: Health,
     onToggleConfirm: (Boolean) -> Unit,
+    onAccounts: () -> Unit,
     onStrategies: () -> Unit,
     onDisconnect: () -> Unit,
     onBack: () -> Unit,
@@ -88,6 +90,27 @@ fun SettingsScreen(
 
         Column(Modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
 
+            // The account comes FIRST: which account you are pointed at decides what every other
+            // control on this phone will do with real money.
+            SectionLabel("ACCOUNT")
+            MenuRow(
+                title = "MT5 Account",
+                subtitle = when {
+                    health.loggedOut -> "LOGGED OUT — not trading"
+                    health.isDemo == false -> "REAL ACCOUNT · ${health.server ?: "?"}"
+                    health.isDemo == true -> "DEMO · ${health.server ?: "?"}"
+                    else -> "checking…"
+                },
+                dot = when {
+                    health.loggedOut -> Amber
+                    health.isDemo == false -> Red
+                    health.isDemo == true -> Green
+                    else -> null
+                },
+                onClick = onAccounts,
+            )
+
+            Spacer(Modifier.height(18.dp))
             SectionLabel("TRADING")
 
             // Moved off the trade screen: it is a set-once preference, not something you work

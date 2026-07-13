@@ -196,11 +196,77 @@ class Api(
     /**
      * Log the terminal into a SAVED profile. The broker password is never sent from the
      * phone -- the server reads it from the Windows Credential Vault (accounts.py).
+     *
+     * This is the path used for EVERY login after the first: once an account is saved, the
+     * password never leaves the server again.
      */
     suspend fun login(profileId: String): ApiResult<LoginResult> = post(
         path = "/api/login",
         body = buildJsonObject { put("profile_id", JsonPrimitive(profileId)) },
+        client = tradeHttp,
     ) { json.decodeFromString<LoginResult>(it) }
+
+    /**
+     * Log in with typed credentials, optionally saving them.
+     *
+     * ── This is the ONLY call in the app that carries a broker password. ──
+     *
+     * The password is sent ONCE. With `save = true` the server writes it to the Windows
+     * Credential Manager (accounts.save_profile, which fails closed if there is no keyring) and
+     * every later login goes through [login] with a profile id alone.
+     *
+     * It is never persisted on the phone, never logged, and never comes back: `_public()` on the
+     * server projects only non-secret fields, so no response can leak it.
+     *
+     * The transport is whatever the user pointed the app at, and that is usually PLAIN HTTP.
+     * On Tailscale (WireGuard) that is encrypted; on open Wi-Fi it is not, and this call would
+     * put a broker password on the wire in the clear. The UI warns about exactly that before the
+     * field is even typed into -- see AccountsScreen. It warns; it does not block. It is the
+     * user's own network.
+     *
+     * Uses tradeHttp (60 s): a cold MT5 start can LAUNCH terminal64.exe, which is far slower
+     * than the shared client's 15 s budget. A timeout here is an UNKNOWN, not a failure -- the
+     * login may well have succeeded. See ApiResult.TimedOut.
+     */
+    suspend fun loginWith(
+        login: Long,
+        password: String,
+        server: String,
+        path: String?,
+        save: Boolean,
+        label: String?,
+    ): ApiResult<LoginResult> = post(
+        path = "/api/login",
+        body = buildJsonObject {
+            put("login", JsonPrimitive(login))
+            put("password", JsonPrimitive(password))
+            put("server", JsonPrimitive(server))
+            path?.takeIf { it.isNotBlank() }?.let { put("path", JsonPrimitive(it)) }
+            put("save", JsonPrimitive(save))
+            label?.takeIf { it.isNotBlank() }?.let { put("label", JsonPrimitive(it)) }
+        },
+        client = tradeHttp,
+    ) { json.decodeFromString<LoginResult>(it) }
+
+    /** Forget a saved profile: drops the index record AND the vault password. */
+    suspend fun deleteAccount(profileId: String): ApiResult<DeleteResult> =
+        execute(
+            Request.Builder().url(baseUrl() + "/api/accounts/" + profileId).delete(),
+            http,
+            "/api/accounts/$profileId",
+        ) { json.decodeFromString<DeleteResult>(it) }
+
+    /**
+     * Stop driving the terminal.
+     *
+     * NOT a broker logout -- MT5 has no such thing. Open positions STAY OPEN on the account,
+     * which is why `prev_open` comes back and why the UI must say so before you tap it.
+     */
+    suspend fun logout(): ApiResult<LogoutResult> = post(
+        path = "/api/logout",
+        body = JsonObject(emptyMap()),
+        client = tradeHttp,
+    ) { json.decodeFromString<LogoutResult>(it) }
 
     // ---- plumbing --------------------------------------------------------
 
