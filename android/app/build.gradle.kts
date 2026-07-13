@@ -45,6 +45,21 @@ fun devDefault(key: String, env: String): String =
 val devBaseUrl = devDefault("xau.baseUrl", "XAU_BASE_URL")
 val devToken = devDefault("xau.token", "XAU_TOKEN")
 
+// Demo build: the password for the client.p12 bundled in assets/certs/. Non-blank = the app loads
+// the embedded certificate at startup, so the EC2 mTLS path works with no manual cert upload. The
+// Connect screen is still shown (URL + token pre-filled); the user taps CONNECT. DEBUG only.
+val devP12Password = devDefault("xau.p12Password", "XAU_P12_PASSWORD")
+
+// Opt-in for a NON-clean release: `assembleRelease -Pxau.embedSecrets=true` bakes the same
+// URL/token/p12-password the debug build uses (and bundles the demo certs -- see sourceSets below)
+// into a SIGNED, non-debuggable release, for handing to a tester without a manual setup.
+//
+// Absent (the default, and the shippable form), the release build is secret-free: the three
+// DEFAULT_* fields are "" and no client.p12 is packaged, so there is nothing to extract. Signing
+// stops someone RE-signing a modified APK as us; it does NOT hide a baked-in string, so the only
+// build that is safe to leak is this flag turned OFF.
+val embedSecrets = (project.findProperty("xau.embedSecrets") as String?)?.toBoolean() == true
+
 android {
     namespace = "com.xauorderpad"
     compileSdk = 36
@@ -86,6 +101,8 @@ android {
             // Pre-fill the Connect screen so the URL + token are not retyped on every install.
             buildConfigField("String", "DEFAULT_BASE_URL", "\"$devBaseUrl\"")
             buildConfigField("String", "DEFAULT_TOKEN", "\"$devToken\"")
+            // Demo build: the password that unlocks the client.p12 bundled in assets/certs/.
+            buildConfigField("String", "DEFAULT_P12_PASSWORD", "\"$devP12Password\"")
         }
         release {
             // R8 off: ~15 files, nothing meaningful to shrink, and it only adds a way for
@@ -93,13 +110,25 @@ android {
             isMinifyEnabled = false
             if (hasSigning) signingConfig = signingConfigs.getByName("release")
 
-            // EMPTY, deliberately. A signed release APK with a live trading token compiled into
-            // it is a secret that cannot be rotated: anyone holding the APK can `strings` it out,
-            // and the token grants order placement on a real account. Convenience belongs on the
-            // dev build; the shippable artifact carries nothing.
-            buildConfigField("String", "DEFAULT_BASE_URL", "\"\"")
-            buildConfigField("String", "DEFAULT_TOKEN", "\"\"")
+            // EMPTY unless -Pxau.embedSecrets=true. A signed release APK with a live trading token
+            // compiled into it is a secret that cannot be rotated: anyone holding the APK can
+            // `strings` it out, and the token grants order placement on a real account. So the
+            // default (no flag) carries nothing; the flag is an explicit, temporary convenience for
+            // handing a ready-to-run build to a tester -- and that build is exactly as extractable
+            // as the debug one, minus `debuggable`. See `embedSecrets` above.
+            buildConfigField("String", "DEFAULT_BASE_URL",     "\"${if (embedSecrets) devBaseUrl else ""}\"")
+            buildConfigField("String", "DEFAULT_TOKEN",        "\"${if (embedSecrets) devToken else ""}\"")
+            buildConfigField("String", "DEFAULT_P12_PASSWORD", "\"${if (embedSecrets) devP12Password else ""}\"")
         }
+    }
+
+    // The demo certs (ca.crt + client.p12) live OUTSIDE src/main so they are NOT in every APK --
+    // client.p12 is a trading credential. Debug always gets them (CertStore.seedFromAssetsIfEmpty
+    // auto-loads them for on-desk testing); release gets them ONLY with -Pxau.embedSecrets=true. A
+    // clean release ships no cert at all -> nothing to extract. The dir is gitignored.
+    sourceSets {
+        getByName("debug").assets.srcDir("src/demoCerts/assets")
+        if (embedSecrets) getByName("release").assets.srcDir("src/demoCerts/assets")
     }
 
     compileOptions {

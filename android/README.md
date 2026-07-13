@@ -145,32 +145,39 @@ Connect screen always wins and is never silently reverted by the next install.
 
 ---
 
-## Pointing the app at the EC2 box
+## Pointing the app at a server
 
-**No rebuild. No certificate. Nothing to change in this directory.** The base URL is a *setting*, not
-a build constant — `Secrets.normalizeBaseUrl` takes whatever `host:port` you type, defaulting the
-scheme to `http://` and the port to `:8765`. So repointing the app is two fields on the Connect
-screen.
+**No rebuild.** The base URL is a *setting* — `Secrets.normalizeBaseUrl` takes whatever you type,
+defaulting a bare host to `http://host:8765` and preserving an explicit `https://`. One build reaches
+**both** servers:
 
-What you need:
+| Target | What you type | Certificate |
+|---|---|---|
+| LAN dev server | `192.168.0.116:8765` (plain HTTP) | **none** |
+| EC2 box | `https://<elastic-ip>:8443` (mutual TLS) | **required** — uploaded in Settings |
 
-| | |
-|---|---|
-| Phone | Android **14+** (`minSdk 34`) |
-| Tailscale | Install it from the Play Store, sign in to the same tailnet as the box |
-| Server address | The box's `100.x.y.z:8765` (printed by `provision.bat`) |
-| API token | Printed once by `provision.bat` |
-| **Certificates** | **None. Not required, and not supported** — see below |
+**The app now does mutual TLS** (`net/Tls.kt`, `data/CertStore.kt`). For the EC2 box:
 
-**There is no TLS anywhere in this app.** No trust store, no pinning, no self-signed handling — the
-OkHttp client is stock (`Feed.kt`), and the server speaks plain HTTP. A self-signed certificate would
-fail as an opaque "connection failed", not a useful error. Encryption comes from **WireGuard**:
-Tailscale carries the cleartext hop, and port 8765 is never opened in the EC2 security group.
+1. Generate the certs on the laptop: `python XauOrderPad\deploy\make_certs.py --ip <elastic-ip>`.
+2. Move `ca.crt` and `client.p12` to the phone **over USB/MTP** — `client.p12` is a trading
+   credential; do not email it.
+3. In the app: **Settings → Certificates (mTLS)** → import both files + the p12 password → LOAD.
+4. Connect to `https://<elastic-ip>:8443` + the API token.
 
-Set the box up with `XauOrderPad\deploy\bat\provision.bat` — see
-[XauOrderPad/deploy/README.md](../XauOrderPad/deploy/README.md). Do **not** try to reach the box by
-opening 8765 on its public IP: the token grants order placement on a live account and the transport
-is cleartext.
+The client trusts **our private CA only** (`Tls.kt`), so no public CA can impersonate the box, and it
+presents `client.p12` as its identity — Caddy drops any connection without it at the TLS handshake.
+Uploading a rotated cert is a Settings action, not a reinstall (`Feed.reloadTls()` rebuilds the HTTP
+client live). Certs are **not** baked into the APK.
+
+Having a cert loaded does **not** affect the LAN HTTP path: OkHttp only uses the TLS factory for
+`https://` URLs. The broker password, however, is **blocked** from being sent over plain HTTP
+(`loginWith` refuses when `passwordInClear`) — add accounts over https or on the desktop.
+
+Do **not** reach the box by opening 8765 on its public IP: that is uvicorn, plain HTTP, and the token
+grants order placement. 8443 (Caddy, mTLS) is the only way in. Set the box up with the
+`eip` → `ship` → `caddy` flow in [XauOrderPad/deploy/README.md](../XauOrderPad/deploy/README.md).
+
+Phone requirement: Android **14+** (`minSdk 34`).
 
 ---
 
@@ -193,6 +200,68 @@ uninstalling, which wipes the stored token.
 
 **Back the keystore up somewhere outside this repo.** Lose it and you can never ship an update over
 the installed app.
+
+---
+
+## Building the release APK — two forms
+
+```
+deploy.bat release         # CLEAN: no URL/token/cert baked in. The shippable, secret-free build.
+deploy.bat release demo    # embeds URL + token + demo cert (-Pxau.embedSecrets=true).
+```
+
+Both are signed with the `xau` release key and are **not** `debuggable`; the APK lands at
+`E:\temp\mt5_data\app-release.apk`. The difference is only what is compiled in:
+
+- **`release`** — `DEFAULT_BASE_URL` / `DEFAULT_TOKEN` / `DEFAULT_P12_PASSWORD` are `""` and **no**
+  `client.p12` is packaged (the demo certs live in `app/src/demoCerts/`, added to the release assets
+  *only* under `-Pxau.embedSecrets`). Nothing to extract — safe to distribute. The user types the URL +
+  token and imports a cert manually.
+- **`release demo`** — self-contained: the Connect screen is pre-filled and `CertStore.seedFromAssetsIfEmpty`
+  auto-loads the bundled cert on first launch, so it connects to the box with **no manual setup**.
+
+## Giving the `release demo` APK to someone else
+
+Verified end-to-end (clean uninstall → install → first-launch CONNECT reaches a live box feed, cert
+auto-loaded, no import, no trust error):
+
+1. Send **only** `app-release.apk` (the `demo` build). They install it, open it, tap **CONNECT**. That is
+   the whole setup — no certificate to send separately.
+2. They share the **same** demo account the box is logged into (`472200942`). The box must be **running**
+   with MT5 logged in and **AutoTrading ON**, or they connect but the feed is flat / orders are refused.
+
+**The `demo` APK IS a trading credential.** Anyone holding the file can unzip it and pull out the client
+cert + token and trade that demo account. Hand it to one trusted person — never a public link. It is a
+*demo* account, so the blast radius is demo funds; the client cert is still not individually revocable
+(no CRL), so if it leaks the only remedy is regenerating the CA (`make_certs.py --force`), which
+invalidates every device including your own phone.
+
+## Planned: hardening the demo APK (NOT yet implemented — see `TODO.md`)
+
+To raise the bar against a leaked `demo` APK while keeping the cert/token baked in, the agreed *future*
+work is:
+
+1. **Time-derived login code** — the friend enters a short code computed from the current clock on each
+   connect (e.g. `23:07` → `2+3+7 = 12`); the app computes the same from its own clock and refuses to
+   connect on a mismatch. Use an **hourly bucket** (or ±1 minute tolerance) so he isn't racing a
+   per-minute change and to survive clock skew between phone and box.
+2. **R8 obfuscation** (`isMinifyEnabled = true` + `shrinkResources`) to scramble the baked strings/classes.
+3. **Android Keystore** for the unlocked cert + token (non-exportable) instead of plain files/prefs.
+4. Keep the bundled cert + token (current `release demo`) — the code is an *added gate*, not a replacement.
+
+**Be honest about what this buys.** It is **layered obfuscation, not a lock.** The time-code rule is a
+fixed algorithm compiled into the app; R8 obfuscates it but does not hide it — a determined attacker reads
+it, reproduces it, and still extracts the baked cert. Two consequences:
+
+- To make the code *actually* gate access, fold in a **secret only the friend knows** — e.g.
+  `sum-of-time + a shared PIN` — so knowing the public algorithm is not enough.
+- **Only a secret that is NOT in the APK** (a passphrase/activation code, or a server-provisioned
+  per-device cert) gives real leak resistance. This stack is best-effort for a *demo* credential; do **not**
+  rely on it for a real-money account.
+
+Also: R8 cannot be turned on blind — it needs **keep rules for kotlinx.serialization** generated
+serializers (the exact reason it is off today, `app/build.gradle.kts:108`), or WebSocket frames silently
+fail to parse.
 
 ---
 

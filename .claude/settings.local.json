@@ -23,8 +23,26 @@
       "Bash(npx serve*)",
       "Bash(npx http-server*)",
       "Bash(docker compose *)",
+
+      "Bash(adb *)",
+      "Bash(./gradlew *)",
+      "Bash(git *)",
+      "Bash(curl *)",
+      "PowerShell(adb *)",
+      "PowerShell(& cmd /c \"d:\\llm\\ios\\mt5plus\\android\\deploy.bat\"*)",
+      "PowerShell(Start-Sleep *)",
+      "PowerShell(Invoke-RestMethod *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-NetTCPConnection *)",
+      "PowerShell(Start-Process *)",
+      "PowerShell(1..*)",
+      "PowerShell($sp = *)",
+      "PowerShell($tok = *)",
+
       "Read(d:\\llm\\ios\\mt5plus\\**)",
-      "Read(.\\**)"
+      "Read(.\\**)",
+      "Read(C:\\Users\\Pandu\\AppData\\Local\\Temp\\claude\\**)"
     ]
   }
 }

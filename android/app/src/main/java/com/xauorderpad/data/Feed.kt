@@ -52,21 +52,38 @@ object Feed {
      * without shutting it down -- leaking the dispatcher's thread pool and its connection
      * pool on every token re-entry.
      */
-    val http: OkHttpClient = OkHttpClient.Builder()
-        // Ping frames keep the socket alive through carrier NAT. Without them an idle socket
-        // on a mobile network can be silently reaped, leaving us "connected" and showing
-        // stale prices -- worse than showing offline.
-        //
-        // 5 s, not 20: this interval IS the detection latency for a silently-reaped socket --
-        // OkHttp only discovers the death when a ping goes unanswered. At 20 s the app could
-        // sit for twenty seconds showing a frozen quote while `live` still read true, with
-        // BUY/SELL and the strategy switches armed against it. A keepalive frame every 5 s is
-        // nothing next to the 5 Hz snapshot stream it is protecting.
-        .pingInterval(5, TimeUnit.SECONDS)
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)   // 0 = none; the socket is long-lived by design
-        .callTimeout(15, TimeUnit.SECONDS)       // applies to the REST calls, not the socket
-        .build()
+    private fun buildClient(): OkHttpClient {
+        val b = OkHttpClient.Builder()
+            // Ping frames keep the socket alive through carrier NAT. Without them an idle socket
+            // on a mobile network can be silently reaped, leaving us "connected" and showing
+            // stale prices -- worse than showing offline.
+            //
+            // 5 s, not 20: this interval IS the detection latency for a silently-reaped socket --
+            // OkHttp only discovers the death when a ping goes unanswered. At 20 s the app could
+            // sit for twenty seconds showing a frozen quote while `live` still read true, with
+            // BUY/SELL and the strategy switches armed against it. A keepalive frame every 5 s is
+            // nothing next to the 5 Hz snapshot stream it is protecting.
+            .pingInterval(5, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)   // 0 = none; the socket is long-lived by design
+            .callTimeout(15, TimeUnit.SECONDS)       // applies to the REST calls, not the socket
+        // mTLS material, when the user has uploaded a cert (the EC2 path). Applied unconditionally
+        // once loaded -- but OkHttp only INVOKES the SSLSocketFactory for https:// URLs, so this
+        // does NOT affect the plain-HTTP LAN server. One client, both destinations.
+        CertStore.tls()?.let { b.sslSocketFactory(it.factory, it.trustManager) }
+        return b.build()
+    }
+
+    /**
+     * ONE OkHttpClient for the whole app, shared by the WebSocket and the REST calls.
+     *
+     * A `var`, not a `val`: uploading or clearing a certificate rebuilds it (see [reloadTls]).
+     * Consumers must read `Feed.http` fresh rather than capture it -- Api takes a `() -> http`
+     * supplier, and start() passes the current value into each new TradingClient.
+     */
+    @Volatile
+    var http: OkHttpClient = buildClient()
+        private set
 
     /** Set once, under the lock, before anything reads it. */
     lateinit var secrets: Secrets
@@ -97,12 +114,37 @@ object Feed {
      * reconfigure is picked up without rebuilding this object.
      */
     val api: Api by lazy {
-        Api(http, baseUrl = { secrets.baseUrl }, token = { secrets.token })
+        // A supplier, not the instance: http is rebuilt when a certificate is uploaded/cleared, and
+        // Api must pick up the new client. It already reads baseUrl/token through lambdas for the
+        // same reason.
+        Api(http = { http }, baseUrl = { secrets.baseUrl }, token = { secrets.token })
     }
 
     @Synchronized
     fun init(context: Context) {
+        CertStore.init(context)
         if (!::secrets.isInitialized) secrets = Secrets.create(context)
+        // "Launch and trade" demo build: import the client cert bundled in the APK (if any) so the
+        // EC2 mTLS path works with no manual upload. `http` was built at object-init WITHOUT a cert
+        // (CertStore needs a context, which we only have now), so rebuild it if one just loaded.
+        // Nothing has connected yet at init time, so this is a plain rebuild, not a live swap.
+        if (CertStore.seedFromAssetsIfEmpty(context, com.xauorderpad.BuildConfig.DEFAULT_P12_PASSWORD)) {
+            http = buildClient()
+        }
+    }
+
+    /**
+     * Rebuild the OkHttp client after a certificate change, then reconnect. The old client's
+     * dispatcher thread pool and connection pool are shut down explicitly -- without this we
+     * reintroduce the exact leak the shared-client design (above) fixed.
+     */
+    @Synchronized
+    fun reloadTls() {
+        val old = http
+        http = buildClient()
+        old.dispatcher.executorService.shutdown()
+        old.connectionPool.evictAll()
+        reconfigure()
     }
 
     /**
@@ -149,5 +191,14 @@ object Feed {
 
     fun onNetworkAvailable() {
         client.value?.onNetworkAvailable()
+    }
+
+    /**
+     * Drop the held frame after an account switch, so the UI stops showing the previous account's
+     * book. Safe if there is no client yet (nothing to clear). The socket stays up; the next frame
+     * refills `snapshot`.
+     */
+    fun invalidateSnapshot() {
+        client.value?.clearSnapshot()
     }
 }

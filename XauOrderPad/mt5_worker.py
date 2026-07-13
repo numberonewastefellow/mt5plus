@@ -611,6 +611,23 @@ class Mt5Worker:
 
     def _place_order(self, cmd: dict) -> dict:
         """Unified entry for the new UI: market or pending(limit)."""
+        # Auto-Test live-account guard, AUTHORITATIVE copy. The HTTP handler also checks, but it
+        # reads worker.get_state() -- a snapshot up to one poll (~67 ms) stale -- so a demo->REAL
+        # switch immediately followed by an auto_test order could pass the guard against the
+        # PREVIOUS account. Here we are on the worker thread and can read the LIVE account, which
+        # closes that window. trade_mode 2 = REAL; None/unknown is refused too (fail safe).
+        if cmd.get("auto_test"):
+            acc = mt5.account_info()
+            tmode = int(getattr(acc, "trade_mode", 2)) if acc is not None else None
+            if tmode != 0 and tmode != 1:      # allow only demo(0) / contest(1)
+                log.error("auto_test order refused on non-demo account (live check)", extra={
+                    "event": "auto_test_refused_live_account_worker",
+                    "trade_mode": tmode,
+                    "login": getattr(acc, "login", None),
+                })
+                return {"ok": False, "auto_test_refused": True,
+                        "error": f"auto_test refused: account trade_mode={tmode} is not demo"}
+
         typ = (cmd.get("type") or "market").lower()
         side = (cmd.get("side") or "").lower()
         if side not in ("buy", "sell"):

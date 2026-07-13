@@ -236,6 +236,14 @@ data class LoginResult(
     @SerialName("is_demo") val isDemo: Boolean? = null,
     /** Positions left open on the PREVIOUS account when switching. Must be surfaced. */
     @SerialName("prev_open") val prevOpen: Int? = null,
+    /**
+     * Set ONLY when the client asked to save (ad-hoc login with save=true); null otherwise.
+     * `false` means the login worked but the password was NOT stored on the server -- so this
+     * account cannot be auto-restored, and the user must be told plainly rather than shown a
+     * bare success. `saveError` carries the reason. See server.py's login handler.
+     */
+    val saved: Boolean? = null,
+    @SerialName("save_error") val saveError: String? = null,
 )
 
 /**

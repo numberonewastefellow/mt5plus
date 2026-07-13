@@ -88,57 +88,85 @@ API_TOKEN = os.environ.get("XAUORDERPAD_TOKEN", "")
 The defaults reproduce the original behaviour exactly — loopback bind, no auth — so a plain
 `python server.py` on the desktop is unchanged.
 
-**There are exactly two legitimate binds.**
+**On the EC2 box there is exactly ONE legitimate bind: `127.0.0.1`.**
 
-- `127.0.0.1` (the default) — desktop use, reachable only through the SSH tunnel.
-- The box's **Tailscale** address (`100.x.y.z`), so the Android client can reach it over WireGuard.
-  8765 still stays closed in the security group; the tailnet is the only path in. A Tailscale
-  address is *not* a public bind.
+Caddy is the only process on a public address. uvicorn stays on loopback, and that is what makes the
+deployment fail closed (see below). On a *desktop*, `0.0.0.0` is reasonable — it means "the LAN",
+behind your router's NAT, and `HOW_TO_RUN.md` documents it with a mandatory token. **On the box it
+means "the internet"**, bypassing TLS and client-cert auth entirely. Never set it there.
 
-**`0.0.0.0` never is.** That publishes a trading API to the internet.
+### Reaching the box from the phone — mutual TLS
 
-### Reaching the box from the phone
+The phone reaches the box **over the public internet**, on port **8443**, and must present a
+**client certificate** signed by our own private CA. Without one it is dropped **during the TLS
+handshake**.
 
-**The Android app needs no change and no rebuild to point somewhere else.** It follows whatever
-`host:port` you type on its Connect screen — `Secrets.normalizeBaseUrl` only appends `:8765` when
-you leave the port off, so `100.101.102.103:9000` is honoured exactly as typed. Changing where it
-connects is a *setting*, not a build.
+That last sentence is the whole design. A scanner that finds the open port never speaks HTTP, never
+reaches FastAPI, never reaches the token check, and never touches a line of MT5 code. The exposed
+attack surface is the TLS stack, not the application.
 
-What does **not** work is the obvious move: pointing it at the box's **public IP** and opening the
-port. That will simply time out, because `8765` is never in the security group — only `22` and
-`3389`, and only to your home IP (`deploy/mt5_ec2.py:20`).
+**Why not just a server certificate + the API token?** Because the token is a **bearer** secret:
+anything that obtains it — a log line, a phone backup, a screenshot — can place orders. A client
+certificate's private key never leaves the phone, so there is nothing replayable to intercept. The
+token stays as a *second* factor: the certificate authenticates the **device**, the token authorises
+the **call**, and the token can be rotated without reissuing certificates.
 
-> ⚠ **Do not "fix" that by opening 8765.** The transport is **plain HTTP**. The API token grants
-> **order placement on whatever account MT5 is logged into** — so opening the port puts that token
-> on the open internet in cleartext, in front of a live-trading API. This is the single most
-> damaging change anyone could make to this deployment, and it is also the most tempting one.
+**Why it costs nothing at runtime**, which matters for a low-latency app: TLS 1.3 is a 1-RTT
+handshake and a client certificate adds no extra round trip. The quote feed is a **single long-lived
+WebSocket**, so the handshake is paid *once*; steady-state cost is AES-GCM, i.e. microseconds. It is
+a connection-level control, not a per-request one.
 
-**Use Tailscale instead.** It gives the phone a route in *without* exposing anything:
+#### TLS terminates in Caddy, not in uvicorn
 
-1. On the box — bind to the tailnet address and set a token. The security group stays untouched:
+```
+phone ──TLS 1.3 + client cert──► :8443  Caddy  ──plain HTTP──► 127.0.0.1:8765  uvicorn
+   (internet)                    (mTLS gate)      (loopback)
+```
 
-   ```powershell
-   $env:XAUORDERPAD_HOST  = "100.101.102.103"   # the box's Tailscale address, NOT its public IP
-   $env:XAUORDERPAD_TOKEN = "<strong random string>"
-   $env:XAUORDERPAD_PORT  = "8765"              # optional; this is the default
-   .venv\Scripts\python.exe server.py
-   ```
+Three properties follow, and they are the reason for the split:
 
-   The startup banner prints the exact URL to type into the app, and shouts if the bind is
-   non-loopback with no token.
-2. Install **Tailscale** on the phone and join the same tailnet.
-3. In the app: **LOGOUT** → enter `100.101.102.103:8765` and the token → **CONNECT**.
+- **`server.py` is unchanged.** No `ssl_keyfile`, no new dependency, no new failure mode in the
+  trading path.
+- **The SSH tunnel still works** for the browser UI, which hits uvicorn directly. Had uvicorn itself
+  enforced mTLS, the browser would need a client certificate too — uvicorn binds exactly ONE address.
+- **It fails CLOSED.** uvicorn stays on `127.0.0.1`, so if Caddy is down, misconfigured, or not yet
+  started, the trading API is **unreachable** — rather than reachable *without* TLS, which is what a
+  `0.0.0.0` bind would give you. `ship.ps1` and `caddy_setup.ps1` both assert the loopback bind and
+  refuse to report success if it has moved.
 
-WireGuard is the encryption layer, so cleartext HTTP inside the tunnel is fine. A Tailscale
-address is *not* a public bind.
+#### The private CA is a feature, not a compromise
 
-**Optional hardening — MagicDNS.** If you point the app at the box's MagicDNS name
-(`<box>.<tailnet>.ts.net`) instead of a raw `100.x.y.z`, you can delete
-`cleartextTrafficPermitted="true"` from `base-config` in
-`android/app/src/main/res/xml/network_security_config.xml`. Cleartext is then scoped to `ts.net`
-only, and **the platform itself refuses a mistyped public URL** rather than sending your token in
-the clear. That file explains the trade-off in full; it is left permissive by default only because
-a raw tailnet IP is the likelier thing to type on a phone.
+The app is configured to trust **our CA and nothing else**, so **no public CA can mis-issue a
+certificate for this service** — not a compromised one, not a coerced one. That is strictly stronger
+than a Let's Encrypt certificate. The price is that we distribute `ca.crt` ourselves, which is what
+the app's Settings → Certificates screen is for: **certificates are uploaded at runtime, never baked
+into the APK**, so rotating one does not mean rebuilding and reinstalling the app.
+
+**`ca.key` never leaves the laptop.** It mints client identities; anyone holding it can issue
+themselves a certificate this server accepts. It is not on the box and it is gitignored.
+
+#### Why an Elastic IP is mandatory
+
+A certificate is bound to an **address** (`subjectAltName = IP:…`), and the auto-assigned public IP
+**changes on every stop/start**. A certificate minted today would stop verifying tomorrow — failing
+as an *opaque TLS handshake error* that reads like a network fault, not like the expired-address
+problem it actually is. Hence `mt5_ec2.py eip`.
+
+The SAN must be an **IP** entry, not a DNS name or a bare CN: OkHttp verifies an IP-literal URL
+against `iPAddress` SANs only.
+
+#### Two traps this design walked into
+
+- **Caddy enables `strict_sni_host` automatically once client auth is configured.** It then requires
+  the `Host` header to match the TLS SNI — but a client connecting to a bare **IP sends no SNI at
+  all**. Every request is answered **421 Misdirected Request** while the handshake and the client
+  certificate both succeed. It looks exactly like an application bug. `strict_sni_host insecure_off`
+  is correct here: it guards against vhost confusion across *multiple name-based sites*, and there
+  is one site, reached by IP.
+- **The API token rides in the WebSocket query string** (`/ws?token=…` — a browser cannot set headers
+  on a WS handshake). Caddy's access log records the full URI, so leaving it on writes a live trading
+  credential to disk in cleartext. The log is switched off; `server.py` already redacts the uvicorn
+  side (`_RedactToken`).
 
 **`API_TOKEN` is REQUIRED whenever `HOST` is not loopback.** The web UI understands it: it prompts
 once at load (via the unauthenticated `GET /api/config` probe, which reports *that* a token is

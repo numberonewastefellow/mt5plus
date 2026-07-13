@@ -1,29 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The server speaks PLAIN HTTP. That is not an oversight and it is not insecure here:
-  WireGuard (Tailscale) is the encryption layer. The box binds 8765 to its tailnet
-  address only, port 8765 is never opened in the EC2 security group, and the traffic
-  never touches the public internet unencrypted.
+  Two servers, deliberately different transports:
 
-  ── An honest limitation ──
-  Android's network security config CANNOT express a CIDR range, so we cannot scope
-  cleartext to Tailscale's 100.64.0.0/10 CGNAT block. Scoping is only possible by
-  HOSTNAME.
+    LAN dev server   http://192.168.x.x:8765   plain HTTP  (a fixed API token guards it)
+    EC2 box          https://<elastic-ip>:8443  mutual TLS (client cert + token)
 
-  Two ways to run this, in order of preference:
+  Cleartext is permitted below because the LAN case needs it and Android's network security
+  config CANNOT express a CIDR range (it can scope cleartext only by hostname), and the LAN IP
+  is numeric and changes. So we cannot say "cleartext for 192.168.0.0/16 only".
 
-  1. PREFERRED — point the app at the box's MagicDNS name (e.g. `mt5-box.tailnet-abc.ts.net`).
-     The `ts.net` domain-config below then permits cleartext for tailnet hosts and
-     NOTHING ELSE: a typo'd public URL would be refused by the platform rather than
-     sending an API token in the clear over the internet.
+  == What actually protects the scary secret ==
+  The broker PASSWORD is never sent over cleartext: TradingViewModel.loginWith() BLOCKS (not just
+  warns) when passwordInClear(baseUrl) is true, so adding an account requires https (EC2) or
+  loopback. What crosses the LAN in the clear is the API token (the user's accepted risk for a
+  fixed-token dev server) plus market data and trade commands, not a broker credential.
 
-  2. FALLBACK — a raw `100.x.y.z` IP. This requires the permissive base-config below.
-     It works, but the platform can no longer stop a mis-typed address from being
-     contacted in cleartext.
+  The EC2 path does NOT rely on this file: OkHttp is configured with a custom SSLSocketFactory +
+  X509TrustManager (trusting our private CA only) and a client certificate, which OVERRIDES the
+  trust-anchors here for those calls. See net/Tls.kt / data/CertStore.kt.
 
-  If you commit to MagicDNS, delete `cleartextTrafficPermitted="true"` from base-config
-  and this becomes genuinely scoped. It is left permissive by default only because a raw
-  Tailscale IP is the more likely thing to be typed on a phone.
+  If this app ever drops the LAN case and talks only to the EC2 box, delete
+  cleartextTrafficPermitted below and cleartext is refused platform-wide.
+
+  (Tailscale/WireGuard was an earlier design and has been removed; mutual TLS replaced it.)
 -->
 <network-security-config>
 
@@ -32,10 +31,5 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-
-    <!-- Tailscale MagicDNS names. Cleartext here is carried inside WireGuard. -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">ts.net</domain>
-    </domain-config>
 
 </network-security-config>

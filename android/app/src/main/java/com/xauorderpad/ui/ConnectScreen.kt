@@ -55,10 +55,10 @@ fun ConnectScreen(
             value = url,
             onValueChange = { url = it },
             label = { Text("Server address") },
-            // The Tailscale IP, not the EC2 public IP. The public one changes on every
-            // start of the box; the tailnet address is stable, which is the whole reason
-            // the app points at it.
-            placeholder = { Text("100.x.y.z:8765") },
+            // Two real targets: a LAN dev server (http://192.168.x.x:8765, plain HTTP) or the EC2
+            // box (https://<elastic-ip>:8443, mutual TLS). Type the scheme+port for EC2; a bare
+            // host defaults to http://host:8765 for the LAN case.
+            placeholder = { Text("192.168.0.116:8765  or  https://<ip>:8443") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             modifier = Modifier.fillMaxWidth(),
@@ -84,10 +84,13 @@ fun ConnectScreen(
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            // Pre-empt the obvious question. The broker password is a much scarier
-            // secret than the API token, and it genuinely never comes here.
-            "Your MT5 broker password is never entered here. The server holds it in the "
-                + "Windows Credential Vault; the phone only picks which saved account to use.",
+            // Accurate scope: no broker password on THIS screen. It is entered on the Accounts
+            // screen when you add an account, sent to the server once, and stored in the server's
+            // credential vault -- after that the phone logs in by saved account. (It used to say
+            // the password "never comes to the phone", which the account feature made false.)
+            "This screen takes only the API token. Your MT5 broker password is entered on the "
+                + "Accounts screen when adding an account, sent once, and kept in the server's "
+                + "credential vault — not stored on the phone.",
             fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

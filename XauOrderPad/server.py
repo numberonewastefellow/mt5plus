@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -140,9 +142,11 @@ def _print_banner() -> None:
             "    Network:  NOT REACHABLE -- bound to 127.0.0.1 (loopback only).",
             "              A phone CANNOT connect. This is not a firewall issue: the",
             "              socket does not exist on your Wi-Fi interface.",
-            "              Fix (desktop, phone on the same Wi-Fi): XAUORDERPAD_HOST=0.0.0.0",
-            "              Fix (EC2 box): XAUORDERPAD_HOST=<the 100.x.y.z Tailscale address>.",
-            "              Never 0.0.0.0 on EC2 -- that publishes a trading API to the internet.",
+            "              Desktop + phone on the same Wi-Fi: set BOTH",
+            "                  XAUORDERPAD_HOST=0.0.0.0  AND  XAUORDERPAD_TOKEN=<secret>",
+            "              (the server now REFUSES to start on a network bind with no token).",
+            "              EC2: do NOT bind the network here -- the mTLS front door (Caddy on",
+            "              8443) is the only way in; uvicorn stays on loopback. See deploy/README.",
         ]
     elif dialable:
         lines.append(f"    Network:  http://{dialable}:{port}     <-- type this into the Android app")
@@ -165,8 +169,30 @@ def _print_banner() -> None:
     print("\n".join(lines), flush=True)
 
 
+def _require_auth_when_networked() -> None:
+    """Refuse to start a trading API on the network with no token.
+
+    API_TOKEN == "" disables auth. That is fine on loopback (only this machine can reach it, and
+    it is how a plain `python server.py` on the desktop has always worked), and catastrophic on
+    any other bind: the process places REAL orders, so an unauthenticated network socket lets any
+    device on the LAN -- or the internet, on 0.0.0.0 -- trade the account and flatten the book.
+
+    The banner used to only WARN about this and even recommended 0.0.0.0. Warnings are not
+    controls. Same fail-closed posture the Caddy/mTLS design already takes: die instead."""
+    loopback = config.HOST in ("127.0.0.1", "localhost", "::1")
+    if not loopback and not config.API_TOKEN:
+        raise SystemExit(
+            f"REFUSING TO START: bound to {config.HOST} (reachable off this machine) with no "
+            f"XAUORDERPAD_TOKEN set. That is an unauthenticated trading API on the network. "
+            f"Set XAUORDERPAD_TOKEN, or bind 127.0.0.1 for loopback-only use."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail closed BEFORE the worker starts or the socket serves: a networked bind with no token
+    # is refused outright, not merely warned about.
+    _require_auth_when_networked()
     # `server_started` is the first event of the run. Subsequent events
     # (orders, account snapshots, etc.) can be filtered against this line's
     # `pid` field to attribute everything to the right process instance.
@@ -203,6 +229,65 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="XauOrderPad", lifespan=lifespan)
+
+
+# Extra browser origins allowed to call this API, comma-separated (e.g. a dev tool on another
+# port). Empty by default -- same-origin and loopback are always allowed without listing them.
+_ALLOWED_ORIGINS = {
+    o.strip().rstrip("/").lower()
+    for o in os.environ.get("XAUORDERPAD_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+}
+
+
+def _origin_allowed(origin: str | None, host: str | None) -> bool:
+    """Reject cross-site browser requests; wave through everything without an Origin.
+
+    The threat is CSRF: /close_all and /api/logout take no body, so a plain cross-origin HTML
+    form POST reaches them with no preflight, and /ws leaks the account to any site (WebSocket
+    handshakes are exempt from CORS). There is no other Origin/CSRF control anywhere.
+
+    A browser ALWAYS attaches Origin on a cross-site request. Native clients -- the Android app's
+    OkHttp, curl, the server's own tools -- send NONE, so `origin is None` must pass or we lock
+    out the very clients this API is for. When Origin IS present it must be same-origin (its
+    host:port equals the request's Host), loopback, or explicitly allow-listed.
+    """
+    if not origin:
+        return True                       # no browser => no CSRF vector
+    o = origin.strip().rstrip("/").lower()
+    if o in _ALLOWED_ORIGINS:
+        return True
+    try:
+        from urllib.parse import urlsplit
+        oh = urlsplit(o).hostname
+    except Exception:
+        return False
+    if oh in ("127.0.0.1", "localhost", "::1"):
+        return True
+    # Same-origin: the Origin's authority matches the Host header the request arrived with.
+    if host and o.split("://", 1)[-1] == host.strip().lower():
+        return True
+    return False
+
+
+@app.middleware("http")
+async def _origin_guard(request, call_next):
+    if not _origin_allowed(request.headers.get("origin"), request.headers.get("host")):
+        return JSONResponse(status_code=403, content={"detail": "cross-origin request refused"})
+    return await call_next(request)
+
+
+@app.exception_handler(RequestValidationError)
+async def _redacted_validation_error(request, exc: RequestValidationError):
+    """FastAPI's default 422 body echoes the SUBMITTED INPUT back to the caller. Pydantic v2 puts
+    the whole request body in each error's `input`, so a POST /api/login or /api/accounts that
+    fails validation (e.g. a missing `server`) returns the broker PASSWORD verbatim in the
+    response. Strip `input` from every error before it leaves the process.
+
+    The field locations and messages are kept -- that is what makes a 422 useful to the client
+    (Api.parseError reads them) -- only the echoed values are dropped."""
+    errors = [{k: v for k, v in e.items() if k != "input"} for e in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 class OrderReq(BaseModel):
@@ -292,6 +377,11 @@ class StrategyReq(BaseModel):
 # profiles.json, where it becomes a profile you can never log into and can only delete by hand.
 _LOGIN_MIN, _LOGIN_MAX = 1, 999_999_999_999
 
+# Length caps on the free-text account fields. `login` is bounded above; these were not, so a
+# client could post a multi-megabyte label/server/password to be written into profiles.json or the
+# credential vault. Generous vs any real broker value (servers/passwords are short), finite vs abuse.
+_LABEL_MAX, _SERVER_MAX, _PASSWORD_MAX = 120, 120, 256
+
 
 def _validated_server(v: str | None) -> str | None:
     """Broker server name: collapse whitespace, reject empty.
@@ -314,14 +404,19 @@ class ProfileReq(BaseModel):
     """Save (or overwrite) a saved account profile. The password is stored in
     the OS credential vault by accounts.save_profile; it is never persisted to
     profiles.json and never logged."""
-    label: str | None = None
+    label: str | None = Field(default=None, max_length=_LABEL_MAX)
     login: int = Field(ge=_LOGIN_MIN, le=_LOGIN_MAX)
     # min_length=1: an empty password would be stored in the vault and then fail every login
     # with an opaque broker error. NOT stripped -- an MT5 password may legitimately contain
     # spaces, and silently trimming a user's password is how you lock them out of their account.
-    password: str = Field(min_length=1)
-    server: str
-    path: str | None = None
+    password: str = Field(min_length=1, max_length=_PASSWORD_MAX)
+    server: str = Field(max_length=_SERVER_MAX)
+    # NOTE: there is deliberately NO `path` field. It used to exist here and on LoginReq, flowed
+    # unvalidated into mt5.initialize(path=...), and that call LAUNCHES the named executable -- so a
+    # UNC path (\\attacker\share\evil.exe) on this otherwise-unauthenticated API was remote code
+    # execution, then persisted to profiles.json and replayed on every login and auto-restore. The
+    # terminal path comes from config.MT5_PATH (env XAUORDERPAD_MT5_PATH on the box); a client must
+    # never be able to choose which binary the server runs.
 
     @field_validator("server")
     @classmethod
@@ -332,13 +427,13 @@ class ProfileReq(BaseModel):
 class LoginReq(BaseModel):
     """Log in / switch account. Either reference a saved `profile_id`, or pass
     ad-hoc `login`/`password`/`server` (optionally `save=True` to remember)."""
-    profile_id: str | None = None
+    profile_id: str | None = Field(default=None, max_length=_SERVER_MAX + 24)
     login: int | None = Field(default=None, ge=_LOGIN_MIN, le=_LOGIN_MAX)
-    password: str | None = None
-    server: str | None = None
-    path: str | None = None
+    password: str | None = Field(default=None, max_length=_PASSWORD_MAX)
+    server: str | None = Field(default=None, max_length=_SERVER_MAX)
+    # No `path` -- see ProfileReq. The client does not get to pick the executable.
     save: bool = False
-    label: str | None = None
+    label: str | None = Field(default=None, max_length=_LABEL_MAX)
 
     @field_validator("server")
     @classmethod
@@ -346,8 +441,17 @@ class LoginReq(BaseModel):
         return _validated_server(v)
 
 
+def _token_ok(token: str | None) -> bool:
+    """Constant-time token comparison. `==` on secrets leaks length and prefix through timing;
+    hmac.compare_digest does not. Empty API_TOKEN means the check is disabled (loopback dev) --
+    but the startup guard below refuses to run in that state on a non-loopback bind."""
+    if not config.API_TOKEN:
+        return True
+    return isinstance(token, str) and hmac.compare_digest(token, config.API_TOKEN)
+
+
 def _check_token(token: str | None) -> None:
-    if config.API_TOKEN and token != config.API_TOKEN:
+    if not _token_ok(token):
         raise HTTPException(status_code=401, detail="bad or missing token")
 
 
@@ -467,8 +571,8 @@ def list_accounts(x_token: str | None = Header(default=None)):
 def save_account(req: ProfileReq, x_token: str | None = Header(default=None)):
     _check_token(x_token)
     try:
-        return accounts.save_profile(req.label, req.login, req.password,
-                                     req.server, req.path or "")
+        # No path: profiles never carry a client-supplied executable path any more.
+        return accounts.save_profile(req.label, req.login, req.password, req.server)
     except RuntimeError as exc:           # keyring backend unavailable -> fail closed
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -558,8 +662,10 @@ async def _restore_session(prev: dict) -> str | None:
                   extra={"event": "session_restore_impossible", "profile": pid})
         return None
     try:
+        # No "path": the worker falls back to config.MT5_PATH. Any path left in an old
+        # profiles.json is deliberately ignored -- it must not be able to launch a chosen binary.
         res = await _do({"action": "login", "login": prof["login"], "password": pw,
-                         "server": prof["server"], "path": prof.get("path") or None})
+                         "server": prof["server"]})
     except Exception:
         log.exception("session restore failed",
                       extra={"event": "session_restore_failed", "profile": pid})
@@ -591,7 +697,6 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
 
     async with _account_lock:
         login_id, password, server = req.login, req.password, req.server
-        path = req.path
 
         if req.profile_id:
             prof = accounts.get_profile(req.profile_id)
@@ -599,7 +704,6 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
                 raise HTTPException(status_code=404,
                                     detail=f"profile {req.profile_id!r} not found")
             login_id, server = prof["login"], prof["server"]
-            path = prof.get("path") or None
             password = accounts.get_password(req.profile_id)
             if not password:
                 raise HTTPException(
@@ -614,8 +718,9 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
         # reading it here -- rather than trusting a remembered value -- is what keeps it true.
         prev = _live_account()
 
+        # No "path": the worker uses config.MT5_PATH. A client never chooses the executable.
         res = await _do({"action": "login", "login": login_id,
-                         "password": password, "server": server, "path": path})
+                         "password": password, "server": server})
 
         if not res.get("ok"):
             err = res.get("error") or "login failed"
@@ -632,13 +737,21 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
                            f"could not be restored). Log in again.")
             raise HTTPException(status_code=400, detail=err)
 
-        # Persist on ad-hoc login if asked; best-effort (the login already succeeded).
+        # Persist on ad-hoc login if asked. The login already succeeded, so a save failure is not
+        # fatal -- but it must NOT be swallowed. It used to be caught and dropped with a log line,
+        # so the client saw a plain 200 and told the user "stored on the server" when nothing was
+        # stored. That matters: an unsaved account cannot be restored by _restore_session, so the
+        # next failed login takes the terminal off the market with no way back. Report the outcome.
         if req.save and not req.profile_id:
             try:
                 accounts.save_profile(req.label, login_id, password, server,
-                                      path or "", res.get("trade_mode"))
-            except RuntimeError:
-                log.warning("login ok but profile not saved (no keyring backend)")
+                                      last_trade_mode=res.get("trade_mode"))
+                res["saved"] = True
+                res["save_error"] = None
+            except RuntimeError as exc:
+                log.warning("login ok but profile not saved: %s", exc)
+                res["saved"] = False
+                res["save_error"] = str(exc)
         elif req.profile_id:
             try:
                 accounts.update_trade_mode(req.profile_id, res.get("trade_mode"))
@@ -782,17 +895,28 @@ async def close_where(req: CloseWhereReq,
 def client_config():
     """Unauthenticated capability probe, so a client knows whether to ask the
     user for a token BEFORE it fires a request and eats a 401. Deliberately
-    leaks nothing: it reports THAT a token is required, never what it is."""
-    return {"auth_required": bool(config.API_TOKEN), "poll_hz": int(config.POLL_HZ)}
+    leaks nothing: it reports THAT a token is required, never what it is.
+
+    `keyring_ok` lets the client decide UP FRONT whether "Remember this account" can work, rather
+    than accept the save, get a 200, and only then find it was silently dropped. On the EC2 box
+    the server runs as a session-0 Scheduled Task where a DPAPI vault can be unusable."""
+    return {
+        "auth_required": bool(config.API_TOKEN),
+        "poll_hz": int(config.POLL_HZ),
+        "keyring_ok": accounts.keyring_ok(),
+    }
 
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket, token: str | None = None, hz: float | None = None):
     """Live state stream.
 
-    `token` is a QUERY PARAM, not a header, because the browser's WebSocket API
-    cannot set headers on the handshake. OkHttp can, but using one mechanism for
-    both clients keeps this from silently diverging.
+    The token is taken from the `x-token` HEADER if present, else the `token` QUERY PARAM.
+    Native clients (the Android app's OkHttp) send the header -- which never lands in an access
+    log. Browsers cannot set headers on a WebSocket handshake, so the web UI still uses the query
+    param; that path is covered by the log-redaction filter here and by Caddy's query-redacting
+    log on the box. Preferring the header keeps the secret out of the URL wherever the client can
+    manage it.
 
     Auth here is not optional paranoia: this stream carries balance, equity and
     every open position. Before this check existed, `/ws` was readable by anyone
@@ -811,7 +935,17 @@ async def ws(websocket: WebSocket, token: str | None = None, hz: float | None = 
     # against a server that will never let it in. Accepting costs nothing: we send no
     # state before closing.
     await websocket.accept()
-    if config.API_TOKEN and token != config.API_TOKEN:
+    # CSRF: a browser on a malicious page can open a WebSocket to us (handshakes are exempt from
+    # CORS), and would then stream balance/equity/positions to that page. The HTTP middleware does
+    # not run for the /ws route, so the same Origin check is enforced here. Native clients send no
+    # Origin and pass. Closed with 4403 (app-level "forbidden"), distinct from the 4401 token code.
+    if not _origin_allowed(websocket.headers.get("origin"), websocket.headers.get("host")):
+        await websocket.close(code=4403)
+        return
+    # Header wins over the query param -- see the docstring. A native client that sends the header
+    # never puts the token in the URL.
+    ws_token = websocket.headers.get("x-token") or token
+    if not _token_ok(ws_token):
         await websocket.close(code=4401)   # 4401: app-level "unauthorized"
         return
 
@@ -874,7 +1008,43 @@ app.mount("/legacy", StaticFiles(directory=str(STATIC_DIR), html=True), name="le
 app.mount("/", StaticFiles(directory=str(WEBUI_DIR), html=True), name="webui")
 
 
+def _use_selector_loop_on_windows() -> None:
+    """Do not let Windows' Proactor event loop serve this.
+
+    ── Measured, in this project, with a phone on the Wi-Fi ──
+
+    asyncio's default loop on Windows is the Proactor loop. Its accept() path surfaces transient
+    network errors as OSError, and when one lands the accept loop **stops accepting for good**:
+
+        Accept failed on a socket
+        socket: <TransportSocket fd=1208, laddr=('0.0.0.0', 8765)>
+        OSError: [WinError 64] The specified network name is no longer available
+
+    The process does not exit. The MT5 worker is a separate thread, so it keeps polling, keeps
+    logging "account snapshot" once a minute, and keeps the broker session alive. Everything
+    looks healthy. The HTTP port simply never answers again -- not even on loopback.
+
+    That is the worst failure shape a trading server has: up, connected to the broker, holding
+    your positions, and unreachable. The phone shows a stale feed and no reason. Any client that
+    was mid-order gets nothing back.
+
+    WinError 64 is exactly what a phone roaming between Wi-Fi and cellular produces -- i.e. the
+    normal operating condition of this app. It happened within minutes of a phone connecting.
+
+    The Selector loop handles a failed accept per-connection and carries on serving, which is the
+    behaviour every other platform already has. Its limits (no subprocess support, ~512 sockets)
+    are irrelevant to a single-user order pad.
+    """
+    if sys.platform != "win32":
+        return
+    policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy is not None:
+        asyncio.set_event_loop_policy(policy())
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="info")
+    _use_selector_loop_on_windows()
+    # loop="asyncio" makes uvicorn honour the policy set above rather than picking its own.
+    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="info", loop="asyncio")

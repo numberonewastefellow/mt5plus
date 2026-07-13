@@ -2,11 +2,13 @@ package com.xauorderpad.net
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -59,7 +61,9 @@ sealed interface ApiResult<out T> {
  * (one connection pool, one dispatcher thread pool) -- see Feed.
  */
 class Api(
-    private val http: OkHttpClient,
+    // A supplier, not an instance: the client is rebuilt when a TLS certificate is uploaded or
+    // cleared (Feed.reloadTls), and every call must use the CURRENT client. Read it fresh per call.
+    private val http: () -> OkHttpClient,
     private val baseUrl: () -> String,
     private val token: () -> String,
 ) {
@@ -74,9 +78,11 @@ class Api(
      * situation in which someone taps CLOSE ALL -- can outlast 15 s while the server is still
      * making progress.
      *
-     * newBuilder() shares the connection pool and dispatcher, so this costs nothing.
+     * newBuilder() shares the connection pool and dispatcher, so this costs nothing. Derived from
+     * the CURRENT client per call (a function, not a stored val) so a certificate upload that
+     * rebuilds Feed.http is picked up here too.
      */
-    private val tradeHttp: OkHttpClient = http.newBuilder()
+    private fun tradeHttp(): OkHttpClient = http().newBuilder()
         .callTimeout(60, TimeUnit.SECONDS)
         .build()
 
@@ -110,13 +116,13 @@ class Api(
             put("sl", JsonPrimitive(slPoints))
             put("tp", JsonPrimitive(tpPoints))
         },
-        client = tradeHttp,
+        client = tradeHttp(),
     ) { json.decodeFromString<OrderResult>(it) }
 
     suspend fun close(ticket: Long): ApiResult<Unit> = post(
         path = "/close",
         body = buildJsonObject { put("ticket", JsonPrimitive(ticket)) },
-        client = tradeHttp,
+        client = tradeHttp(),
     ) { }
 
     /**
@@ -142,7 +148,7 @@ class Api(
             params.forEach { (k, v) -> put(k, v) }
             if (enabled != null) put("enabled", JsonPrimitive(enabled))
         },
-        client = tradeHttp,
+        client = tradeHttp(),
     ) { json.decodeFromString<StrategyStatus>(it) }
 
     /**
@@ -172,7 +178,7 @@ class Api(
         val r = post(
             path = "/close_where",
             body = buildJsonObject { put("filter", JsonPrimitive(filter)) },
-            client = tradeHttp,
+            client = tradeHttp(),
         ) { json.decodeFromString<CloseResult>(it) }
 
         if (r is ApiResult.Ok && !r.value.ok) {
@@ -204,7 +210,7 @@ class Api(
     suspend fun login(profileId: String): ApiResult<LoginResult> = post(
         path = "/api/login",
         body = buildJsonObject { put("profile_id", JsonPrimitive(profileId)) },
-        client = tradeHttp,
+        client = tradeHttp(),
     ) { json.decodeFromString<LoginResult>(it) }
 
     /**
@@ -233,20 +239,20 @@ class Api(
         login: Long,
         password: String,
         server: String,
-        path: String?,
         save: Boolean,
         label: String?,
     ): ApiResult<LoginResult> = post(
         path = "/api/login",
+        // No `path` field: the server no longer accepts one (it used to launch that executable).
+        // The terminal path lives in the server's config; a client must not choose the binary.
         body = buildJsonObject {
             put("login", JsonPrimitive(login))
             put("password", JsonPrimitive(password))
             put("server", JsonPrimitive(server))
-            path?.takeIf { it.isNotBlank() }?.let { put("path", JsonPrimitive(it)) }
             put("save", JsonPrimitive(save))
             label?.takeIf { it.isNotBlank() }?.let { put("label", JsonPrimitive(it)) }
         },
-        client = tradeHttp,
+        client = tradeHttp(),
     ) { json.decodeFromString<LoginResult>(it) }
 
     /**
@@ -261,13 +267,16 @@ class Api(
      * addPathSegment() percent-encodes the segment, so the id arrives intact whatever is in it.
      */
     suspend fun deleteAccount(profileId: String): ApiResult<DeleteResult> {
-        val url = (baseUrl() + "/api/accounts").toHttpUrl()
-            .newBuilder()
-            .addPathSegment(profileId)
-            .build()
+        // toHttpUrl() also throws on a malformed base URL, so it is built inside the thunk too.
         return execute(
-            Request.Builder().url(url).delete(),
-            http,
+            {
+                val url = (baseUrl() + "/api/accounts").toHttpUrl()
+                    .newBuilder()
+                    .addPathSegment(profileId)
+                    .build()
+                Request.Builder().url(url).delete()
+            },
+            http(),
             "/api/accounts/$profileId",
         ) { json.decodeFromString<DeleteResult>(it) }
     }
@@ -281,29 +290,32 @@ class Api(
     suspend fun logout(): ApiResult<LogoutResult> = post(
         path = "/api/logout",
         body = JsonObject(emptyMap()),
-        client = tradeHttp,
+        client = tradeHttp(),
     ) { json.decodeFromString<LogoutResult>(it) }
 
     // ---- plumbing --------------------------------------------------------
 
     private suspend fun <T> get(path: String, parse: (String) -> T): ApiResult<T> =
-        execute(Request.Builder().url(baseUrl() + path).get(), http, path, parse)
+        execute({ Request.Builder().url(baseUrl() + path).get() }, http(), path, parse)
 
     private suspend fun <T> post(
         path: String,
         body: JsonObject,
-        client: OkHttpClient = http,
+        client: OkHttpClient = http(),
         parse: (String) -> T,
     ): ApiResult<T> = execute(
-        Request.Builder().url(baseUrl() + path)
-            .post(body.toString().toRequestBody(JSON_MEDIA)),
+        { Request.Builder().url(baseUrl() + path).post(body.toString().toRequestBody(JSON_MEDIA)) },
         client,
         path,
         parse,
     )
 
     private suspend fun <T> execute(
-        builder: Request.Builder,
+        // A THUNK, not a built Request.Builder: `.url(baseUrl() + path)` throws
+        // IllegalArgumentException on a malformed base URL, and it used to run at the CALL SITE,
+        // outside this try -- so a bad URL escaped as an uncaught exception and crashed the app
+        // instead of becoming ApiResult.Failed. Building here folds that into the catch below.
+        buildRequest: () -> Request.Builder,
         client: OkHttpClient,
         path: String,
         parse: (String) -> T,
@@ -311,9 +323,10 @@ class Api(
         // Read the token at SEND time, not at construction: it can change under us when the
         // user re-enters it, and a retry must use the new one.
         val tok = token()
-        if (tok.isNotBlank()) builder.header("x-token", tok)
 
         try {
+            val builder = buildRequest()
+            if (tok.isNotBlank()) builder.header("x-token", tok)
             client.newCall(builder.build()).execute().use { res ->
                 val text = res.body?.string().orEmpty()
                 when {
@@ -339,11 +352,13 @@ class Api(
      *   /order        -> 400, `detail` is an OBJECT: {message, retcode, comment}
      *   /close        -> 400, `detail` is a STRING
      *   /close_where  -> 400, `detail` is a STRING
+     *   422           -> `detail` is an ARRAY of {loc, msg, type} (FastAPI/Pydantic validation)
      *   403           -> plain string (the auto_test live-account guard; we never send that
      *                    flag, but a stale build might)
      *
-     * Assuming either shape alone throws on the other -- which would turn a plain broker
-     * rejection ("Market closed") into an opaque crash-shaped toast.
+     * Assuming any one shape throws on the others -- which is what turned a 422 into the opaque
+     * "request failed (HTTP 422)" with no field info, and would turn a plain broker rejection
+     * ("Market closed") into a crash-shaped toast.
      */
     private fun parseError(code: Int, text: String): ApiResult.Failed {
         val fallback = "request failed (HTTP $code)"
@@ -351,15 +366,28 @@ class Api(
             val detail = json.parseToJsonElement(text).jsonObject["detail"]
                 ?: return ApiResult.Failed(fallback)
 
-            if (detail is JsonPrimitive) {
-                ApiResult.Failed(detail.contentOrNull ?: fallback)
-            } else {
-                val o = detail.jsonObject
-                ApiResult.Failed(
-                    message = o["message"]?.jsonPrimitive?.contentOrNull ?: fallback,
-                    retcode = o["retcode"]?.jsonPrimitive?.intOrNull,
-                    comment = o["comment"]?.jsonPrimitive?.contentOrNull,
-                )
+            when (detail) {
+                is JsonPrimitive -> ApiResult.Failed(detail.contentOrNull ?: fallback)
+
+                // Pydantic validation: [{loc:[...], msg, type}, ...]. Name the offending field
+                // (the last non-"body" element of `loc`) so the message is actually actionable.
+                is JsonArray -> {
+                    val first = detail.firstOrNull()?.jsonObject
+                    val msg = first?.get("msg")?.jsonPrimitive?.contentOrNull ?: fallback
+                    val field = first?.get("loc")?.jsonArray
+                        ?.mapNotNull { it.jsonPrimitive.contentOrNull }
+                        ?.lastOrNull { it != "body" }
+                    ApiResult.Failed(if (field != null) "$field: $msg" else msg)
+                }
+
+                else -> {
+                    val o = detail.jsonObject
+                    ApiResult.Failed(
+                        message = o["message"]?.jsonPrimitive?.contentOrNull ?: fallback,
+                        retcode = o["retcode"]?.jsonPrimitive?.intOrNull,
+                        comment = o["comment"]?.jsonPrimitive?.contentOrNull,
+                    )
+                }
             }
         } catch (_: Exception) {
             ApiResult.Failed(fallback)

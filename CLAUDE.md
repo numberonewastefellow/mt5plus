@@ -59,6 +59,18 @@ moment the server binds to a network, *any device on that network can place orde
 positions*. If you set `XAUORDERPAD_HOST`, you must set `XAUORDERPAD_TOKEN`. The startup banner
 shouts about this.
 
+**Never open port 8765 in the EC2 security group, and never bind uvicorn to `0.0.0.0` there.**
+uvicorn speaks plain HTTP, and the API token grants *order placement on whatever account MT5 is
+logged into*. The phone reaches the box on **8443**, where **Caddy** enforces **mutual TLS** — no
+client certificate signed by our private CA, no connection, rejected at the TLS handshake. uvicorn
+stays on `127.0.0.1`, so the deployment **fails closed**: if Caddy dies, the trading API becomes
+*unreachable* rather than *reachable without TLS*. Bypassing the proxy undoes the entire design.
+Set it up with `deploy/bat/` → `eip` → `ship` → `caddy`; see
+[XauOrderPad/deploy/README.md](XauOrderPad/deploy/README.md).
+
+**`XauOrderPad/deploy/certs/ca.key` must never leave the laptop.** It mints client identities:
+whoever holds it can issue themselves a certificate the server accepts. Not on the box, not in git.
+
 **A bulk close that FAILED returns HTTP 200.** `/close_where` answers `{ok: false, remaining: N}`
 with a 200, because it is a well-formed answer rather than a protocol error. Any client that trusts
 the status code will report a failed emergency close as a success. Check the body.

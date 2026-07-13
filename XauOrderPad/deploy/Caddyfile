@@ -1,0 +1,87 @@
+# The mTLS front door. Copied to C:\app\Caddyfile by `mt5_ec2.py caddy`.
+#
+# This is the ONLY thing on this box that listens on a public address. uvicorn stays on
+# 127.0.0.1:8765, so if this proxy is down or misconfigured the trading API is unreachable
+# rather than reachable-without-TLS. The deployment fails CLOSED.
+
+{
+    # Explicit certificates. Without this Caddy would try to obtain its own via ACME, which
+    # cannot work for a bare IP address and would leave the site serving nothing while it
+    # retried. Our cert is issued by our own CA (deploy/make_certs.py).
+    auto_https off
+
+    # Disable the admin API. It listens UNAUTHENTICATED on 127.0.0.1:2019 and accepts a full
+    # config replacement -- including one with NO client_auth. Every guard we have (caddy_setup.ps1
+    # validating the file, grepping for require_and_verify) inspects the Caddy*file*, not the
+    # RUNNING config, so anything local that can reach 2019 could quietly swap in an open proxy and
+    # every check would still pass. Off means the running config can only come from this file.
+    admin off
+
+    # NOTE: there is deliberately NO global `log { output discard }` here. That form silences
+    # Caddy's OWN runtime and error logs too, leaving a system that places real trades with no
+    # audit trail and no diagnostics (the old comment claiming "errors still surface" was wrong).
+    # Access logging is configured PER-SITE below, with the query string redacted.
+
+    servers {
+        # Caddy turns `strict_sni_host` ON AUTOMATICALLY as soon as client_auth is configured.
+        # It then requires the request's Host header to match the SNI from the TLS ClientHello --
+        # and a client connecting to a bare IP sends NO SNI at all (SNI carries names, not
+        # addresses). So Host "16.60.16.191" is compared against an empty SNI, never matches, and
+        # every single request is answered 421 Misdirected Request. The TLS handshake and the
+        # client certificate both succeed; the request dies immediately after. It looks like an
+        # app bug and is not one.
+        #
+        # What strict_sni_host actually defends against is vhost confusion via HTTP/2 connection
+        # coalescing across MULTIPLE name-based sites. There is one site here and it is reached by
+        # IP, so there is nothing to coalesce and nothing to confuse. Turning it off costs no
+        # security in this deployment; leaving it on makes the deployment simply not work.
+        strict_sni_host insecure_off
+    }
+}
+
+:8443 {
+    tls C:/app/certs/server.crt C:/app/certs/server.key {
+        client_auth {
+            # THE line this entire design rests on.
+            #
+            # `require_and_verify` rejects any connection that does not present a certificate
+            # signed by our CA -- and it rejects it DURING THE TLS HANDSHAKE. An internet scanner
+            # that finds this open port never speaks HTTP, never reaches FastAPI, never reaches
+            # the token check, and never touches a line of MT5 code.
+            #
+            # Downgrade this to `request` (or drop the block) and the port becomes an
+            # unauthenticated TCP path to a live-trading API guarded only by a bearer token.
+            mode          require_and_verify
+            trust_pool    file C:/app/certs/ca.crt
+        }
+    }
+
+    # Tell the app WHICH device is trading. With one client cert today this is dull; the moment
+    # there are two phones it is the only way to attribute an order after the fact.
+    reverse_proxy 127.0.0.1:8765 {
+        header_up X-Client-Cert-CN {http.request.tls.client.subject}
+
+        # The feed is a WebSocket held open for the whole session. Caddy proxies Upgrade natively;
+        # what it does NOT do by default is wait forever for a response, and the quote stream is a
+        # long-lived response by definition.
+        flush_interval -1
+    }
+
+    # Per-site access log WITH the query string redacted. There IS an audit trail (which client
+    # cert connected, what path, what status) -- but the `token` query param is deleted before the
+    # line is written. The Android app now sends the token as a header (not logged at all); the
+    # browser web UI still uses /ws?token=, so this redaction is what keeps that token off disk.
+    log {
+        output file C:/app/logs/access.log {
+            roll_size 10MiB
+            roll_keep 5
+        }
+        format filter {
+            fields {
+                request>uri query {
+                    delete token
+                }
+            }
+        }
+    }
+}

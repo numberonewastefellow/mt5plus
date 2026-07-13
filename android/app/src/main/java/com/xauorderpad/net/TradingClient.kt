@@ -16,7 +16,6 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import java.net.URLEncoder
 import kotlin.coroutines.resume
 import kotlin.math.min
 import kotlin.random.Random
@@ -65,6 +64,16 @@ class TradingClient(
 
     private val _snapshot = MutableStateFlow<Snapshot?>(null)
     val snapshot: StateFlow<Snapshot?> = _snapshot.asStateFlow()
+
+    /**
+     * Drop the last frame WITHOUT tearing the socket down. Used after an account switch: the held
+     * frame describes the previous account's book, and the screen would otherwise render it (with
+     * the close buttons live against foreign tickets) until the next frame arrives. Back to null =
+     * "no data yet", which the UI already renders safely; the very next /ws frame refills it.
+     */
+    fun clearSnapshot() {
+        _snapshot.value = null
+    }
 
     private val _link = MutableStateFlow<Link>(Link.Connecting)
     val link: StateFlow<Link> = _link.asStateFlow()
@@ -146,10 +155,12 @@ class TradingClient(
 
     /** Opens the socket and suspends until it closes. Returns the close code. */
     private suspend fun connectAndWait(): Int = suspendCancellableCoroutine { cont ->
+        // Token goes in the x-token HEADER, not the query string. OkHttp can set handshake
+        // headers (browsers cannot -- the web UI still uses ?token=), and a header never lands in
+        // an access log the way a URL query does. The server prefers the header over the param.
         val url = buildString {
             append(baseUrl().replaceFirst("http", "ws"))
             append("/ws?hz=").append(hz)
-            token().let { if (it.isNotBlank()) append("&token=").append(URLEncoder.encode(it, "UTF-8")) }
         }
 
         var resumed = false
@@ -221,7 +232,9 @@ class TradingClient(
             }
         }
 
-        val ws = http.newWebSocket(Request.Builder().url(url).build(), listener)
+        val reqBuilder = Request.Builder().url(url)
+        token().let { if (it.isNotBlank()) reqBuilder.header("x-token", it) }
+        val ws = http.newWebSocket(reqBuilder.build(), listener)
         socket = ws
         cont.invokeOnCancellation { ws.close(NORMAL_CLOSURE, "cancelled") }
     }

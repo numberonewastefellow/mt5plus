@@ -64,7 +64,8 @@ fun TradeScreen(
     positions: PositionsUi,
     link: Link,
     form: OrderForm,
-    busy: Boolean,
+    /** Order/close requests currently on the wire -- feeds the "N sending" chip, never gates a button. */
+    inFlight: Int,
     onLot: (String) -> Unit,
     onStepLot: (Int) -> Unit,
     onSl: (String) -> Unit,
@@ -131,8 +132,9 @@ fun TradeScreen(
         // `live` gates ENTRY only. `health.healthy` alone is not enough: it is derived from the
         // last snapshot, which survives the socket's death -- so it still reports "healthy" from
         // a frame that may be minutes old, and BUY/SELL would stay armed against a frozen price.
-        OrderFormBlock(form, canTrade = health.healthy && !busy && live, digits = positions.digits,
-            armed = armed, quote = quote, busy = busy, d = d,
+        // No `busy` term any more: the entry/close buttons fire-and-forget so a burst is not gated.
+        OrderFormBlock(form, canTrade = health.healthy && live, digits = positions.digits,
+            armed = armed, quote = quote, inFlight = inFlight, d = d,
             onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp,
             onEnterArmed = onEnterArmed, onCloseArmed = onCloseArmed)
         Spacer(Modifier.height(d.gap))
@@ -469,7 +471,7 @@ private fun OrderFormBlock(
     digits: Int,
     armed: ArmedUi,
     quote: Quote,
-    busy: Boolean,
+    inFlight: Int,
     onLot: (String) -> Unit,
     onStepLot: (Int) -> Unit,
     onSl: (String) -> Unit,
@@ -561,7 +563,9 @@ private fun OrderFormBlock(
             // disables it is having nothing on this side to close.
             OutlinedButton(
                 onClick = onCloseArmed,
-                enabled = hasTarget && !busy,
+                // Only "nothing left to close" disables it. No busy gate: rapid CLOSE taps must go
+                // through, each one walking down to the next-newest ticket (target skips in-flight).
+                enabled = hasTarget,
                 colors = ButtonDefaults.outlinedButtonColors(
                     contentColor = if (hasTarget) MaterialTheme.colorScheme.onSurface
                     else MaterialTheme.colorScheme.onSurfaceVariant,
@@ -605,6 +609,20 @@ private fun OrderFormBlock(
                     )
                 }
             }
+        }
+
+        // Burst indicator. Fixed height so it appearing/vanishing mid-scalp does not jitter the
+        // layout and shove the grid; empty when nothing is on the wire.
+        Row(
+            Modifier.fillMaxWidth().height(14.dp),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            if (inFlight > 0) Text(
+                "$inFlight sending…",
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.primary,
+            )
         }
     }
 }

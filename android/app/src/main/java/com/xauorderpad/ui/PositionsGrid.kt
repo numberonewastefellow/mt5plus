@@ -29,6 +29,48 @@ val Red = Color(0xFFE0544E)
 val Amber = Color(0xFFD9A441)
 
 /**
+ * What kind of money is behind an account.
+ *
+ * ── Why this is not a Boolean ──
+ * It used to be `val isReal = p.lastTradeMode == 2`, rendered as `if (isReal) "REAL" else "DEMO"`.
+ * That makes **null** -- "we have never actually seen this account" -- render as a green DEMO
+ * badge, and skip the "switch to a REAL account?" confirmation entirely.
+ *
+ * `last_trade_mode` is null for any profile that has not yet been logged into *through this
+ * server* (accounts.py defaults it to None): a real account added from the web UI's modal, or any
+ * profile from a profiles.json written before the field existed. So the most dangerous account in
+ * the list was the one shown in green.
+ *
+ * On the one screen whose job is to tell you which account you are about to trade, UNKNOWN must
+ * fail toward "dangerous", never toward "safe". Hence three states, and [confirmBeforeSwitch].
+ *
+ * MT5's ACCOUNT_TRADE_MODE: 0 = DEMO, 1 = CONTEST, 2 = REAL. Contest is play money, so it groups
+ * with DEMO -- but note that only 2 is REAL, and anything we do not recognise is UNKNOWN, not DEMO.
+ */
+enum class AcctMode { DEMO, REAL, UNKNOWN }
+
+fun acctMode(lastTradeMode: Int?): AcctMode = when (lastTradeMode) {
+    2 -> AcctMode.REAL
+    0, 1 -> AcctMode.DEMO       // demo / contest -- neither risks real money
+    else -> AcctMode.UNKNOWN    // null, or a value MetaQuotes added after this was written
+}
+
+/** REAL *and* UNKNOWN both get the are-you-sure dialog. Only a PROVEN demo skips it. */
+val AcctMode.confirmBeforeSwitch: Boolean get() = this != AcctMode.DEMO
+
+val AcctMode.badge: String get() = when (this) {
+    AcctMode.REAL -> "REAL"
+    AcctMode.DEMO -> "DEMO"
+    AcctMode.UNKNOWN -> "UNVERIFIED"
+}
+
+val AcctMode.color: Color get() = when (this) {
+    AcctMode.REAL -> Red
+    AcctMode.DEMO -> Green
+    AcctMode.UNKNOWN -> Amber
+}
+
+/**
  * The open book.
  *
  * Takes [PositionsUi] (an ImmutableList) rather than the raw Snapshot, so Compose can compare

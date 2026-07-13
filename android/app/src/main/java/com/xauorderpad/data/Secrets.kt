@@ -13,17 +13,23 @@ import android.content.SharedPreferences
  * whose only recovery is "clear app data". It also cost 50-200 ms of Keystore + Tink work
  * on the main thread at every launch, which is the entire launch budget.
  *
- * Weigh that against what is actually stored:
+ * Weigh that against what is actually stored HERE:
  *
  *   - a base URL (not a secret), and
- *   - an API token for an endpoint that is only reachable INSIDE the Tailscale tailnet.
+ *   - the API token: the bearer secret for the trading API.
  *
- * The MT5 broker password is NOT here and never reaches the phone: the app logs in by
- * `profile_id` and the SERVER reads the password from the Windows Credential Vault (see
- * XauOrderPad/accounts.py). So the worst case for a lost phone is a token to a private
- * WireGuard-only endpoint -- and an attacker holding the unlocked phone can simply use the
- * app anyway. The device lock screen is the real control. An at-rest layer that can brick
- * the app is a bad trade for a threat it does not actually stop.
+ * The MT5 broker password is NOT stored here. Note the precise claim: it is not *persisted* on
+ * the phone. It IS typed on the Accounts screen and sent to the server once (to log in / save),
+ * after which every later login is by `profile_id` and the server reads the password from its own
+ * credential vault. So a captured phone at rest yields the API token, not the broker password --
+ * and an attacker holding the UNLOCKED phone can just use the app regardless. The device lock
+ * screen is the real control. An at-rest layer that can brick the app (see above) is a bad trade
+ * for a threat it does not actually stop.
+ *
+ * The token is not "only reachable inside a tailnet" any more: depending on the server it guards
+ * either a LAN endpoint (plain HTTP) or the EC2 mTLS front door. On the mTLS path the client
+ * certificate is the outer gate and this token is the inner one; on the LAN path the token is the
+ * only gate, which is why the Connect screen warns when the transport is cleartext.
  *
  * Values are cached in memory after the first read: `baseUrl`/`token` are read on the hot
  * path (every reconnect, every request header) and must not hit disk each time.
@@ -125,10 +131,13 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
      * server address every time you log out would be pointless friction. It comes back prefilled.
      */
     fun disconnect() {
-        // Fall back to the baked-in default rather than "", so a debug build comes back with the
-        // token prefilled instead of demanding you retype 32 random chars on a phone keyboard.
-        // In RELEASE, DEFAULT_TOKEN compiles to "" -- so a real build genuinely forgets it.
-        cachedToken = com.xauorderpad.BuildConfig.DEFAULT_TOKEN.trim()
+        // Genuinely forget the token in-session. This used to re-seed cachedToken from
+        // BuildConfig.DEFAULT_TOKEN, so on a debug build "LOG OUT" left the token sitting in
+        // memory and pre-filled again on the very next screen -- i.e. it did not actually log you
+        // out. Clear it. (The fresh-install convenience still works: KEY_TOKEN is removed from
+        // disk, so a NEW process re-seeds from the baked-in default via the init block; a release
+        // build's default is "" and forgets for real either way.)
+        cachedToken = ""
         cachedConnected = false
         prefs.edit().remove(KEY_TOKEN).putBoolean(KEY_CONNECTED, false).apply()
     }

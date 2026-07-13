@@ -70,14 +70,16 @@ import com.xauorderpad.net.Profile
 fun AccountsScreen(
     profiles: List<Profile>,
     health: Health,
+    /** Whether the feed is actually live. A dead socket must not be read as "this account is active". */
+    live: Boolean,
     busy: Boolean,
     error: String?,
-    /** Bumped on every successful account action. Clears the password -- and ONLY on success. */
+    /** Bumped ONLY when a typed-credential login succeeds. The sole trigger for clearing the form. */
     okTick: Int,
     /** True when a typed password would cross the network unencrypted. */
     passwordInClear: Boolean,
     onLoginProfile: (String) -> Unit,
-    onLoginWith: (login: String, password: String, server: String, path: String, save: Boolean, label: String) -> Unit,
+    onLoginWith: (login: String, password: String, server: String, save: Boolean, label: String) -> Unit,
     onDelete: (String) -> Unit,
     onLogout: () -> Unit,
     onBack: () -> Unit,
@@ -96,16 +98,25 @@ fun AccountsScreen(
     var label by rememberSaveable { mutableStateOf("") }
     var login by rememberSaveable { mutableStateOf("") }
     var server by rememberSaveable { mutableStateOf("") }
-    var path by rememberSaveable { mutableStateOf("") }
     var save by rememberSaveable { mutableStateOf(true) }
     var password by remember { mutableStateOf("") }
 
-    // Cleared on SUCCESS only. Clearing it on send meant a one-character typo in the server name
-    // cost you the whole password as well.
+    // Cleared on a successful typed login ONLY. Clearing it on send meant a one-character typo in
+    // the server name cost you the whole password as well.
+    //
+    // We track the last tick we ACTED on, in saved state, rather than firing on `okTick > 0`. The
+    // ViewModel outlives an Activity recreation, so after any earlier success `okTick` is already
+    // non-zero; keying on `> 0` re-ran this on every rotation and wiped the four rememberSaveable
+    // fields it was supposed to protect. Comparing against the last-handled value fires exactly
+    // once per real success and never on a bare recomposition.
+    var handledTick by rememberSaveable { mutableStateOf(0) }
     LaunchedEffect(okTick) {
-        if (okTick > 0) {
-            password = ""
-            label = ""; login = ""; server = ""; path = ""
+        if (okTick != handledTick) {
+            handledTick = okTick
+            if (okTick > 0) {
+                password = ""
+                label = ""; login = ""; server = ""
+            }
         }
     }
 
@@ -113,8 +124,9 @@ fun AccountsScreen(
 
     var confirmDelete by remember { mutableStateOf<Profile?>(null) }
     var confirmLogout by remember { mutableStateOf(false) }
-    // A REAL account is a decision, not a tap. Holds the pending action until confirmed.
-    var confirmReal by remember { mutableStateOf<(() -> Unit)?>(null) }
+    // Switching to a REAL -- or an UNVERIFIED -- account is a decision, not a tap. Holds the pending
+    // switch (its mode + the action) until confirmed. Demo switches never land here.
+    var confirmSwitch by remember { mutableStateOf<Pair<AcctMode, () -> Unit>?>(null) }
 
     Column(modifier.fillMaxSize()) {
         AccTopBar("MT5 Account", onBack)
@@ -122,7 +134,7 @@ fun AccountsScreen(
         Column(Modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
 
             // ---- what we are connected to RIGHT NOW ---------------------------
-            AccountStatus(health)
+            AccountStatus(health, live)
 
             // The banner the web had to learn to add: a login failure that only toasts for four
             // seconds reads as "the button did nothing", and the user taps it again and again.
@@ -147,24 +159,32 @@ fun AccountsScreen(
                      fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             for (p in profiles) {
-                val isReal = p.lastTradeMode == 2
+                val mode = acctMode(p.lastTradeMode)
                 // Match on LOGIN **and** SERVER, from the live feed.
                 //
                 // This used to compare the server alone -- and a demo and a real account on the
                 // same broker server is the normal Exness setup, so BOTH rows lit up as active.
                 // On the one screen whose job is to tell you which account you are about to
                 // trade, that is the single thing it must not get wrong.
-                val active = !health.loggedOut &&
+                //
+                // `live` gates it now: Feed.snapshot is NOT cleared when the socket dies, so the
+                // last frame just sits there. Without this the screen would keep asserting "●
+                // active" and a green DEMO badge from a frame that may be minutes old and about
+                // an account the terminal has since left.
+                val active = live && !health.loggedOut &&
                     health.login != null && p.login != null &&
                     health.login == p.login && health.server == p.server
                 SavedRow(
                     p = p,
-                    isReal = isReal,
+                    mode = mode,
                     active = active,
                     enabled = !busy,
                     onSwitch = {
                         val go = { onLoginProfile(p.id) }
-                        if (isReal) confirmReal = go else go()
+                        // REAL *and* UNVERIFIED both confirm. An account we have never actually
+                        // logged into might be a real one; treating it as demo is the one mistake
+                        // this dialog exists to prevent.
+                        if (mode.confirmBeforeSwitch) confirmSwitch = mode to go else go()
                     },
                     onDelete = { confirmDelete = p },
                 )
@@ -211,8 +231,9 @@ fun AccountsScreen(
             AccField(server, { server = it }, "Server", "Exness-MT5Trial16",
                      enabled = !busy, error = v.server)
 
-            AccField(path, { path = it }, "Terminal path (optional)",
-                     "blank = use the running terminal", enabled = !busy)
+            // No "Terminal path" field: the server no longer accepts a client-supplied path
+            // (it launched that executable -- a remote-code-execution hole). The terminal the
+            // server drives is fixed in its own config.
 
             Spacer(Modifier.height(6.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -243,7 +264,7 @@ fun AccountsScreen(
             Button(
                 // The password is NOT cleared here. It is cleared on the success tick, and only
                 // there -- see the LaunchedEffect above.
-                onClick = { onLoginWith(login, password, server, path, save, label) },
+                onClick = { onLoginWith(login, password, server, save, label) },
                 enabled = !busy && v.valid,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
             ) {
@@ -305,33 +326,46 @@ fun AccountsScreen(
         )
     }
 
-    confirmReal?.let { go ->
+    confirmSwitch?.let { (mode, go) ->
+        val unverified = mode == AcctMode.UNKNOWN
         AlertDialog(
-            onDismissRequest = { confirmReal = null },
-            title = { Text("Switch to a REAL account?") },
+            onDismissRequest = { confirmSwitch = null },
+            title = { Text(if (unverified) "Switch to an UNVERIFIED account?" else "Switch to a REAL account?") },
             text = {
                 Text(
-                    "This account trades REAL MONEY. Manual BUY / SELL / CLOSE will place real " +
-                        "orders.\n\n" +
-                        "The automated strategy engines will REFUSE to run on it — they are " +
-                        "demo-only, and the server re-checks that on every tick."
+                    if (unverified)
+                        "This account has never been logged in through this server, so whether it " +
+                            "is DEMO or REAL is UNKNOWN. It is treated as REAL until proven " +
+                            "otherwise.\n\n" +
+                            "If it turns out to be real, manual BUY / SELL / CLOSE will place real " +
+                            "orders. The status card will show the true type once you are in."
+                    else
+                        "This account trades REAL MONEY. Manual BUY / SELL / CLOSE will place real " +
+                            "orders.\n\n" +
+                            "The automated strategy engines will REFUSE to run on it — they are " +
+                            "demo-only, and the server re-checks that on every tick."
                 )
             },
             confirmButton = {
-                TextButton(onClick = { confirmReal = null; go() }) {
-                    Text("SWITCH TO REAL", color = Red, fontWeight = FontWeight.Bold)
+                TextButton(onClick = { confirmSwitch = null; go() }) {
+                    Text(if (unverified) "SWITCH ANYWAY" else "SWITCH TO REAL",
+                         color = Red, fontWeight = FontWeight.Bold)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { confirmReal = null }) { Text("Cancel") }
+                TextButton(onClick = { confirmSwitch = null }) { Text("Cancel") }
             },
         )
     }
 }
 
 @Composable
-private fun AccountStatus(h: Health) {
+private fun AccountStatus(h: Health, live: Boolean) {
+    // With a dead feed the snapshot is the LAST frame, which may be minutes old and about an
+    // account the terminal has since left. Refuse to assert REAL/DEMO from it -- a stale green
+    // "DEMO" on a screen whose job is to say what you are trading is exactly the wrong failure.
     val (text, color) = when {
+        !live -> "NO LIVE DATA — status unknown (feed is down)" to Amber
         h.loggedOut -> "LOGGED OUT — no account connected" to Amber
         h.isDemo == false -> "REAL ACCOUNT" to Red
         h.isDemo == true -> "DEMO" to Green
@@ -354,7 +388,7 @@ private fun AccountStatus(h: Health) {
 @Composable
 private fun SavedRow(
     p: Profile,
-    isReal: Boolean,
+    mode: AcctMode,
     active: Boolean,
     enabled: Boolean,
     onSwitch: () -> Unit,
@@ -376,14 +410,11 @@ private fun SavedRow(
                     Text(p.label ?: p.id, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.width(6.dp))
                     Text(
-                        if (isReal) "REAL" else "DEMO",
+                        mode.badge,
                         fontSize = 9.sp, fontWeight = FontWeight.Bold,
-                        color = if (isReal) Red else Green,
+                        color = mode.color,
                         modifier = Modifier
-                            .background(
-                                (if (isReal) Red else Green).copy(alpha = 0.18f),
-                                RoundedCornerShape(3.dp),
-                            )
+                            .background(mode.color.copy(alpha = 0.18f), RoundedCornerShape(3.dp))
                             .padding(horizontal = 4.dp, vertical = 1.dp),
                     )
                     if (active) {

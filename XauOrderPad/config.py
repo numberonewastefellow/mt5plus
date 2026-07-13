@@ -119,15 +119,28 @@ API_TOKEN = os.environ.get("XAUORDERPAD_TOKEN", "")
 # --- Auto-launch browser --------------------------------------------------
 # On startup, open the UI in a Chrome/Edge "app-mode" window (no address bar,
 # no tabs) so it feels like a native desktop app. Prefers Chrome, falls back to
-# Edge. Set LAUNCH_BROWSER = False to disable (e.g. running headless on a box).
-LAUNCH_BROWSER = True
+# Edge.
+#
+# From the ENVIRONMENT, like HOST/PORT/API_TOKEN above, and for the same reason:
+# this value must differ on the EC2 box, and `deploy ship` copies this very file
+# from the developer's laptop. Hardcoding it here means the deploy silently
+# overwrites the box's setting with the laptop's -- which it did, and the box
+# then launched Microsoft Edge on a headless cloud server, once per restart.
+# A deploy that clobbers the target's config with the developer's is not a
+# deploy step, it is a regression generator.
+LAUNCH_BROWSER = os.environ.get("XAUORDERPAD_LAUNCH_BROWSER", "1") != "0"
 BROWSER_MODE = "app"         # "app" = standalone window (no address bar); "kiosk" = fullscreen
 
 # --- MT5 terminal connection ---------------------------------------------
 # Leave MT5_PATH blank to attach to the running terminal. Leave MT5_LOGIN = 0
 # to use whatever account is already logged in (recommended). Fill these in
 # only if you want the app to launch/log in the terminal itself.
-MT5_PATH = ""                # e.g. r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
+#
+# From the environment for the same reason as LAUNCH_BROWSER. On the box this
+# MUST point at the installed terminal, or mt5.initialize() has nothing to
+# launch and every login fails with an IPC timeout that looks like a broker
+# problem. Blank locally = attach to whatever terminal is already running.
+MT5_PATH = os.environ.get("XAUORDERPAD_MT5_PATH", "")   # e.g. r"C:\Program Files\MetaTrader 5\terminal64.exe"
 MT5_LOGIN = 0
 MT5_PASSWORD = ""
 MT5_SERVER = ""

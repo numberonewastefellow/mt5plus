@@ -13,13 +13,17 @@ acting.
 | Region | `eu-west-2` (London) |
 | Disk | 30 GB gp3 |
 | Auto-stop | Currently **60 min** after every boot. `autostop <mins>` changes it; ceiling ~390 |
-| Open ports | 22 (SSH) + 3389 (RDP), **your home IP only**. Port 8765 is never exposed. |
+| Open ports | 22 (SSH) + 3389 (RDP) — **your home IP only**. 8443 (mTLS front door) — `0.0.0.0/0`, but every connection without a client certificate is dropped at the TLS handshake. **8765 is never exposed.** |
 | Broker | Exness demo `472104398` @ `Exness-MT5Trial16` |
 | Key | `deploy\mt5-london-key.pem` — the **only** way to decrypt the Windows password. Back it up. |
 
 Control script: `deploy\mt5_ec2.py`. Every command below has a double-click wrapper in `deploy\bat\`
 (`start.bat`, `stop.bat`, `status.bat`, `password.bat`, `tunnel.bat`, `fixfw.bat`, `autostop.bat`,
-`create.bat`, `terminate.bat` — all except `ip`, which is `python mt5_ec2.py ip`).
+`eip.bat`, `ship.bat`, `caddy.bat`, `create.bat`, `terminate.bat` — all except `ip`, which is
+`python mt5_ec2.py ip`).
+The `.bat` files are plain wrappers: they run the Python command and pause. **Nothing is installed
+on your laptop and no scheduled task is created there** — the `xauorderpad` task lives on the *box*,
+which is what keeps the server alive after you disconnect SSH.
 
 The **public IP changes on every start** — never hardcode it; always re-read it.
 
@@ -88,6 +92,71 @@ matter.
 > writes `accounts.dat`, so future headless launches auto-login), confirm **AutoTrading** is on and
 > `XAUUSD` — Exness may name it `XAUUSDm` — is in Market Watch. Then **disconnect** RDP. Do **not**
 > log off: logging off kills MT5.
+
+---
+
+## Reach it from the Android app (mutual TLS)
+
+The phone reaches the box over the public internet on **8443**, guarded by **mutual TLS**: it must
+present a client certificate signed by our own private CA, or it is dropped **during the TLS
+handshake** — before a single HTTP byte is parsed, before the token is checked, before any MT5 code
+is touched.
+
+### First time (per box)
+
+```powershell
+python mt5_ec2.py start                     # boot
+python mt5_ec2.py eip                       # STABLE public IP + opens 8443 (only 8443)
+python make_certs.py --ip <that elastic ip> # mints the CA, server cert, client.p12
+python mt5_ec2.py ship                      # source + certs -> box; rebuilds the venv
+python mt5_ec2.py caddy                     # the mTLS front door
+```
+
+`bat\eip.bat`, `bat\ship.bat`, `bat\caddy.bat` are double-click wrappers for the same thing.
+
+**The Elastic IP is not optional.** A certificate is bound to an *address*, and the auto-assigned
+public IP changes on every stop/start — so a cert minted today stops verifying tomorrow, and it
+fails as an *opaque TLS handshake error* that looks like a network fault rather than the
+expired-address problem it is.
+
+### What the phone needs
+
+| | |
+|---|---|
+| Android | **14+** (`minSdk 34`) |
+| Server address | `https://<elastic-ip>:8443` |
+| `ca.crt` | so the phone trusts our private CA — **and only ours** |
+| `client.p12` | the phone's own identity, password-protected. **It IS a trading credential.** |
+| API token | second factor, checked by FastAPI behind the proxy |
+
+`ca.crt` and `client.p12` are **uploaded in the app's Settings**, not baked into the APK — so
+rotating a certificate does not mean rebuilding and reinstalling the app.
+
+### The invariants — do not break these
+
+- **8765 is never opened.** uvicorn stays on `127.0.0.1`. Caddy terminates TLS on 8443 and proxies
+  to loopback. This makes the deployment **fail CLOSED**: if Caddy dies or is misconfigured, the
+  trading API is *unreachable*, rather than reachable without TLS. `ship.ps1` and `caddy_setup.ps1`
+  both assert the loopback bind and refuse to report success if it has moved.
+- **8443 is open to `0.0.0.0/0`, deliberately.** The phone roams onto mobile data, so a home-IP rule
+  would lock it out. What makes an internet-wide rule defensible is that **mTLS drops everything
+  without a client cert at the handshake** — the exposed surface is the TLS stack, not the app.
+- **`ca.key` never leaves your laptop.** It can mint new client identities: anyone holding it can
+  issue themselves a certificate this server will accept. It is not on the box, and it is gitignored.
+- **The token must not reach a log.** `/ws?token=…` carries it in the query string (a browser cannot
+  set headers on a WebSocket handshake), so Caddy's access log is switched off — otherwise it writes
+  a live trading credential to disk in cleartext. `server.py` already redacts the uvicorn side.
+
+### Rotating a certificate
+
+```powershell
+python make_certs.py --ip <elastic ip> --force   # invalidates every client.p12 already issued
+python mt5_ec2.py ship
+python mt5_ec2.py caddy
+```
+
+Then upload the new `ca.crt` + `client.p12` in the app's Settings. `--force` is required precisely
+because a silent regeneration would strand the phone with an identity the server no longer accepts.
 
 ---
 
@@ -162,7 +231,26 @@ Stop-ScheduledTask  -TaskName xauorderpad
 Config: AtStartup trigger, principal `Administrator` / S4U / Highest, `ExecutionTimeLimit = 0`
 (unlimited), 3 restarts on failure. This is also why it comes back by itself after every reboot.
 
-Code lives at `C:\app\XauOrderPad` with its venv at `C:\app\XauOrderPad\.venv`.
+There are **two** tasks. `xauorderpad` is uvicorn (loopback); `xauorderpad-caddy` is the mTLS front
+door. Both are AtStartup, `ExecutionTimeLimit = 0`, 3 restarts on failure.
+
+```powershell
+Get-ScheduledTask -TaskName xauorderpad,xauorderpad-caddy   # both must be Running
+```
+
+**The tasks are created by `ship.ps1` and `caddy_setup.ps1`.** The `xauorderpad` task used to exist
+only as a hand-made task on the box — described in detail in these docs and registered by **no
+committed script** — so a rebuilt box silently had no server at all. Its action is
+`C:\app\run_server.ps1`, a wrapper generated by `ship.ps1` that sets `XAUORDERPAD_HOST/PORT/TOKEN`
+and launches the venv's Python; see Security below for why the environment is written there rather
+than inherited.
+
+Code lives at `C:\app\XauOrderPad` with its venv at `C:\app\XauOrderPad\.venv`; TLS material in
+`C:\app\certs` (Administrators + SYSTEM only). **`ca.key` is deliberately NOT there** — the box has
+no business being able to issue new trading identities.
+
+`ship.bat` re-pushes the current source and rebuilds the venv. **The box does not update itself**:
+run it after every code change, or you are testing yesterday's server.
 
 **Logs and tools on the box:**
 
@@ -175,15 +263,31 @@ Code lives at `C:\app\XauOrderPad` with its venv at `C:\app\XauOrderPad\.venv`.
 
 ## Security — the operating rules
 
-`HOST` and `API_TOKEN` come from the **environment**, so no secret sits in a git-tracked file
-(`config.py:57,60`):
+`HOST`, `PORT` and `API_TOKEN` come from the **environment**, so no secret sits in a git-tracked
+file (`config.py:110-117`):
 
 ```python
 HOST      = os.environ.get("XAUORDERPAD_HOST",  "127.0.0.1")
+PORT      = int(os.environ.get("XAUORDERPAD_PORT", "8765"))
 API_TOKEN = os.environ.get("XAUORDERPAD_TOKEN", "")
 ```
 
-On the box, set both in the `xauorderpad` Scheduled Task's environment.
+**On the box, `ship.ps1` sets these — do not try to set them by hand.** `HOST` stays `127.0.0.1`
+there **on purpose**: Caddy is the only thing on a public address, so uvicorn being loopback-only is
+what makes the deployment fail closed.
+
+> ⚠ **This section used to say "set both in the Scheduled Task's environment."** That was not
+> executable advice: **Task Scheduler has no environment field** — an action is exe + arguments +
+> working directory, nothing more.
+>
+> The tempting fix, a machine-level env var, is a trap. A task inherits the environment block held
+> by the *Schedule service*, and that service captured it **at boot** — so a variable set now is not
+> seen by a task started now. It fails **silently**, and it fails **open**: `XAUORDERPAD_TOKEN` comes
+> back `""`, which *disables authentication* on the trading API.
+>
+> So `ship.ps1` writes the values into `C:\app\run_server.ps1`, the wrapper the task actually
+> executes. They are set in the process that serves, at the moment it starts. No inheritance,
+> nothing to go stale.
 
 - **The defaults are loopback + NO AUTHENTICATION.** That is harmless behind the SSH tunnel and
   dangerous anywhere else — this process places **real MT5 orders**.
@@ -195,14 +299,19 @@ On the box, set both in the `xauorderpad` Scheduled Task's environment.
   streamed balance, equity and every open position to anyone who could reach the port — *even with
   `API_TOKEN` set on every other route*. ([Why the close lands *after* `accept()`, and why that
   ordering is load-bearing](../DEPLOY_AWS.md#security-model))
-- **Never set `HOST = "0.0.0.0"`** — that exposes the trading API to the internet. Exactly two binds
-  are legitimate: `127.0.0.1` (the default, via the tunnel), and the box's **Tailscale** address
-  (`100.x.y.z`) so the Android client can reach it over WireGuard. Port 8765 stays out of the
-  security group in both cases.
+- **Never set `HOST = "0.0.0.0"` on the box.** On a public cloud host that publishes the trading API
+  to the internet *without TLS and without client-cert auth*, bypassing Caddy entirely. The only
+  legitimate bind here is `127.0.0.1`; the proxy is the front door. Both `ship.ps1` and
+  `caddy_setup.ps1` assert this and refuse to report success if the bind has moved.
+- **mTLS is the outer gate; the token is the inner one.** The certificate authenticates the
+  *device*, the token authorises the *call*. Keep both: the token can be rotated without reissuing
+  certificates, and a stolen token alone is useless without a client certificate.
+- **`ca.key` must never reach the box or the repo.** It mints client identities — whoever holds it
+  can issue themselves a certificate this server accepts.
 - Never bake broker credentials into `user_data.ps1` — it is readable via the instance metadata
   service.
-- **`*.pem` and `state.json` are gitignored — leave them that way.** A leaked key cannot be
-  un-published; you would have to rebuild the instance and rotate the key pair.
+- **`*.pem`, `state.json` and `certs/` are gitignored — leave them that way.** A leaked key cannot
+  be un-published; you would have to rebuild the instance and rotate.
 
 > ⚠ **This section used to say the opposite** — that `API_TOKEN = ""` was deliberate, and that
 > setting a token gave you *"a healthy-looking UI with live quotes and a dead Buy button"*. That was

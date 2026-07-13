@@ -29,6 +29,7 @@ import com.xauorderpad.data.Feed
 import com.xauorderpad.net.Link
 import com.xauorderpad.svc.FeedService
 import com.xauorderpad.ui.AccountsScreen
+import com.xauorderpad.ui.CertsScreen
 import com.xauorderpad.ui.ConnectScreen
 import com.xauorderpad.ui.LoginScreen
 import com.xauorderpad.ui.Screen
@@ -83,7 +84,7 @@ class MainActivity : ComponentActivity() {
                 val account by vm.account.collectAsStateWithLifecycle()
                 val positions by vm.positions.collectAsStateWithLifecycle()
                 val form by vm.form.collectAsStateWithLifecycle()
-                val busy by vm.busy.collectAsStateWithLifecycle()
+                val inFlight by vm.inFlight.collectAsStateWithLifecycle()
                 val closing by vm.closing.collectAsStateWithLifecycle()
                 val toast by vm.toast.collectAsStateWithLifecycle()
                 val profiles by vm.profiles.collectAsStateWithLifecycle()
@@ -94,6 +95,9 @@ class MainActivity : ComponentActivity() {
                 val armed by vm.armed.collectAsStateWithLifecycle()
                 val accountError by vm.accountError.collectAsStateWithLifecycle()
                 val accountOk by vm.accountOk.collectAsStateWithLifecycle()
+                val accountBusy by vm.accountBusy.collectAsStateWithLifecycle()
+                val certInfo by vm.certInfo.collectAsStateWithLifecycle()
+                val certError by vm.certError.collectAsStateWithLifecycle()
 
                 val snackbar = remember { SnackbarHostState() }
 
@@ -103,7 +107,19 @@ class MainActivity : ComponentActivity() {
                     val keepAwake = screen == Screen.TRADE
                     if (keepAwake) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+
+                    // FLAG_SECURE on the screens where a secret is typed or shown: the account
+                    // screen (broker password, account numbers) and the certificates screen (the
+                    // p12 password). It blocks screenshots and screen recording, and excludes the
+                    // window from the recent-apps thumbnail the OS may persist.
+                    if (screen == Screen.ACCOUNTS || screen == Screen.CERTS)
+                        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+
+                    onDispose {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    }
                 }
 
                 // A 4401 arrives on the SOCKET, not from an API call, so the ViewModel cannot
@@ -159,8 +175,12 @@ class MainActivity : ComponentActivity() {
                         val onSettings: () -> Unit = { vm.goto(Screen.SETTINGS) }
                         val onAccounts: () -> Unit = { vm.goto(Screen.ACCOUNTS) }
                         val onStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
-                        val onLoginWith: (String, String, String, String, Boolean, String) -> Unit =
-                            { l, p, s, path, save, label -> vm.loginWith(l, p, s, path, save, label) }
+                        val onCerts: () -> Unit = { vm.goto(Screen.CERTS) }
+                        val onSaveCerts: (ByteArray, ByteArray, String) -> Unit =
+                            { ca, p12, pw -> vm.saveCerts(ca, p12, pw) }
+                        val onClearCerts: () -> Unit = { vm.clearCerts() }
+                        val onLoginWith: (String, String, String, Boolean, String) -> Unit =
+                            { l, p, s, save, label -> vm.loginWith(l, p, s, save, label) }
                         val onDeleteAccount: (String) -> Unit = { vm.deleteAccount(it) }
                         val onLogoutMt5: () -> Unit = { vm.logoutMt5() }
                         // Stay on the Accounts page after switching: you may want to check the
@@ -189,7 +209,7 @@ class MainActivity : ComponentActivity() {
 
                         Screen.LOGIN -> LoginScreen(
                             profiles = profiles,
-                            busy = busy,
+                            busy = accountBusy,
                             onPick = callbacks.onPickProfile,
                             onAddAccount = callbacks.onAccounts,
                             onBack = callbacks.onBackToTrade,
@@ -203,7 +223,7 @@ class MainActivity : ComponentActivity() {
                             positions = positions,
                             link = link,
                             form = form,
-                            busy = busy,
+                            inFlight = inFlight,
                             closing = closing,
                             onLot = callbacks.onLot,
                             onStepLot = callbacks.onStepLot,
@@ -230,18 +250,30 @@ class MainActivity : ComponentActivity() {
                             live = live,
                             confirmCloses = confirmCloses,
                             health = health,
+                            certInfo = certInfo,
                             onToggleConfirm = callbacks.onToggleConfirm,
                             onAccounts = callbacks.onAccounts,
                             onStrategies = callbacks.onStrategies,
+                            onCerts = callbacks.onCerts,
                             onDisconnect = callbacks.onDisconnect,
                             onBack = callbacks.onBackToTrade,
+                            modifier = inset,
+                        )
+
+                        Screen.CERTS -> CertsScreen(
+                            certInfo = certInfo,
+                            error = certError,
+                            onSave = callbacks.onSaveCerts,
+                            onClear = callbacks.onClearCerts,
+                            onBack = callbacks.onBackToSettings,
                             modifier = inset,
                         )
 
                         Screen.ACCOUNTS -> AccountsScreen(
                             profiles = profiles,
                             health = health,
-                            busy = busy,
+                            live = live,
+                            busy = accountBusy,
                             error = accountError,
                             okTick = accountOk,
                             // A pure function of the URL, so Compose recomposes it properly.

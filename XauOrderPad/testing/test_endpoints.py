@@ -344,8 +344,35 @@ def test_api_config_is_open_and_leaks_nothing():
     r = httpx.get(f"{BASE}/api/config", timeout=5)       # no token sent
     assert r.status_code == 200
     body = r.json()
-    assert body == {"auth_required": True, "poll_hz": 15}
+    # Reports capability, never the secret itself. keyring_ok lets the client decide up front
+    # whether "Remember this account" can work (it cannot under the EC2 box's S4U task if DPAPI
+    # is unusable); it is a plain bool and reveals nothing sensitive.
+    assert body["auth_required"] is True
+    assert body["poll_hz"] == 15
+    assert isinstance(body["keyring_ok"], bool)
     assert TOKEN not in r.text                            # reports THAT, never WHAT
+
+
+def test_validation_error_does_not_echo_the_password():
+    """A 422 must NOT contain the submitted password.
+
+    FastAPI's default RequestValidationError body echoes the whole request body back in each
+    error's `input` field -- so a login that fails validation returns the broker password
+    verbatim. server.py installs a handler that strips `input`. This proves it: the password must
+    be nowhere in the response, and the field location must still be reported.
+
+    A BOUNDS violation on `login` (LoginReq constrains it with ge/le) is what forces a Pydantic
+    422 -- the other fields are Optional, so a missing one is a plain 400 from the handler, with
+    no echo. -1 is below the minimum, so Pydantic rejects it before the handler runs.
+    """
+    config.API_TOKEN = ""
+    secret = "sup3r-secret-broker-pw"
+    r = httpx.post(f"{BASE}/api/login", timeout=5,
+                   json={"login": -1, "password": secret, "server": "X"})   # out of range -> 422
+    assert r.status_code == 422, r.text
+    assert secret not in r.text, "THE PASSWORD WAS ECHOED BACK IN THE 422 RESPONSE"
+    # Still useful: the offending field is named.
+    assert "login" in r.text
 
 
 @pytest.mark.parametrize("method,path,body", [
@@ -539,3 +566,154 @@ async def test_degraded_frame_omits_account_positions_and_prices_entirely():
             f"`positions` key as 'unknown' and an empty list as 'FLAT' -- emitting [] here "
             f"would tell a trader holding 8 lots that they are flat."
         )
+
+
+# ---------------------------------------------------------------- the startup banner
+#
+# The banner is not decoration: its "type this into the Android app" line is the ONLY place
+# the operator is told which address the phone should dial. If it prints an address the phone
+# cannot reach, the bring-up fails in a way that looks like a firewall or a Tailscale problem
+# and is neither.
+#
+# The specific bug these lock down: _lan_ip() UDP-connects to 8.8.8.8 and reports the source
+# address the routing table picked -- i.e. the route to the PUBLIC INTERNET. On the EC2 box
+# that is the AWS private 172.31.x.x, NOT the 100.x.y.z tailnet address the server is bound to.
+# The banner used to print _lan_ip() for every non-loopback bind.
+
+BANNER_LAN = "192.168.1.50"       # what the routing table would say
+BANNER_TAILNET = "100.101.102.103"  # what the server is actually bound to
+
+
+def _banner(monkeypatch, host, token="", lan=BANNER_LAN, port=8765) -> str:
+    monkeypatch.setattr(config, "HOST", host)
+    monkeypatch.setattr(config, "PORT", port)
+    monkeypatch.setattr(config, "API_TOKEN", token)
+    monkeypatch.setattr(server, "_lan_ip", lambda: lan)
+
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        server._print_banner()
+    return buf.getvalue()
+
+
+def test_banner_explicit_bind_prints_host_not_the_routing_table(monkeypatch):
+    """The EC2 case. Bound to the tailnet address -> that is what the phone must dial."""
+    out = _banner(monkeypatch, BANNER_TAILNET, token="t")
+
+    assert f"http://{BANNER_TAILNET}:8765" in out
+    assert BANNER_LAN not in out, (
+        "The banner printed the routing-table IP for an EXPLICIT bind. On EC2 that is the AWS "
+        "private 172.31.x.x, which the phone cannot reach -- captioned 'type this into the "
+        "Android app'."
+    )
+    assert "type this into the Android app" in out
+
+
+def test_banner_wildcard_bind_asks_the_routing_table(monkeypatch):
+    """The desktop-LAN case. 0.0.0.0 names no address, so _lan_ip() is the right answer."""
+    out = _banner(monkeypatch, "0.0.0.0", token="t")
+
+    assert f"http://{BANNER_LAN}:8765" in out
+    assert "0.0.0.0" not in out, "0.0.0.0 is a bind, not an address a phone can dial."
+
+
+def test_banner_loopback_promises_no_network_url(monkeypatch):
+    out = _banner(monkeypatch, "127.0.0.1")
+
+    assert "NOT REACHABLE" in out
+    assert "type this into the Android app" not in out
+    assert BANNER_LAN not in out, "loopback must not advertise a network URL it does not have"
+    # It must not recommend a bare 0.0.0.0 bind WITHOUT a token: the LAN-dev hint pairs the two,
+    # and it must point EC2 at the mTLS front door rather than a raw network bind.
+    assert "XAUORDERPAD_TOKEN" in out
+    assert "mTLS front door" in out
+
+
+def test_banner_shouts_when_on_the_network_with_no_token(monkeypatch):
+    """The dangerous state: reachable + unauthenticated + places real orders."""
+    out = _banner(monkeypatch, BANNER_TAILNET, token="")
+
+    assert "*** NONE -- AND THIS SERVER IS ON THE NETWORK ***" in out
+    assert "REAL MT5" in out
+    assert "XAUORDERPAD_TOKEN" in out
+
+
+def test_banner_port_is_not_hardcoded(monkeypatch):
+    """PORT is env-configurable; the banner must follow it or it hands out a dead address."""
+    out = _banner(monkeypatch, BANNER_TAILNET, token="t", port=9000)
+
+    assert f"http://{BANNER_TAILNET}:9000" in out
+    assert ":8765" not in out
+
+
+# ---------------------------------------------------------------- fail-closed startup
+
+def test_networked_bind_without_token_refuses_to_start(monkeypatch):
+    """A non-loopback bind with no token is an unauthenticated trading API. It must DIE, not warn.
+
+    This is the control the banner used to only hint at (and used to recommend the very bind that
+    triggers it). server._require_auth_when_networked raises SystemExit; lifespan calls it before
+    the worker starts or the socket serves.
+    """
+    monkeypatch.setattr(config, "HOST", "0.0.0.0")
+    monkeypatch.setattr(config, "API_TOKEN", "")
+    with pytest.raises(SystemExit):
+        server._require_auth_when_networked()
+
+
+def test_networked_bind_with_token_is_allowed(monkeypatch):
+    monkeypatch.setattr(config, "HOST", "0.0.0.0")
+    monkeypatch.setattr(config, "API_TOKEN", "a-real-token")
+    server._require_auth_when_networked()          # must NOT raise
+
+
+def test_loopback_without_token_is_allowed(monkeypatch):
+    """The desktop default -- loopback, no token -- stays valid."""
+    monkeypatch.setattr(config, "HOST", "127.0.0.1")
+    monkeypatch.setattr(config, "API_TOKEN", "")
+    server._require_auth_when_networked()          # must NOT raise
+
+
+def test_cross_origin_request_is_refused_but_native_and_same_origin_pass():
+    """CSRF guard: a browser cross-origin POST is 403'd; no-Origin (native app/curl) and
+    same-origin are allowed. /close_all and /api/logout are bodyless, so this is the only thing
+    standing between a malicious page and a flattened book when the token is empty."""
+    config.API_TOKEN = ""
+
+    # No Origin (the Android app, curl, tools) -> allowed.
+    r = httpx.get(f"{BASE}/api/state", timeout=5, headers=_hdr())
+    assert r.status_code == 200
+
+    # Cross-origin browser -> refused, BEFORE the route runs.
+    r = httpx.post(f"{BASE}/close_all", timeout=5,
+                   headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403, r.text
+
+    # Same-origin (Origin authority == Host) -> allowed through the guard.
+    r = httpx.post(f"{BASE}/close_all", timeout=5,
+                   headers={"Origin": f"http://127.0.0.1:{PORT}", "Host": f"127.0.0.1:{PORT}"})
+    assert r.status_code != 403
+
+
+def test_origin_helper_unit(monkeypatch):
+    monkeypatch.setattr(server, "_ALLOWED_ORIGINS", set())
+    assert server._origin_allowed(None, "anything") is True            # native client
+    assert server._origin_allowed("https://evil.test", "box:8443") is False
+    assert server._origin_allowed("http://127.0.0.1:8765", "x") is True  # loopback
+    assert server._origin_allowed("https://box:8443", "box:8443") is True  # same-origin
+
+
+def test_ws_token_check_is_constant_time_and_correct(monkeypatch):
+    """_token_ok gates both HTTP and /ws. Empty token = open; else exact match only."""
+    monkeypatch.setattr(config, "API_TOKEN", "")
+    assert server._token_ok(None) is True          # disabled -> open
+
+    monkeypatch.setattr(config, "API_TOKEN", "sekret")
+    assert server._token_ok("sekret") is True
+    assert server._token_ok("sekre") is False
+    assert server._token_ok("sekrett") is False
+    assert server._token_ok(None) is False
+    assert server._token_ok("") is False

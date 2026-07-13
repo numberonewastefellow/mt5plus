@@ -121,9 +121,55 @@ def get_password(profile_id: str) -> str | None:
         return None
 
 
-def save_profile(label, login, password, server, path="", last_trade_mode=None) -> dict:
+_keyring_ok_cache: bool | None = None
+
+
+def keyring_ok() -> bool:
+    """Cached: whether this process can READ AND WRITE the OS credential vault.
+
+    The probe does a real vault round-trip, and it is called from the UNAUTHENTICATED
+    GET /api/config on every load -- so without caching, any unauthenticated caller can make the
+    server hammer the Credential Manager. The answer is a property of the process's logon session
+    and does not change during its life, so probe once and memoise."""
+    global _keyring_ok_cache
+    if _keyring_ok_cache is None:
+        _keyring_ok_cache = _probe_keyring()
+    return _keyring_ok_cache
+
+
+def _probe_keyring() -> bool:
+    """Can this process actually READ AND WRITE the OS credential vault?
+
+    Not just "is keyring importable" -- on the EC2 box the server runs as a session-0 Scheduled
+    Task, and a DPAPI-backed store can import fine yet fail to unlock. This does a real
+    round-trip on a throwaway key so the client can grey out "Remember this account" up front,
+    rather than accept a save, return 200, and only then discover it went nowhere. Also catches
+    the case where the READ half fails even though the write succeeded, which is what
+    _restore_session actually depends on.
+    """
+    probe_user = "__keyring_selfcheck__"
+    probe_val = "ok"
+    try:
+        kr = _keyring()
+        kr.set_password(SERVICE, probe_user, probe_val)
+        read_back = kr.get_password(SERVICE, probe_user)
+        try:
+            kr.delete_password(SERVICE, probe_user)
+        except Exception:
+            pass                     # a leftover probe entry is harmless; the round-trip is the test
+        return read_back == probe_val
+    except Exception:
+        log.warning("keyring self-check failed", exc_info=True)
+        return False
+
+
+def save_profile(label, login, password, server, last_trade_mode=None) -> dict:
     """Persist a profile. Stores the password in the OS vault FIRST; if that
-    fails (no keyring backend) we raise and write nothing -- never plaintext."""
+    fails (no keyring backend) we raise and write nothing -- never plaintext.
+
+    There is no `path`: a profile must never carry a client-chosen executable path (it used to
+    flow into mt5.initialize(path=...), which launches it). `path` is written as "" so the index
+    schema is unchanged and any old entry's path is overwritten to empty on the next save."""
     login = int(login)
     server = _clean_server(server)
     pid = _profile_id(login, server)
@@ -135,7 +181,7 @@ def save_profile(label, login, password, server, path="", last_trade_mode=None) 
                 "cannot store the password securely (no keyring backend "
                 f"available): {exc}") from exc
     rec = {"id": pid, "label": (label or str(login)), "login": login,
-           "server": server, "path": path or "", "last_trade_mode": last_trade_mode}
+           "server": server, "path": "", "last_trade_mode": last_trade_mode}
     # Load -> mutate -> store under ONE lock. Without it, two concurrent saves both read the
     # same index and the second write drops the first record.
     with _index_lock:

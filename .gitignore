@@ -26,10 +26,39 @@ state.json
 *.keystore
 keystore.properties
 
+# android/.env holds the release-signing keystore + key passwords, fed to the build
+# container by docker compose. A committed password defeats the whole "keystore lives
+# outside the repo" design, so ignore every .env.
+.env
+*/.env
+android/.env
+
 # The API token for the local/LAN dev server. Grants order placement on whatever
 # account MT5 is logged into -- treat it like the .pem above.
 .token.local
 *.token.local
+
+# Operator login cheat-sheets: they contain a live API token verbatim (even a demo one
+# grants order placement), so keep them local. The PROCEDURE lives in deploy/README.md;
+# this file is the fill-in-the-blanks copy with the real token.
+XauOrderPad/deploy/LOGIN_EC2.md
+
+# mTLS material for the public EC2 deployment. NEVER commit any of it.
+#
+# ca.key is the crown jewel: it MINTS CLIENT IDENTITIES. Anyone holding it can issue
+# themselves a certificate the server will accept, and mTLS is then worth nothing --
+# they still need the API token, but you have handed away the outer layer entirely.
+# It belongs on your laptop and nowhere else: not the box, not the repo, not a remote.
+#
+# client.p12 IS a trading identity. server.key impersonates the server.
+# Ignore the whole directory rather than the extensions, so a stray intermediate,
+# CSR, serial file or backup cannot slip through a pattern that did not anticipate it.
+XauOrderPad/deploy/certs/
+certs/
+*.p12
+*.pfx
+*.key
+*.csr
 
 # Server stdout/stderr captured when launching detached. Machine-local noise, and
 # the banner echoes the LAN URL, so keep it out of the repo.

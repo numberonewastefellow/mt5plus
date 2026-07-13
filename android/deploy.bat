@@ -26,6 +26,10 @@ set "LAUNCH=%PKG%/.MainActivity"
 set "APK_C=/workspace/app/build/outputs/apk/debug/app-debug.apk"
 set "OUT_C=/out/app-debug.apk"
 set "OUT_W=E:\temp\mt5_data\app-debug.apk"
+rem Release variant paths (signed; see :cmd_release). Different APK, different signing key.
+set "APK_C_REL=/workspace/app/build/outputs/apk/release/app-release.apk"
+set "OUT_C_REL=/out/app-release.apk"
+set "OUT_W_REL=E:\temp\mt5_data\app-release.apk"
 set "PHONE_FILE=%~dp0.deploy-phone"
 
 rem --- locate Windows adb -----------------------------------------------------
@@ -50,6 +54,7 @@ if not defined CMD set "CMD=all"
 
 if /I "%CMD%"=="all"       goto :cmd_all
 if /I "%CMD%"=="build"     goto :cmd_build
+if /I "%CMD%"=="release"   goto :cmd_release
 if /I "%CMD%"=="install"   goto :cmd_install
 if /I "%CMD%"=="pair"      goto :cmd_pair
 if /I "%CMD%"=="connect"   goto :cmd_connect
@@ -98,6 +103,46 @@ if errorlevel 1 (
 
 call :copy_out || goto :fail
 call :show_apk
+goto :done
+
+
+rem ------------------------------------------------------------ release -----
+rem Build the SIGNED release APK. Two forms:
+rem     deploy.bat release          -> CLEAN: no URL/token/cert baked in. The shippable build;
+rem                                    useless if extracted (nothing to extract).
+rem     deploy.bat release demo     -> embeds the dev URL + token + demo cert (-Pxau.embedSecrets),
+rem                                    for handing a ready-to-run build to a tester. As extractable
+rem                                    as debug, but signed with the real key and NOT debuggable.
+rem
+rem Signing comes from android/.env (keystore passwords) via docker-compose. If the container was
+rem started BEFORE android/.env existed, it does not have those vars and the build fails the signing
+rem gate -- run `docker compose up -d` once to recreate it, then retry.
+:cmd_release
+call :ensure_container || goto :fail
+
+set "EMBED="
+if /I "%~2"=="demo" set "EMBED=-Pxau.embedSecrets=true"
+if defined EMBED (
+    echo [deploy] RELEASE build WITH embedded secrets ^(demo -- URL/token/cert baked in^)
+) else (
+    echo [deploy] RELEASE build ^(clean, secret-free -- the shippable artifact^)
+)
+
+docker compose exec -T %SVC% sh ./gradlew :app:assembleRelease %EMBED%
+if errorlevel 1 (
+    echo.
+    echo [deploy] RELEASE BUILD FAILED -- no APK produced.
+    echo [deploy] If it complained about signing, the container may predate android/.env.
+    echo [deploy] Fix:  docker compose up -d   ^(recreates it so it reads android/.env^)
+    goto :fail
+)
+
+call :copy_out_release || goto :fail
+call :show_apk_rel
+echo.
+echo [deploy] Release APK: %OUT_W_REL%
+echo [deploy] Install is NOT automatic -- a release cannot update an installed DEBUG build (different
+echo [deploy] key). To switch:  deploy.bat uninstall  then  adb install -r "%OUT_W_REL%"
 goto :done
 
 
@@ -297,6 +342,25 @@ if not exist "%OUT_W%" (
 )
 exit /b 0
 
+rem Release counterpart of :copy_out (named-volume APK -> Windows-visible /out).
+:copy_out_release
+echo [deploy] copying release APK to %OUT_W_REL% ...
+docker compose exec -T %SVC% cp %APK_C_REL% %OUT_C_REL%
+if errorlevel 1 (
+    echo [deploy] copy failed. Did assembleRelease actually produce %APK_C_REL%?
+    exit /b 1
+)
+if not exist "%OUT_W_REL%" (
+    echo [deploy] copy reported success but %OUT_W_REL% is not there.
+    exit /b 1
+)
+exit /b 0
+
+:show_apk_rel
+if not exist "%OUT_W_REL%" exit /b 0
+powershell -NoProfile -Command "$f = Get-Item -LiteralPath '%OUT_W_REL%'; '[deploy] APK: {0}' -f $f.FullName; '[deploy]      {0:N1} MB   built {1}' -f ($f.Length/1MB), $f.LastWriteTime"
+exit /b 0
+
 :do_install
 echo [deploy] installing...
 rem -r reinstalls over the existing app and KEEPS its data, so the saved server
@@ -335,6 +399,8 @@ echo   deploy.bat [command]
 echo.
 echo     (none) ^| all      build + install + launch          ^<- the hot loop
 echo     build             build + copy APK to Windows, no install
+echo     release           build the SIGNED, secret-free release APK
+echo     release demo      signed release WITH url/token/cert baked in (for a tester)
 echo     install           install the existing APK (does NOT build)
 echo.
 echo     pair ^<ip:port^> ^<code^>   wireless only, once

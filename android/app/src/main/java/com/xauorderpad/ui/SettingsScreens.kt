@@ -1,6 +1,8 @@
 package com.xauorderpad.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -36,6 +38,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -72,9 +75,11 @@ fun SettingsScreen(
     live: Boolean,
     confirmCloses: Boolean,
     health: Health,
+    certInfo: com.xauorderpad.data.CertStore.Info?,
     onToggleConfirm: (Boolean) -> Unit,
     onAccounts: () -> Unit,
     onStrategies: () -> Unit,
+    onCerts: () -> Unit,
     onDisconnect: () -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -95,13 +100,17 @@ fun SettingsScreen(
             SectionLabel("ACCOUNT")
             MenuRow(
                 title = "MT5 Account",
+                // Do not assert REAL/DEMO from a dead feed: `health` is the last frame, kept even
+                // after the socket dies, so it may describe an account the terminal has since left.
                 subtitle = when {
+                    !live -> "no live data — status unknown"
                     health.loggedOut -> "LOGGED OUT — not trading"
                     health.isDemo == false -> "REAL ACCOUNT · ${health.server ?: "?"}"
                     health.isDemo == true -> "DEMO · ${health.server ?: "?"}"
                     else -> "checking…"
                 },
                 dot = when {
+                    !live -> Amber
                     health.loggedOut -> Amber
                     health.isDemo == false -> Red
                     health.isDemo == true -> Green
@@ -180,6 +189,16 @@ fun SettingsScreen(
             }
 
             Spacer(Modifier.height(10.dp))
+            MenuRow(
+                title = "Certificates (mTLS)",
+                subtitle = certInfo?.let {
+                    "loaded: ${it.clientCn} · CA ${it.caCn}"
+                } ?: "none — required for the https EC2 box, not for the LAN server",
+                dot = if (certInfo != null) Green else null,
+                onClick = onCerts,
+            )
+
+            Spacer(Modifier.height(10.dp))
             TextButton(onClick = { confirmDisconnect = true }) {
                 Text("LOG OUT / CHANGE SERVER", color = Red, fontWeight = FontWeight.Bold)
             }
@@ -207,6 +226,139 @@ fun SettingsScreen(
             dismissButton = {
                 TextButton(onClick = { confirmDisconnect = false }) { Text("Cancel") }
             },
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Certificates — the EC2 mTLS client identity, uploaded at runtime.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun CertsScreen(
+    certInfo: com.xauorderpad.data.CertStore.Info?,
+    error: String?,
+    onSave: (ca: ByteArray, p12: ByteArray, password: String) -> Unit,
+    onClear: () -> Unit,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    BackHandler(onBack = onBack)
+    val ctx = LocalContext.current
+
+    var caBytes by remember { mutableStateOf<ByteArray?>(null) }
+    var p12Bytes by remember { mutableStateOf<ByteArray?>(null) }
+    var caName by remember { mutableStateOf("") }
+    var p12Name by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var confirmClear by remember { mutableStateOf(false) }
+
+    fun readBytes(uri: android.net.Uri?): ByteArray? =
+        uri?.let { ctx.contentResolver.openInputStream(it)?.use { s -> s.readBytes() } }
+
+    // OpenDocument keeps a persistable read grant and returns a stable content Uri; we read the
+    // bytes immediately into memory and never keep the Uri, so no persisted permission is needed.
+    val pickCa = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        runCatching { readBytes(uri) }.getOrNull()?.let { caBytes = it; caName = uri?.lastPathSegment ?: "ca.crt" }
+    }
+    val pickP12 = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        runCatching { readBytes(uri) }.getOrNull()?.let { p12Bytes = it; p12Name = uri?.lastPathSegment ?: "client.p12" }
+    }
+
+    Column(modifier.fillMaxSize()) {
+        TopBar("Certificates", onBack)
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
+
+            Text(
+                "For the EC2 box (https, mutual TLS) only. The LAN server (plain http) needs none. " +
+                    "Import the two files made by make_certs.py, then connect to https://<ip>:8443.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "client.p12 is a TRADING CREDENTIAL — move it to the phone over USB, not email.",
+                fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Amber,
+            )
+
+            Spacer(Modifier.height(16.dp))
+            SectionLabel("CURRENTLY LOADED")
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(Modifier.padding(12.dp)) {
+                    if (certInfo == null) {
+                        Text("No certificate loaded.", fontSize = 13.sp)
+                    } else {
+                        Text("client: ${certInfo.clientCn}", fontFamily = FontFamily.Monospace, fontSize = 13.sp)
+                        Text("CA: ${certInfo.caCn}", fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                             color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("expires: ${java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date(certInfo.notAfter))}",
+                             fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            if (certInfo != null) {
+                Spacer(Modifier.height(6.dp))
+                TextButton(onClick = { confirmClear = true }) {
+                    Text("REMOVE CERTIFICATE", color = Red, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Spacer(Modifier.height(18.dp))
+            SectionLabel("IMPORT")
+
+            error?.let {
+                Card(colors = CardDefaults.cardColors(containerColor = Red.copy(alpha = 0.15f)),
+                     modifier = Modifier.fillMaxWidth()) {
+                    Text("⚠ $it", Modifier.padding(10.dp), fontSize = 12.sp,
+                         fontWeight = FontWeight.Bold, color = Red)
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+
+            OutlinedButton(onClick = { pickCa.launch(arrayOf("*/*")) },
+                           modifier = Modifier.fillMaxWidth()) {
+                Text(if (caName.isBlank()) "PICK ca.crt" else "ca.crt: $caName")
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { pickP12.launch(arrayOf("*/*")) },
+                           modifier = Modifier.fillMaxWidth()) {
+                Text(if (p12Name.isBlank()) "PICK client.p12" else "client.p12: $p12Name")
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = password, onValueChange = { password = it },
+                label = { Text("client.p12 password") }, singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            Spacer(Modifier.height(14.dp))
+            val ready = caBytes != null && p12Bytes != null && password.isNotEmpty()
+            OutlinedButton(
+                onClick = { onSave(caBytes!!, p12Bytes!!, password) },
+                enabled = ready,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                colors = ButtonDefaults.outlinedButtonColors(),
+            ) {
+                Text("LOAD CERTIFICATE", fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Remove certificate?") },
+            text = { Text("The phone will no longer be able to reach the EC2 (https) server until " +
+                          "you import it again. The LAN (http) server is unaffected.") },
+            confirmButton = {
+                TextButton(onClick = { confirmClear = false; onClear() }) {
+                    Text("REMOVE", color = Red, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } },
         )
     }
 }
