@@ -1,6 +1,8 @@
 package com.xauorderpad.ui
 
+import android.os.SystemClock
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,22 +25,31 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -48,6 +60,8 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xauorderpad.net.Link
+import kotlinx.coroutines.delay
+import kotlin.math.ceil
 
 /**
  * The trading screen.
@@ -84,9 +98,22 @@ fun TradeScreen(
     /** Socket is Up. False => everything on this screen is a frozen last-known frame. */
     live: Boolean,
     strategies: StrategiesUi,
+    /** Active layout. Classic vs Compact vs Scalp; the top-bar chip cycles it. */
+    mode: LayoutMode = LayoutMode.CLASSIC,
+    onCycleLayout: () -> Unit = {},
+    /** MT5 broker tick time (epoch s) for the Scalp candle countdown; null until first tick. */
+    tickTime: Long? = null,
+    /** Selected candle timeframe in minutes (Scalp). */
+    candleTf: Int = 15,
+    onSelectTf: (Int) -> Unit = {},
+    /** Server-enforced account P&L guard (auto-close-all at a target). */
+    guard: GuardUi = GuardUi(),
+    onSetGuard: (Boolean?, Double?, String?) -> Unit = { _, _, _ -> },
     modifier: Modifier = Modifier,
     closing: Boolean = false,
 ) {
+    // Compact order form + quotes for both Compact AND Scalp; only Classic keeps the roomy layout.
+    val compact = mode != LayoutMode.CLASSIC
     // Every bulk close is confirmed: they are irreversible and a single tap can flatten the
     // whole book. `confirm` holds the pending filter, or null.
     var confirm by remember { mutableStateOf<String?>(null) }
@@ -100,7 +127,11 @@ fun TradeScreen(
     // control on a tiny screen or ballooning on a tablet.
     BoxWithConstraints(modifier.fillMaxSize()) {
         val hPx = maxHeight
-        fun frac(f: Float, min: Dp, max: Dp): Dp = (hPx * f).coerceIn(min, max)
+        // Grow the height floors/ceilings with the (already-clamped) font scale, so when the user's
+        // Font-Size enlarges the text the controls enlarge WITH it instead of being overrun. fs is in
+        // [1, MAX_FONT_SCALE] because the root clamps LocalDensity.
+        val fs = LocalDensity.current.fontScale
+        fun frac(f: Float, min: Dp, max: Dp): Dp = (hPx * f).coerceIn(min * fs, max * fs)
         val d = Dims(
             gap = frac(0.007f, 4.dp, 10.dp),
             quotePad = frac(0.006f, 4.dp, 10.dp),
@@ -116,14 +147,22 @@ fun TradeScreen(
             serverUrl = serverUrl,
             strategyDot = strategies.items.any { it.enabled },
             strategyKilled = strategies.items.any { it.killed },
+            mode = mode,
+            onCycleLayout = onCycleLayout,
             onSettings = onSettings,
         )
         Spacer(Modifier.height(d.gap))
 
-        StatusBanner(health, link, onLogin)
+        // Scalp swaps the full status banner for a trimmed identity + candle countdown. Every other
+        // mode keeps the full banner. Critical states (disconnect / logged out / REAL) survive both.
+        if (mode == LayoutMode.SCALP) {
+            ScalpHeader(health, link, live, tickTime, candleTf, onSelectTf, onLogin)
+        } else {
+            StatusBanner(health, link, onLogin)
+        }
         Spacer(Modifier.height(d.gap))
 
-        QuoteBlock(quote, live, d)
+        QuoteBlock(quote, live, d, compact)
         Spacer(Modifier.height(d.gap))
 
         ArmedTabs(armed.side, d, onArmedSide)
@@ -134,7 +173,7 @@ fun TradeScreen(
         // a frame that may be minutes old, and BUY/SELL would stay armed against a frozen price.
         // No `busy` term any more: the entry/close buttons fire-and-forget so a burst is not gated.
         OrderFormBlock(form, canTrade = health.healthy && live, digits = positions.digits,
-            armed = armed, quote = quote, inFlight = inFlight, d = d,
+            armed = armed, quote = quote, inFlight = inFlight, d = d, compact = compact,
             onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp,
             onEnterArmed = onEnterArmed, onCloseArmed = onCloseArmed)
         Spacer(Modifier.height(d.gap))
@@ -163,6 +202,11 @@ fun TradeScreen(
         BulkCloseBar(enabled = !closing, d = d) { filter ->
             if (confirmCloses) confirm = filter else onCloseWhere(filter)
         }
+        Spacer(Modifier.height(d.gap))
+
+        // Server-enforced auto-close-all at a floating-P&L target. Rendered once here, so it shows
+        // in all three layouts. See GuardBar / the /api/guard path.
+        GuardBar(guard = guard, floatingPl = account.floatingPl, d = d, onSetGuard = onSetGuard)
         Spacer(Modifier.height(d.gap))
 
         AccountStrip(account)
@@ -225,6 +269,8 @@ private fun ServerBar(
     serverUrl: String,
     strategyDot: Boolean,
     strategyKilled: Boolean,
+    mode: LayoutMode,
+    onCycleLayout: () -> Unit,
     onSettings: () -> Unit,
 ) {
     Row(
@@ -243,6 +289,20 @@ private fun ServerBar(
             modifier = Modifier.weight(1f),
         )
 
+        // Layout cycle chip. Taps through Classic -> Compact -> Scalp, persisted, so the designs can
+        // be compared on the same phone with the same live feed. Temporary comparison scaffold.
+        TextButton(
+            onClick = onCycleLayout,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+        ) {
+            Text(
+                mode.name,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+
         TextButton(
             onClick = onSettings,
             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
@@ -256,36 +316,46 @@ private fun ServerBar(
     }
 }
 
+/**
+ * The banner's (text, colour, action) decision, shared by the full [StatusBanner] and the Scalp
+ * [ScalpHeader] so the two can NEVER disagree about state. `trimmed` only shortens the healthy
+ * demo/real identity line -- every fault state (disconnect / logged out / not-healthy / token) is
+ * identical in both, and a REAL account stays a loud red badge either way.
+ *
+ * Order matters: a connection problem MASKS a broker problem, so report the outermost one. Showing
+ * "market closed" while the socket is actually dead would send the user hunting the wrong fault.
+ */
+private fun bannerState(h: Health, link: Link, trimmed: Boolean): Triple<String, Color, String?> = when {
+    link is Link.Unauthorized -> Triple("Token rejected — reconnect", Red, null)
+    link is Link.Down -> Triple("Disconnected: ${link.reason} · retry ${link.retryInSec}s", Red, null)
+    link is Link.Connecting -> Triple("Connecting…", Amber, null)
+    h.loggedOut -> Triple("MT5 is logged out", Red, "LOG IN")
+    !h.healthy -> Triple(h.error ?: "Trading not allowed", Red, null)
+
+    // isDemo == false means a REAL account. This screen has three one-tap buttons that flatten a
+    // book -- make it impossible to miss which account you are on. Trimmed keeps it LOUD (red, ●).
+    h.isDemo == false -> Triple(
+        if (trimmed) "● R-${brokerShort(h.server)}${loginSuffix(h.login)}"
+        else "● REAL ACCOUNT — ${h.server.orEmpty()}",
+        Red, null,
+    )
+
+    else -> Triple(
+        if (trimmed) "D-${brokerShort(h.server)}${loginSuffix(h.login)}"
+        else "● DEMO · ${h.server ?: "connected"}",
+        Green, null,
+    )
+}
+
+/** First 2 letters of the broker (before the "-" in the server name), e.g. Exness-MT5Trial16 -> EX. */
+private fun brokerShort(server: String?): String =
+    server?.substringBefore('-')?.trim()?.take(2)?.uppercase().orEmpty().ifEmpty { "?" }
+
+private fun loginSuffix(login: Long?): String = login?.let { " ($it)" } ?: ""
+
 @Composable
 private fun StatusBanner(h: Health, link: Link, onLogin: () -> Unit) {
-    // Order matters: a connection problem MASKS a broker problem, so report the outermost one.
-    // Showing "market closed" while the socket is actually dead would send the user hunting the
-    // wrong fault.
-    val (text, color, action) = when {
-        link is Link.Unauthorized ->
-            Triple("Token rejected — reconnect", Red, null)
-
-        link is Link.Down ->
-            Triple("Disconnected: ${link.reason} · retry ${link.retryInSec}s", Red, null)
-
-        link is Link.Connecting ->
-            Triple("Connecting…", Amber, null)
-
-        h.loggedOut ->
-            Triple("MT5 is logged out", Red, "LOG IN")
-
-        !h.healthy ->
-            Triple(h.error ?: "Trading not allowed", Red, null)
-
-        // isDemo == false means a REAL account. This screen has three one-tap buttons that
-        // flatten a book -- make it impossible to miss which account you are on.
-        h.isDemo == false ->
-            Triple("● REAL ACCOUNT — ${h.server.orEmpty()}", Red, null)
-
-        else ->
-            Triple("● DEMO · ${h.server ?: "connected"}", Green, null)
-    }
-
+    val (text, color, action) = bannerState(h, link, trimmed = false)
     Row(
         Modifier
             .fillMaxWidth()
@@ -300,6 +370,163 @@ private fun StatusBanner(h: Health, link: Link, onLogin: () -> Unit) {
 }
 
 /**
+ * Scalp mode's header: a TRIMMED identity badge + an MT5 candle-close countdown. On any fault
+ * state (disconnect / logged out / token / not-healthy) it falls back to the same loud message the
+ * full banner would show and hides the countdown -- a running timer next to a dead feed would lie.
+ */
+@Composable
+private fun ScalpHeader(
+    h: Health,
+    link: Link,
+    live: Boolean,
+    tickTime: Long?,
+    candleTf: Int,
+    onSelectTf: (Int) -> Unit,
+    onLogin: () -> Unit,
+) {
+    val (text, color, action) = bannerState(h, link, trimmed = true)
+    // Only show the countdown when there is no fault to report AND the feed is live.
+    val showCandle = action == null && live
+    // produceState runs regardless (cheap); we just gate its RENDERING.
+    val (leftSec, fill) = rememberCandleCountdown(tickTime, candleTf)
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(color.copy(alpha = 0.14f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 10.dp, vertical = 3.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            if (action != null) {
+                TextButton(onClick = onLogin) { Text(action, fontSize = 12.sp) }
+            } else {
+                TfDropdown(candleTf, enabled = live, onSelect = onSelectTf)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    fmtLeft(leftSec),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (live) MaterialTheme.colorScheme.onSurface
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (showCandle) {
+            Spacer(Modifier.height(2.dp))
+            CandleBar(fill)
+        }
+    }
+}
+
+/**
+ * Seconds-left-to-candle-close and the elapsed fraction, anchored to MT5 BROKER time.
+ *
+ * `tickTime` is the broker epoch-seconds of the latest tick; it only advances on a new tick, so
+ * between ticks we interpolate with the phone's MONOTONIC clock (elapsedRealtime) and re-anchor
+ * whenever a new tick arrives (produceState is keyed on tickTime). When no tick has arrived yet
+ * (market closed at connect), fall back to the device epoch clock -- candle boundaries are
+ * epoch-aligned, so only the phone's absolute offset differs. Returns (secondsLeft, elapsedFrac).
+ */
+@Composable
+private fun rememberCandleCountdown(tickTime: Long?, tfMinutes: Int): Pair<Int, Float> {
+    val period = tfMinutes.coerceAtLeast(1) * 60
+    val state by produceState(initialValue = period to 0f, tickTime, tfMinutes) {
+        val anchorServer = tickTime
+        val anchorLocal = SystemClock.elapsedRealtime()
+        while (true) {
+            val serverNow = if (anchorServer != null)
+                anchorServer + (SystemClock.elapsedRealtime() - anchorLocal) / 1000.0
+            else
+                System.currentTimeMillis() / 1000.0
+            val elapsed = ((serverNow % period) + period) % period   // guard any negative
+            val left = ceil(period - elapsed).toInt().coerceIn(0, period)
+            value = left to (elapsed / period).toFloat()
+            delay(250)
+        }
+    }
+    return state
+}
+
+/** M1/M2/M5/M15/M30/H1/H4 picker. One tap opens the list. */
+@Composable
+private fun TfDropdown(tfMinutes: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        // A compact clickable label, NOT a TextButton: a Material button forces a ~40 dp min touch
+        // height, which is what made this header row tall. The row height now tracks the text.
+        Text(
+            tfLabel(tfMinutes) + " ▾",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (enabled) MaterialTheme.colorScheme.primary
+            else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .clip(RoundedCornerShape(4.dp))
+                .clickable(enabled = enabled) { open = true }
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+        )
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            for (m in intArrayOf(1, 2, 5, 15, 30, 60, 240)) {
+                DropdownMenuItem(
+                    text = { Text(tfLabel(m), fontWeight = if (m == tfMinutes) FontWeight.Bold else FontWeight.Normal) },
+                    onClick = { onSelect(m); open = false },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * A thin candle-progress bar: fills toward the right as the candle nears its close, AND shifts
+ * colour green -> amber -> red so the LEFT-to-close is legible from colour alone, not just width.
+ */
+@Composable
+private fun CandleBar(fill: Float) {
+    val f = fill.coerceIn(0f, 1f)
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(4.dp)
+            .clip(RoundedCornerShape(2.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth(f)
+                .height(4.dp)
+                .background(candleColor(f)),
+        )
+    }
+}
+
+/**
+ * Candle-progress colour by elapsed fraction (0 = fresh, 1 = about to close). Green for most of the
+ * candle, warming through amber, and RED in the final ~10% so "closing now" reads at a glance. The
+ * amber midpoint keeps a direct green->red lerp out of muddy brown. One lerp per frame -- negligible.
+ */
+private fun candleColor(fill: Float): Color = when {
+    fill < 0.75f -> Green
+    fill < 0.90f -> lerp(Green, Amber, (fill - 0.75f) / 0.15f)
+    else -> lerp(Amber, Red, ((fill - 0.90f) / 0.10f).coerceIn(0f, 1f))
+}
+
+private fun tfLabel(m: Int): String = when (m) {
+    60 -> "H1"
+    240 -> "H4"
+    else -> "M$m"
+}
+
+/** Seconds -> "M:SS", or "H:MM:SS" for >= 1h so H1/H4 read sanely. */
+private fun fmtLeft(sec: Int): String {
+    val s = sec.coerceAtLeast(0)
+    return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
+    else "%d:%02d".format(s / 60, s % 60)
+}
+
+/**
  * The quote.
  *
  * When the feed is not live these numbers are FROZEN -- the last frame before the socket died --
@@ -308,36 +535,44 @@ private fun StatusBanner(h: Health, link: Link, onLogin: () -> Unit) {
  * frozen price that still looks live is the actual hazard here, not the disconnection itself.
  */
 @Composable
-private fun QuoteBlock(q: Quote, live: Boolean, d: Dims) {
+private fun QuoteBlock(q: Quote, live: Boolean, d: Dims, compact: Boolean) {
     Box(Modifier.fillMaxWidth()) {
         Row(
             Modifier.fillMaxWidth().alpha(if (live) 1f else 0.35f),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            QuoteCell("BID", Fmt.price(q.bid, q.digits), Red, d, Modifier.weight(1f))
+            QuoteCell("BID", Fmt.price(q.bid, q.digits), Red, d, compact, Modifier.weight(1f))
 
             Card(
-                Modifier.width(78.dp),
+                Modifier.width(if (compact) 64.dp else 78.dp),
                 colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceVariant),
             ) {
-                Column(
-                    Modifier.fillMaxWidth().padding(vertical = d.quotePad),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Text("SPREAD", fontSize = 9.sp, fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    // spreadPoints, NOT the raw `spread` field: the server sends a PRICE
-                    // difference. Rendering it raw prints "0.22" where a trader expects "22".
-                    Text(
-                        Fmt.points(q.spreadPoints),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = d.priceSp * 0.82f,
-                        fontWeight = FontWeight.Bold,
-                    )
+                // spreadPoints, NOT the raw `spread` field: the server sends a PRICE difference.
+                // Rendering it raw prints "0.22" where a trader expects "22".
+                val spreadColor = MaterialTheme.colorScheme.onSurfaceVariant
+                if (compact) {
+                    // Number-only + a faint "SPD" watermark in the corner, to save the label row.
+                    Box(Modifier.fillMaxWidth().padding(vertical = d.quotePad)) {
+                        Text("SPD", fontSize = 8.sp, fontWeight = FontWeight.Bold,
+                            color = spreadColor.copy(alpha = 0.5f),
+                            modifier = Modifier.align(Alignment.TopStart).padding(start = 5.dp))
+                        Text(Fmt.points(q.spreadPoints), fontFamily = FontFamily.Monospace,
+                            fontSize = d.priceSp * 0.82f, fontWeight = FontWeight.Bold, maxLines = 1,
+                            modifier = Modifier.align(Alignment.Center))
+                    }
+                } else {
+                    Column(
+                        Modifier.fillMaxWidth().padding(vertical = d.quotePad),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text("SPREAD", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = spreadColor)
+                        Text(Fmt.points(q.spreadPoints), fontFamily = FontFamily.Monospace,
+                            fontSize = d.priceSp * 0.82f, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
 
-            QuoteCell("ASK", Fmt.price(q.ask, q.digits), Green, d, Modifier.weight(1f))
+            QuoteCell("ASK", Fmt.price(q.ask, q.digits), Green, d, compact, Modifier.weight(1f))
         }
 
         if (!live) {
@@ -359,15 +594,28 @@ private fun QuoteBlock(q: Quote, live: Boolean, d: Dims) {
 }
 
 @Composable
-private fun QuoteCell(label: String, value: String, color: Color, d: Dims, modifier: Modifier) {
+private fun QuoteCell(label: String, value: String, color: Color, d: Dims, compact: Boolean, modifier: Modifier) {
     Card(modifier, colors = CardDefaults.cardColors(color.copy(alpha = 0.12f))) {
-        Column(
-            Modifier.fillMaxWidth().padding(vertical = d.quotePad),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text(label, fontSize = 9.sp, fontWeight = FontWeight.Bold, color = color)
-            Text(value, fontFamily = FontFamily.Monospace, fontSize = d.priceSp,
-                fontWeight = FontWeight.Bold, color = color, maxLines = 1)
+        if (compact) {
+            // Number only, with the BID/ASK label as a faint corner watermark -- saves the label
+            // row while keeping the hint. Colour + position still carry the meaning (BID=red/left,
+            // ASK=green/right).
+            Box(Modifier.fillMaxWidth().padding(vertical = d.quotePad)) {
+                Text(label, fontSize = 8.sp, fontWeight = FontWeight.Bold, color = color.copy(alpha = 0.45f),
+                    modifier = Modifier.align(Alignment.TopStart).padding(start = 6.dp))
+                Text(value, fontFamily = FontFamily.Monospace, fontSize = d.priceSp,
+                    fontWeight = FontWeight.Bold, color = color, maxLines = 1,
+                    modifier = Modifier.align(Alignment.Center))
+            }
+        } else {
+            Column(
+                Modifier.fillMaxWidth().padding(vertical = d.quotePad),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text(label, fontSize = 9.sp, fontWeight = FontWeight.Bold, color = color)
+                Text(value, fontFamily = FontFamily.Monospace, fontSize = d.priceSp,
+                    fontWeight = FontWeight.Bold, color = color, maxLines = 1)
+            }
         }
     }
 }
@@ -464,6 +712,59 @@ private fun PointsHint(raw: String, digits: Int) {
     )
 }
 
+/** Inline field label for the compact layout (sits to the LEFT of the box, not above it). */
+@Composable
+private fun FieldLabel(text: String) = Text(
+    text,
+    fontSize = 11.sp,
+    fontWeight = FontWeight.Bold,
+    color = MaterialTheme.colorScheme.onSurfaceVariant,
+)
+
+/**
+ * The bordered input box WITHOUT the caption line -- the compact layout puts the label inline
+ * (see [FieldLabel]) instead of above, so it must not carry its own. Same behaviour and height
+ * control as [CompactField]; only the caption is gone.
+ */
+@Composable
+private fun BareField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    height: Dp,
+    keyboardType: KeyboardType,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    fontSize: TextUnit = 17.sp,
+    enabled: Boolean = true,
+) {
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        enabled = enabled,
+        singleLine = true,
+        textStyle = LocalTextStyle.current.copy(
+            color = MaterialTheme.colorScheme.onSurface,
+            fontSize = fontSize,
+            fontWeight = FontWeight.Bold,
+        ),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        modifier = modifier
+            .height(height)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp),
+        decorationBox = { inner ->
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                if (value.isEmpty() && placeholder.isNotEmpty()) {
+                    Text(placeholder, fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                inner()
+            }
+        },
+    )
+}
+
 @Composable
 private fun OrderFormBlock(
     form: OrderForm,
@@ -479,8 +780,67 @@ private fun OrderFormBlock(
     onEnterArmed: () -> Unit,
     onCloseArmed: () -> Unit,
     d: Dims,
+    compact: Boolean,
 ) {
     Column {
+        if (compact) {
+            // LOT on one line: inline label + short box + steppers (no caption row above).
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                FieldLabel("LOT")
+                OutlinedButton(
+                    onClick = { onStepLot(-1) },
+                    contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.width(42.dp).height(d.fieldH),
+                ) { Text("−", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+                BareField(
+                    value = form.lot,
+                    onValueChange = onLot,
+                    height = d.fieldH,
+                    keyboardType = KeyboardType.Decimal,
+                    modifier = Modifier.width(104.dp),
+                )
+                OutlinedButton(
+                    onClick = { onStepLot(1) },
+                    contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.width(42.dp).height(d.fieldH),
+                ) { Text("+", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+            }
+
+            Spacer(Modifier.height(d.gap))
+
+            // SL / TP: inline labels + short boxes, both on one row. The $-equivalent hint stays --
+            // it is a safety readout (these are POINT distances, not prices; see below), not chrome.
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(Modifier.weight(1f)) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        FieldLabel("SL")
+                        BareField(form.slPoints, onSl, d.fieldH, KeyboardType.Number,
+                            Modifier.weight(1f), placeholder = "0")
+                    }
+                    PointsHint(form.slPoints, digits)
+                }
+                Column(Modifier.weight(1f)) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        FieldLabel("TP")
+                        BareField(form.tpPoints, onTp, d.fieldH, KeyboardType.Number,
+                            Modifier.weight(1f), placeholder = "0")
+                    }
+                    PointsHint(form.tpPoints, digits)
+                }
+            }
+
+            Spacer(Modifier.height(d.gap))
+        } else {
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -544,6 +904,7 @@ private fun OrderFormBlock(
         }
 
         Spacer(Modifier.height(d.gap))
+        }
 
         // ── CLOSE is ALWAYS the left slot. ENTRY is ALWAYS the right slot. ──
         //
@@ -570,11 +931,11 @@ private fun OrderFormBlock(
                     contentColor = if (hasTarget) MaterialTheme.colorScheme.onSurface
                     else MaterialTheme.colorScheme.onSurfaceVariant,
                 ),
-                // Zero padding: the default 8.dp top+bottom clipped the second line clean off,
-                // so CLOSE showed no ticket and BUY showed no price -- the two facts those
-                // buttons exist to tell you.
-                contentPadding = PaddingValues(0.dp),
-                modifier = Modifier.weight(1f).height(d.actionH),
+                // Horizontal padding 0 (the default 24.dp would clip the label); a little vertical
+                // padding + heightIn(min) lets the button GROW to fit both lines under a large font
+                // instead of the second line (ticket / price) overflowing onto the row below.
+                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 3.dp),
+                modifier = Modifier.weight(1f).heightIn(min = d.actionH),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("CLOSE", fontWeight = FontWeight.Bold, fontSize = 14.sp)
@@ -596,8 +957,8 @@ private fun OrderFormBlock(
                 enabled = canTrade,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (armed.isBuy) Green else Red),
-                contentPadding = PaddingValues(0.dp),
-                modifier = Modifier.weight(1f).height(d.actionH),
+                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 3.dp),
+                modifier = Modifier.weight(1f).heightIn(min = d.actionH),
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(if (armed.isBuy) "BUY" else "SELL",
@@ -666,7 +1027,7 @@ private fun ArmedTab(
             contentColor = if (selected) Color.Black
             else MaterialTheme.colorScheme.onSurfaceVariant,
         ),
-        modifier = modifier.height(h),
+        modifier = modifier.heightIn(min = h),
     ) {
         Text(label, fontSize = 12.sp, maxLines = 1,
              fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
@@ -703,11 +1064,112 @@ private fun BulkBtn(
         enabled = enabled,
         contentPadding = PaddingValues(0.dp),
         colors = ButtonDefaults.outlinedButtonColors(contentColor = tint),
-        modifier = modifier.height(d.bulkH),
+        modifier = modifier.heightIn(min = d.bulkH),
     ) {
         Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
     }
 }
+
+/**
+ * Server-enforced auto-close-all at a floating-P&L target.
+ *
+ * The SERVER owns the guard (it polls MT5 and closes the book when FLOATING crosses the target),
+ * so the switch reflects `guard.enabled` from the snapshot, not local state. You set an amount and a
+ * direction, then flip the switch to arm; while armed the fields lock (toggle off to change). It
+ * STAYS armed after firing and re-arms once flat, so it keeps protecting until switched off. Because
+ * an account switch disarms it server-side, the switch here flips off automatically on a switch.
+ */
+@Composable
+private fun GuardBar(
+    guard: GuardUi,
+    floatingPl: Double?,
+    d: Dims,
+    onSetGuard: (Boolean?, Double?, String?) -> Unit,
+) {
+    val armed = guard.enabled
+    var amount by rememberSaveable { mutableStateOf("") }
+    var side by remember { mutableStateOf("profit") }
+    // Sync the draft to SERVER truth whenever it is armed (another client, or the account-switch
+    // reset). While disarmed the user's draft is left untouched.
+    LaunchedEffect(armed, guard.side, guard.target) {
+        if (armed) {
+            side = guard.side
+            amount = trimAmount(guard.target)
+        }
+    }
+
+    val amt = amount.trim().toDoubleOrNull()
+    val validAmt = amt != null && amt > 0
+    val wouldFireNow = !armed && amt != null && amt > 0 && floatingPl != null &&
+        (if (side == "loss") floatingPl <= -amt else floatingPl >= amt)
+
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Switch(
+                checked = armed,
+                onCheckedChange = { on ->
+                    // Arming needs a valid amount; without one the toggle is ignored (server stays
+                    // off, so the switch springs back) and the caption tells the user why.
+                    if (on) { if (validAmt) onSetGuard(true, amt, side) }
+                    else onSetGuard(false, null, null)
+                },
+            )
+            GuardSideChip("PROFIT", side == "profit", Green, enabled = !armed) { side = "profit" }
+            GuardSideChip("LOSS", side == "loss", Red, enabled = !armed) { side = "loss" }
+            BareField(
+                value = amount,
+                onValueChange = { amount = it },
+                height = d.fieldH,
+                keyboardType = KeyboardType.Number,
+                modifier = Modifier.weight(1f),
+                placeholder = "close-all at…",
+                enabled = !armed,
+            )
+        }
+        val (msg, msgColor) = when {
+            armed -> ("Auto-close ALL at ${if (guard.side == "loss") "-" else "+"}" +
+                "${trimAmount(guard.target)}  ·  FLOATING ${Fmt.signedMoney(floatingPl)}") to Green
+            wouldFireNow ->
+                "⚠ FLOATING already past this — arming will close ALL immediately" to Amber
+            !validAmt ->
+                "Close ALL when FLOATING reaches your target (server-enforced)" to
+                    MaterialTheme.colorScheme.onSurfaceVariant
+            else ->
+                "Arm to close ALL when FLOATING hits ${if (side == "loss") "-" else "+"}${amount.trim()}" to
+                    MaterialTheme.colorScheme.onSurfaceVariant
+        }
+        Text(msg, fontSize = 10.sp, color = msgColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun GuardSideChip(
+    label: String,
+    selected: Boolean,
+    tint: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Text(
+        label,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Bold,
+        color = if (selected) Color.Black else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (selected) tint else MaterialTheme.colorScheme.surfaceVariant)
+            .clickable(enabled = enabled) { onClick() }
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+    )
+}
+
+/** 500.0 -> "500", 500.5 -> "500.5" -- no trailing ".0" on whole amounts. */
+private fun trimAmount(v: Double): String =
+    if (v == v.toLong().toDouble()) v.toLong().toString() else v.toString()
 
 @Composable
 private fun AccountStrip(a: AccountUi) {
@@ -729,6 +1191,7 @@ private fun Stat(label: String, value: String, color: Color, modifier: Modifier)
         Text(label, fontSize = 9.sp, fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, fontFamily = FontFamily.Monospace, fontSize = 15.sp,
-            fontWeight = FontWeight.Bold, color = color, textAlign = TextAlign.Center)
+            fontWeight = FontWeight.Bold, color = color, textAlign = TextAlign.Center,
+            maxLines = 1, softWrap = false)
     }
 }

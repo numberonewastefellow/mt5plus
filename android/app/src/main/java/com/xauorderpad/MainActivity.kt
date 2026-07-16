@@ -17,11 +17,14 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -39,6 +42,10 @@ import com.xauorderpad.ui.StrategyScreen
 import com.xauorderpad.ui.TradeScreen
 import com.xauorderpad.ui.TradingViewModel
 import kotlinx.serialization.json.JsonObject
+
+// Upper bound on the system Font-Size multiplier the app will honour. The trade panel is a dense,
+// fixed-height layout; beyond this its two-line buttons overflow. Retune here if 1.15 is too tight.
+private const val MAX_FONT_SCALE = 1.15f
 
 class MainActivity : ComponentActivity() {
 
@@ -72,6 +79,15 @@ class MainActivity : ComponentActivity() {
         registerNetworkCallback()
 
         setContent {
+            // Clamp the system Font-Size so an accessibility "huge fonts" setting cannot inflate
+            // the dense trade panel past the heights its controls are laid out at -- unclamped, the
+            // two-line BUY/CLOSE text overflowed its button and painted onto the row below. The cap
+            // still allows a modest enlargement; it is one number (MAX_FONT_SCALE) to retune.
+            val base = LocalDensity.current
+            val clamped = remember(base) {
+                Density(base.density, base.fontScale.coerceIn(1f, MAX_FONT_SCALE))
+            }
+            CompositionLocalProvider(LocalDensity provides clamped) {
             // Dark, always. This is a trading screen: it is used in the dark, and the red/green
             // P&L semantics are far easier to read against a dark ground.
             MaterialTheme(colorScheme = dynamicDarkColorScheme(this)) {
@@ -90,6 +106,10 @@ class MainActivity : ComponentActivity() {
                 val profiles by vm.profiles.collectAsStateWithLifecycle()
                 val confirmCloses by vm.confirmCloses.collectAsStateWithLifecycle()
                 val live by vm.live.collectAsStateWithLifecycle()
+                val layoutMode by vm.layoutMode.collectAsStateWithLifecycle()
+                val candleTf by vm.candleTf.collectAsStateWithLifecycle()
+                val tickTime by vm.tickTime.collectAsStateWithLifecycle()
+                val guard by vm.guard.collectAsStateWithLifecycle()
                 val strategies by vm.strategies.collectAsStateWithLifecycle()
                 val strategy by vm.strategy.collectAsStateWithLifecycle()
                 val armed by vm.armed.collectAsStateWithLifecycle()
@@ -173,6 +193,10 @@ class MainActivity : ComponentActivity() {
                         val onDisconnect: () -> Unit = { vm.disconnect() }
                         val onToggleConfirm: (Boolean) -> Unit = { vm.setConfirmCloses(it) }
                         val onSettings: () -> Unit = { vm.goto(Screen.SETTINGS) }
+                        val onCycleLayout: () -> Unit = { vm.cycleLayout() }
+                        val onSelectTf: (Int) -> Unit = { vm.setCandleTf(it) }
+                        val onSetGuard: (Boolean?, Double?, String?) -> Unit =
+                            { en, tp, side -> vm.setGuard(en, tp, side) }
                         val onAccounts: () -> Unit = { vm.goto(Screen.ACCOUNTS) }
                         val onStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
                         val onCerts: () -> Unit = { vm.goto(Screen.CERTS) }
@@ -241,6 +265,13 @@ class MainActivity : ComponentActivity() {
                             serverUrl = vm.baseUrl,
                             live = live,
                             strategies = strategies,
+                            mode = layoutMode,
+                            onCycleLayout = callbacks.onCycleLayout,
+                            tickTime = tickTime,
+                            candleTf = candleTf,
+                            onSelectTf = callbacks.onSelectTf,
+                            guard = guard,
+                            onSetGuard = callbacks.onSetGuard,
                             modifier = inset,
                         )
 
@@ -304,6 +335,7 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+            }
             }
         }
     }

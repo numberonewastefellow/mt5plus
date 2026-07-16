@@ -61,6 +61,7 @@ AUTOSTOP_PATH = os.path.join(HERE, "autostop.ps1")
 SHIP_PS1_PATH = os.path.join(HERE, "ship.ps1")
 CADDY_PS1_PATH = os.path.join(HERE, "caddy_setup.ps1")
 CADDYFILE_PATH = os.path.join(HERE, "Caddyfile")
+AUTOLOGON_PS1_PATH = os.path.join(HERE, "autologon.ps1")
 
 RDP_PORT = 3389
 SSH_PORT = 22
@@ -661,6 +662,52 @@ def cmd_ship(cfg, args):
     print("\nShipped. Next:  python mt5_ec2.py caddy")
 
 
+def cmd_autologon(cfg, args):
+    """Configure Windows autologon on the box + drop an MT5 Startup shortcut.
+
+    Why: the `xauorderpad` task runs S4U/session-0, which has no interactive desktop -- and MT5 broker
+    logins hang ~60s on an IPC timeout there. Booting into a real logged-in Administrator desktop makes
+    logins instant, lets AutoTrading persist, and makes boot auto-login clean. Pair this with the
+    Interactive/AtLogOn task change in ship.ps1 (re-run `ship` to pick it up).
+
+    The Administrator password (decrypted from the EC2 key, same as `password`) is scp'd to a temp file
+    on the box and deleted by autologon.ps1 after Sysinternals Autologon stores it as an ENCRYPTED LSA
+    secret. It is never passed as an argv element.
+    """
+    ec2, _ = ec2_client(cfg)
+    state = load_state()
+    iid = require_instance(state)
+    ip = current_public_ip(ec2, iid)
+    if not ip:
+        sys.exit("Instance is not running - 'start' it first.")
+
+    data = ec2.get_password_data(InstanceId=iid)["PasswordData"].strip()
+    if not data:
+        sys.exit("Password not available yet (Windows takes ~4 min after first launch). Retry shortly.")
+    pw = load_private_key(cfg).decrypt(base64.b64decode(data), padding.PKCS1v15()).decode()
+
+    tmp = tempfile.mkdtemp(prefix="mt5_autologon_")
+    try:
+        opts = ssh_opts(cfg, os.path.join(tmp, "known_hosts"))
+        target = f"Administrator@{ip}"
+        pwfile = os.path.join(tmp, "pw.txt")
+        with open(pwfile, "w", newline="") as f:
+            f.write(pw)
+        r = subprocess.run(["scp", *opts, pwfile, f"{target}:C:/app/_autologon_pw.txt"],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            sys.exit(f"scp of the password file failed: {r.stderr.strip()}\n"
+                     f"(SSH open? your home IP may have changed -> 'fixfw')")
+        _run_ps1_on_box(opts, target, AUTOLOGON_PS1_PATH, "autologon.ps1", timeout=300)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\nAutologon set. Next:")
+    print("  1. Make sure the interactive task is shipped:  python mt5_ec2.py ship")
+    print("  2. Reboot the box (from RDP, or: ssh Administrator@<ip> shutdown /r /t 0)")
+    print("  3. RDP in ONCE to enable AutoTrading + tick 'Save password' (both persist).")
+
+
 def cmd_caddy(cfg, args):
     """Install/refresh the mTLS front door and (re)start it."""
     ec2, _ = ec2_client(cfg)
@@ -1024,6 +1071,7 @@ COMMANDS = {"create": cmd_create, "status": cmd_status, "start": cmd_start, "sto
             "password": cmd_password, "tunnel": cmd_tunnel, "ip": cmd_ip,
             "fixfw": cmd_fixfw, "autostop": cmd_autostop,
             "eip": cmd_eip, "ship": cmd_ship, "caddy": cmd_caddy,
+            "autologon": cmd_autologon,
             "login": cmd_login, "health": cmd_health,
             "terminate": cmd_terminate}
 

@@ -133,6 +133,34 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, Quote())
 
+    /**
+     * MT5 BROKER time of the latest tick (epoch seconds), for the Scalp candle countdown. Already
+     * arrives on the snapshot (`tick_time`); it was parsed and discarded until now. Its own slice so
+     * the countdown re-anchors on each tick without dragging other consumers into a per-tick recompose.
+     */
+    val tickTime: StateFlow<Long?> = feed
+        .map { it?.tickTime }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /**
+     * The account P&L guard as the SERVER reports it. The switch/amount on screen reflect what is
+     * actually armed on the box, so a guard armed on one phone shows armed on another, and an
+     * account switch (which disarms it server-side) flips the switch off here automatically.
+     */
+    val guard: StateFlow<GuardUi> = feed
+        .map {
+            val g = it?.guard
+            GuardUi(
+                enabled = g?.enabled == true,
+                target = g?.targetPl ?: 0.0,
+                side = g?.side ?: "profit",
+                fired = g?.fired == true,
+            )
+        }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, GuardUi())
+
     val health: StateFlow<Health> = feed
         .map {
             Health(
@@ -281,6 +309,28 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
     fun setConfirmCloses(v: Boolean) {
         secrets.confirmCloses = v
         _confirmCloses.value = v
+    }
+
+    /** Active trade-screen layout. Persisted; see Secrets.layoutMode. The top-bar chip cycles it. */
+    private val _layoutMode = MutableStateFlow(
+        LayoutMode.values().getOrElse(Feed.secrets.layoutMode) { LayoutMode.CLASSIC }
+    )
+    val layoutMode: StateFlow<LayoutMode> = _layoutMode.asStateFlow()
+
+    fun cycleLayout() {
+        val modes = LayoutMode.values()
+        val next = modes[(_layoutMode.value.ordinal + 1) % modes.size]
+        secrets.layoutMode = next.ordinal
+        _layoutMode.value = next
+    }
+
+    /** Scalp candle timeframe in MINUTES (1/2/5/15/30/60/240). Persisted; see Secrets.candleTf. */
+    private val _candleTf = MutableStateFlow(Feed.secrets.candleTf)
+    val candleTf: StateFlow<Int> = _candleTf.asStateFlow()
+
+    fun setCandleTf(minutes: Int) {
+        secrets.candleTf = minutes
+        _candleTf.value = minutes
     }
 
     // ---- armed side ------------------------------------------------------
@@ -948,6 +998,30 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
             }
         } finally {
             _closing.value = false
+        }
+    }
+
+    /**
+     * Arm/disarm/retune the server-enforced P&L guard. NOT gated on `live`: like the bulk-close
+     * bar, this is a protective control and the WebSocket can be stale while HTTP still works. The
+     * server validates and is authoritative; the switch reflects the next snapshot.
+     */
+    fun setGuard(enabled: Boolean?, targetPl: Double?, side: String?) = viewModelScope.launch {
+        val e = Feed.epoch
+        when (val r = Feed.api.setGuard(enabled, targetPl, side)) {
+            is ApiResult.Ok -> {
+                val g = r.value
+                if (g.enabled) {
+                    val sign = if (g.side == "loss") "-" else "+"
+                    say("Auto-close armed: ${g.side} at $sign${Fmt.money(g.targetPl)}", error = false)
+                } else {
+                    say("Auto-close off", error = false)
+                }
+            }
+            is ApiResult.Unauthorized -> onUnauthorized(e)
+            is ApiResult.TimedOut ->
+                say("Auto-close change TIMED OUT — check the switch.", error = true)
+            is ApiResult.Failed -> say("Auto-close: ${r.message}", error = true)
         }
     }
 

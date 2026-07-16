@@ -162,8 +162,13 @@ Step "Registering the '$TASK' task"
 # PowerShell and fails SILENTLY (user_data.ps1:50-53 learned this for ec2-autostop).
 $act = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$WRAPPER`""
-$trg = New-ScheduledTaskTrigger -AtStartup
-$prn = New-ScheduledTaskPrincipal -UserId "Administrator" -LogonType S4U -RunLevel Highest
+# Runs INSIDE the autologon desktop session (LogonType Interactive), NOT session 0 (was S4U). S4U has no
+# interactive desktop/profile -- and that is what made MT5 broker logins hang ~60s on an IPC timeout and
+# spawned a second, invisible terminal64. AtLogOn (not AtStartup) because an Interactive task fires when
+# Administrator logs on, which Windows autologon does automatically at boot (see `mt5_ec2.py autologon`).
+# Prerequisite: autologon MUST be configured, or this task never runs at boot (no logon -> no trigger).
+$trg = New-ScheduledTaskTrigger -AtLogOn -User "Administrator"
+$prn = New-ScheduledTaskPrincipal -UserId "Administrator" -LogonType Interactive -RunLevel Highest
 $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
@@ -172,26 +177,33 @@ if (-not (Get-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue)) {
     throw "FATAL: the '$TASK' task was not created."
 }
 
-Start-ScheduledTask -TaskName $TASK
+try { Start-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue } catch {}
 
 # --- 5. Prove it is listening -- on LOOPBACK, and nowhere else ----------------
+# The task now runs at Administrator LOGON in the interactive desktop session (Interactive principal
+# above), so it only starts once autologon has logged Administrator in. When shipping BEFORE the
+# autologon reboot there is no interactive session yet, so it won't be listening -- that is EXPECTED,
+# not a failure. If it IS up (post-reboot, or an old instance still running) we still assert the
+# fail-closed loopback binding; otherwise we defer verification to the post-reboot `health` check.
 $conn = $null
-foreach ($i in 1..30) {
+foreach ($i in 1..20) {
     Start-Sleep -Seconds 1
     $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
     if ($conn) { break }
 }
-if (-not $conn) {
-    throw "Registered, but nothing is listening on $Port after 30s. See C:\Users\Administrator\Documents\XauOrderPad\"
-}
-# Assert the WHOLE SET of listeners is loopback, not just the first. `-First 1` would pass while a
-# SECOND binding on this port sat wide open on 0.0.0.0 -- the exact state this check exists to
-# catch. Any non-loopback address in the set is a fail-closed violation.
-$addrs = @($conn | ForEach-Object { $_.LocalAddress } | Sort-Object -Unique)
-Write-Host "  uvicorn listening on $($addrs -join ', '):$Port"
-$bad = $addrs | Where-Object { $_ -notin @("127.0.0.1", "::1") }
-if ($bad) {
-    throw "FAIL-CLOSED VIOLATED: uvicorn is listening on $($bad -join ', ') (not only loopback). Reachable WITHOUT TLS or client-cert auth. Stop the task and investigate."
+if ($conn) {
+    # Assert the WHOLE SET of listeners is loopback, not just the first. A SECOND binding on this port
+    # sitting wide open on 0.0.0.0 is exactly what this catches. Any non-loopback address is a
+    # fail-closed violation.
+    $addrs = @($conn | ForEach-Object { $_.LocalAddress } | Sort-Object -Unique)
+    Write-Host "  uvicorn listening on $($addrs -join ', '):$Port"
+    $bad = $addrs | Where-Object { $_ -notin @("127.0.0.1", "::1") }
+    if ($bad) {
+        throw "FAIL-CLOSED VIOLATED: uvicorn is listening on $($bad -join ', ') (not only loopback). Reachable WITHOUT TLS or client-cert auth. Stop the task and investigate."
+    }
+} else {
+    Write-Host "  NOTE: '$TASK' is registered but not yet listening -- it starts at the Administrator logon."
+    Write-Host "        REBOOT the box (autologon), then verify with:  python mt5_ec2.py health"
 }
 
 Write-Host ""

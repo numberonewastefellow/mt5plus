@@ -125,10 +125,15 @@ object Feed {
         CertStore.init(context)
         if (!::secrets.isInitialized) secrets = Secrets.create(context)
         // "Launch and trade" demo build: import the client cert bundled in the APK (if any) so the
-        // EC2 mTLS path works with no manual upload. `http` was built at object-init WITHOUT a cert
-        // (CertStore needs a context, which we only have now), so rebuild it if one just loaded.
-        // Nothing has connected yet at init time, so this is a plain rebuild, not a live swap.
-        if (CertStore.seedFromAssetsIfEmpty(context, com.xauorderpad.BuildConfig.DEFAULT_P12_PASSWORD)) {
+        // EC2 mTLS path works with no manual upload.
+        CertStore.seedFromAssetsIfEmpty(context, com.xauorderpad.BuildConfig.DEFAULT_P12_PASSWORD)
+        // `http` was built at object-init WITHOUT a cert (CertStore had no context then, so tls()
+        // returned null). Rebuild it whenever a cert is present NOW -- not only right after a fresh
+        // seed. Otherwise any later start where the cert is already on disk (a normal process restart,
+        // or `adb install -r` which keeps app data so seedFromAssetsIfEmpty returns false) keeps the
+        // cert-less client, and every https handshake dies with "trust anchor for certification path
+        // not found". Nothing has connected yet at init time, so this is a plain rebuild, not a live swap.
+        if (CertStore.hasCerts()) {
             http = buildClient()
         }
     }

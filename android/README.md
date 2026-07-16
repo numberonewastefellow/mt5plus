@@ -131,17 +131,44 @@ Create `android/local.properties` — **gitignored**, so the token cannot be com
 ```properties
 xau.baseUrl=http://192.168.0.116:8765
 xau.token=<the token the server was started with>
+xau.p12Password=<password that unlocks the bundled demo client.p12>
+xau.defaultAccountPassword=<472200942 master password>
 ```
 
-These are compiled into `BuildConfig` and used to pre-fill the Connect screen, so the app opens
-straight on the Trade screen after a reinstall.
+These are compiled into `BuildConfig`. `xau.baseUrl` / `xau.token` pre-fill the Connect screen;
+`xau.p12Password` unlocks the bundled demo cert on first launch; `xau.defaultAccountPassword` is baked
+so the ACCOUNT form pre-fills the default account's password (see *Server catalog & default account*
+below). All stay in `local.properties`, which is **gitignored** — so they land in the APK but never in
+git.
 
-**Debug builds only. The release variant compiles them as `""`.** A signed release APK with a live
-trading token inside it is a secret you cannot rotate — anyone holding the APK can `strings` it out,
-and that token places orders on a real account.
+**Baked into every build now.** `xau.embedSecrets` defaults to **true** (see *Building the release
+APK*), so the release APK carries these too — treat any APK you build like the token itself. Build a
+secret-free APK with `-Pxau.embedSecrets=false`.
 
 `Secrets.kt` seeds from these defaults **only when nothing is stored**, so a value typed on the
 Connect screen always wins and is never silently reverted by the next install.
+
+---
+
+## Server catalog & default account
+
+**`app/src/main/assets/servers.json`** ships a curated list of MT5 broker servers and one default
+account. It exists because MT5 server names must match the broker **character-for-character**
+(`Exness-MT5Trial16`, `VTMarkets-Live 2` — a `Trail`/`Trial` swap or a missing space is a silent `-6`
+at the broker).
+
+- **Server dropdown.** On the ACCOUNT screen the *Server* field is a dropdown of `servers.json`
+  entries (`data/ServerCatalog.kt` reads the asset). It stays **editable**: a server not on the list can
+  be typed, and it is remembered (`ServerCatalog.addCustomServer`, in prefs `xau_servers`) so it appears
+  in the dropdown next time. Extend the built-in list by editing `servers.json` — no code change.
+- **Default account.** `servers.json → defaultAccount` (currently `472200942 / Exness-MT5Trial16`)
+  pre-fills the ACCOUNT form's login + server + label; the **password** is baked separately from
+  `BuildConfig.DEFAULT_ACCOUNT_PASSWORD` (`xau.defaultAccountPassword`, above). A fresh install opens
+  with the form ready — review and tap **LOG IN**. The login saves the password into the box vault
+  (`save=true`), which also repopulates it if the box ever loses the stored password.
+
+`servers.json` is **not** a secret (only login/server/label); the password is never in it — it comes
+from the gitignored `local.properties`.
 
 ---
 
@@ -203,22 +230,33 @@ the installed app.
 
 ---
 
-## Building the release APK — two forms
+## Building the release APK
 
 ```
-deploy.bat release         # CLEAN: no URL/token/cert baked in. The shippable, secret-free build.
-deploy.bat release demo    # embeds URL + token + demo cert (-Pxau.embedSecrets=true).
+deploy.bat release                          # bakes URL + token + demo cert + default account (DEFAULT)
+assembleRelease -Pxau.embedSecrets=false    # secret-free, extraction-proof build (opt-in)
 ```
 
-Both are signed with the `xau` release key and are **not** `debuggable`; the APK lands at
-`E:\temp\mt5_data\app-release.apk`. The difference is only what is compiled in:
+`xau.embedSecrets` now defaults to **true**, so a plain `deploy.bat release` is **self-contained**: the
+Connect screen is pre-filled, `CertStore.seedFromAssetsIfEmpty` auto-loads the bundled cert, and the
+ACCOUNT form is pre-filled with the default account — it connects with no manual setup. Signed with the
+`xau` release key, **not** `debuggable`; APK at `E:\temp\mt5_data\app-release.apk`.
 
-- **`release`** — `DEFAULT_BASE_URL` / `DEFAULT_TOKEN` / `DEFAULT_P12_PASSWORD` are `""` and **no**
-  `client.p12` is packaged (the demo certs live in `app/src/demoCerts/`, added to the release assets
-  *only* under `-Pxau.embedSecrets`). Nothing to extract — safe to distribute. The user types the URL +
-  token and imports a cert manually.
-- **`release demo`** — self-contained: the Connect screen is pre-filled and `CertStore.seedFromAssetsIfEmpty`
-  auto-loads the bundled cert on first launch, so it connects to the box with **no manual setup**.
+> `deploy.bat release demo` still works and is now identical to plain `release` (it passes the flag that
+> is already the default).
+
+**Secret-free build:** pass `-Pxau.embedSecrets=false`. Then `DEFAULT_BASE_URL` / `DEFAULT_TOKEN` /
+`DEFAULT_P12_PASSWORD` / `DEFAULT_ACCOUNT_PASSWORD` compile to `""`, no `client.p12` is packaged, and the
+user types the URL + token and imports a cert manually. This is the only build safe to distribute
+publicly.
+
+### Security: every default build is now extractable
+
+A baked build carries a live token, the client cert, **and the demo account's password**. Anyone holding
+the APK can `strings`/`unzip` them out and place orders on `472200942`. Mitigations: it is a **demo**
+account, the password lives in `local.properties` (never git), and signing stops someone *re-signing* a
+modified APK as us — it does **not** hide a baked-in string. Hand a baked APK only to someone you would
+trust with that account; for anything public, build with `-Pxau.embedSecrets=false`.
 
 ## Giving the `release demo` APK to someone else
 

@@ -61,6 +61,13 @@ class Mt5Worker:
         self._session_active = False
         self._poll_count = 0
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        # Account-level P&L guard: when enabled, the whole book auto-closes the moment FLOATING P&L
+        # reaches the target (profit >= +target, or loss <= -target). It STAYS enabled and re-arms
+        # after the book goes flat, so it keeps protecting until the user switches it off. Evaluated
+        # on THIS worker thread in _poll_state, so it never races ticks/orders. Reset on account
+        # switch (see _login/_logout) -- it must never carry a target from one account to another.
+        # `fired` latches a single close per breach so a 15 Hz poll does not re-close every tick.
+        self._guard = {"enabled": False, "target_pl": 0.0, "side": "profit", "fired": False}
         # The automated, demo-only strategy engines, keyed by id. All disabled
         # until enabled from a UI, and all evaluated on THIS worker thread, so
         # they never race ticks/orders -- or each other. Each owns a distinct
@@ -300,6 +307,8 @@ class Mt5Worker:
         st["strategies"] = {sid: s.status() for sid, s in self.strategies.items()}
         # Back-compat: the current web panel still reads st["strategy"].
         st["strategy"] = st["strategies"].get("straddle")
+        # Mirror the P&L guard so the phone shows what the SERVER is actually enforcing.
+        st["guard"] = dict(self._guard)
         self._swap(st)
 
         # Drive the engines AFTER the swap so any orders they place show up on the
@@ -315,6 +324,13 @@ class Mt5Worker:
             except Exception:
                 log.exception("strategy evaluate crashed",
                               extra={"event": "strategy_exception", "strategy": sid})
+
+        # Account-level P&L guard, AFTER the swap so its close shows next poll. Own try/except: a
+        # guard crash must never take down the worker or manual trading.
+        try:
+            self._check_guard(st)
+        except Exception:
+            log.exception("pnl guard crashed", extra={"event": "guard_exception"})
 
         # --- Structured event emission (post-swap, deliberately throttled) ---
         # We poll 15 times/sec; we do NOT want one log line every 67ms. Instead:
@@ -352,6 +368,57 @@ class Mt5Worker:
                             "net_lots": st.get("net_lots"),
                             "floating_pl": st.get("floating_pl")})
 
+    def _check_guard(self, st: dict) -> None:
+        """Account-level P&L guard: flatten the whole book when FLOATING P&L hits the target.
+
+        Compares `st["floating_pl"]` -- the SAME number the UI shows as FLOATING -- against the
+        armed target. Fires at most once per breach (`fired` latch), then re-arms once the book has
+        gone flat (P&L retreats back through zero), so it keeps protecting until switched off. Runs
+        on the worker thread, so it may call `_close_where` directly.
+        """
+        g = self._guard
+        if not g.get("enabled"):
+            return
+        pl = st.get("floating_pl")
+        if pl is None:
+            return
+        target = float(g.get("target_pl") or 0.0)
+        if target <= 0:
+            return
+        side = g.get("side", "profit")
+        breach = (pl >= target) if side == "profit" else (pl <= -target)
+
+        if breach and not g.get("fired"):
+            res = self._close_where("all")
+            g["fired"] = True
+            log.warning("pnl guard fired",
+                        extra={"event": "guard_fired", "side": side, "target": target,
+                               "floating_pl": pl, "remaining": res.get("remaining")})
+        elif not breach:
+            # Hysteresis: re-arm only once P&L has crossed back through zero (book flat/reversed),
+            # not the instant it dips under the target -- otherwise it could chatter around the line.
+            retreated = (pl <= 0) if side == "profit" else (pl >= 0)
+            if retreated:
+                g["fired"] = False
+
+    def _apply_guard(self, cmd: dict) -> dict:
+        """Arm/disarm/retune the P&L guard from a client command. Re-arming clears the fired latch."""
+        g = self._guard
+        if cmd.get("enabled") is not None:
+            g["enabled"] = bool(cmd["enabled"])
+        side = cmd.get("side")
+        if side in ("profit", "loss"):
+            g["side"] = side
+        tp = cmd.get("target_pl")
+        if tp is not None:
+            try:
+                g["target_pl"] = max(0.0, float(tp))
+            except (TypeError, ValueError):
+                pass
+        # Any (re)arm or param change resets the latch, so a fresh target can fire immediately.
+        g["fired"] = False
+        return {"ok": True, "guard": dict(g)}
+
     def _swap(self, st: dict) -> None:
         with self._lock:
             self._state = st
@@ -369,6 +436,8 @@ class Mt5Worker:
             return self._close_all()
         if action == "close_where":
             return self._close_where(cmd.get("filter") or "all")
+        if action == "guard":
+            return self._apply_guard(cmd)
         if action == "login":
             return self._login(cmd)
         if action == "logout":
@@ -568,6 +637,9 @@ class Mt5Worker:
         self._resolve_symbol()
         # daily realized / wins / losses belong to the account -> reset on switch.
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        # The P&L guard is per-account too: a "close at +$500" armed on account A must NEVER carry
+        # to account B. Disarm on every switch; the user re-arms for the new account if they want.
+        self._guard = {"enabled": False, "target_pl": 0.0, "side": "profit", "fired": False}
         self._poll_count = 0
         self._last_healthy = None
         # The book belongs to the account too. Re-derive every engine from THIS
@@ -604,6 +676,7 @@ class Mt5Worker:
         self._initialized = False
         self._session_active = False
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
+        self._guard = {"enabled": False, "target_pl": 0.0, "side": "profit", "fired": False}
         self._last_healthy = None
         log.info("account logout",
                  extra={"event": "account_logout", "prev_open": prev_open})

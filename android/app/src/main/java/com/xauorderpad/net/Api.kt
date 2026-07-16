@@ -191,6 +191,26 @@ class Api(
         return r
     }
 
+    /**
+     * Arm/disarm/retune the account P&L guard (server-enforced auto-close-all at a target).
+     * All params optional. The server VALIDATES (side profit|loss, target in [0,1e7]) and is the
+     * authority — the returned [Guard] and the next snapshot reflect what is actually armed. A bad
+     * value comes back as a 400 -> ApiResult.Failed, so the caller cannot silently mis-arm.
+     */
+    suspend fun setGuard(
+        enabled: Boolean?,
+        targetPl: Double?,
+        side: String?,
+    ): ApiResult<Guard> = post(
+        path = "/api/guard",
+        body = buildJsonObject {
+            if (enabled != null) put("enabled", JsonPrimitive(enabled))
+            if (targetPl != null) put("target_pl", JsonPrimitive(targetPl))
+            if (side != null) put("side", JsonPrimitive(side))
+        },
+        client = tradeHttp(),
+    ) { json.decodeFromString<GuardResp>(it).guard ?: Guard() }
+
     // ---- session ---------------------------------------------------------
 
     /** Unauthenticated probe: reports THAT a token is required, never what it is. */

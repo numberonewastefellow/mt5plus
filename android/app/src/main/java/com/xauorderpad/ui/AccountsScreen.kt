@@ -21,8 +21,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -37,6 +42,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -44,6 +50,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.xauorderpad.BuildConfig
+import com.xauorderpad.data.ServerCatalog
 import com.xauorderpad.net.Profile
 
 /**
@@ -95,11 +103,17 @@ fun AccountsScreen(
     // The password is a plain `remember`, deliberately. rememberSaveable writes into the saved
     // instance state Bundle, which Android may persist to disk. A broker password does not go
     // to disk on the phone. Losing it on a process death is the correct trade.
-    var label by rememberSaveable { mutableStateOf("") }
-    var login by rememberSaveable { mutableStateOf("") }
-    var server by rememberSaveable { mutableStateOf("") }
+    // Pre-fill the form from the shipped default account (servers.json) plus the baked password, so a
+    // fresh install can log in with one tap. rememberSaveable keeps any edits across recreation; the
+    // okTick effect below blanks the form once a login actually succeeds. When no default is shipped
+    // the fields start empty, exactly as before.
+    val context = LocalContext.current
+    val defaultAcct = remember { ServerCatalog.load(context).defaultAccount }
+    var label by rememberSaveable { mutableStateOf(defaultAcct?.label ?: "") }
+    var login by rememberSaveable { mutableStateOf(defaultAcct?.login?.toString() ?: "") }
+    var server by rememberSaveable { mutableStateOf(defaultAcct?.server ?: "") }
     var save by rememberSaveable { mutableStateOf(true) }
-    var password by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf(BuildConfig.DEFAULT_ACCOUNT_PASSWORD) }
 
     // Cleared on a successful typed login ONLY. Clearing it on send meant a one-character typo in
     // the server name cost you the whole password as well.
@@ -228,8 +242,7 @@ fun AccountsScreen(
                      keyboard = KeyboardType.Password, isPassword = true, enabled = !busy,
                      error = v.password, warn = v.passwordWarning)
 
-            AccField(server, { server = it }, "Server", "Exness-MT5Trial16",
-                     enabled = !busy, error = v.server)
+            ServerDropdown(server, { server = it }, enabled = !busy, error = v.server)
 
             // No "Terminal path" field: the server no longer accepts a client-supplied path
             // (it launched that executable -- a remote-code-execution hole). The terminal the
@@ -264,7 +277,12 @@ fun AccountsScreen(
             Button(
                 // The password is NOT cleared here. It is cleared on the success tick, and only
                 // there -- see the LaunchedEffect above.
-                onClick = { onLoginWith(login, password, server, save, label) },
+                onClick = {
+                    // Remember a hand-typed server so it appears in the dropdown next time (no-op for
+                    // a built-in or an already-known name).
+                    ServerCatalog.addCustomServer(context, server)
+                    onLoginWith(login, password, server, save, label)
+                },
                 enabled = !busy && v.valid,
                 modifier = Modifier.fillMaxWidth().height(48.dp),
             ) {
@@ -478,10 +496,94 @@ fun validateAccountForm(login: String, password: String, server: String): Accoun
     val s = server.trim()
     val srvErr = when {
         s.isEmpty() -> "required"
-        s.any { it.isWhitespace() } -> "an MT5 server name has no spaces"
+        // Internal spaces are legitimate: many brokers name servers "VTMarkets-Live 2".
+        // The API collapses whitespace runs (server.py _validated_server), so only genuine
+        // paste garbage -- tabs / newlines -- is worth blocking here. Leading/trailing spaces
+        // are already gone via server.trim() above.
+        s.any { it.isWhitespace() && it != ' ' } -> "no tabs or line breaks in a server name"
         else -> null
     }
     return AccountFormErrors(loginErr, pwErr, srvErr, pwWarn)
+}
+
+/**
+ * The Server field as a dropdown of known MT5 servers (servers.json + any the user has typed before),
+ * but still fully editable so a server not on the list can just be typed. A hand-typed name is
+ * remembered on LOG IN and shows in the list next time.
+ *
+ * Editable, not pick-only: MT5 server names must match the broker's EXACTLY (a "Trail"/"Trial" swap or
+ * a missing space is a silent -6), and no curated list is ever complete — so the field accepts free
+ * text; the dropdown just removes the typing for the common ones.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ServerDropdown(
+    value: String,
+    onChange: (String) -> Unit,
+    enabled: Boolean,
+    error: String? = null,
+) {
+    val context = LocalContext.current
+    val brokerOf = remember { ServerCatalog.load(context).servers.associate { it.name to it.broker } }
+    var expanded by remember { mutableStateOf(false) }
+    // Recomputed each time the menu opens so a name just added via free-text (and persisted) appears.
+    val names = remember(expanded) { ServerCatalog.serverNames(context) }
+
+    val show = if (value.isNotEmpty()) error else null
+    val q = value.trim()
+    // Show the whole list when the field is empty or already holds a known server -- otherwise a
+    // pre-filled value (e.g. the default account's server) would filter the dropdown down to itself and
+    // hide every other choice. Filter only while the user is typing a genuine partial/custom name.
+    val exact = names.any { it.equals(q, ignoreCase = true) }
+    val matches = if (q.isEmpty() || exact) names else names.filter { it.contains(q, ignoreCase = true) }
+
+    Column(Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
+        ExposedDropdownMenuBox(
+            expanded = expanded && enabled,
+            onExpandedChange = { if (enabled) expanded = it },
+        ) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = { onChange(it); expanded = true },
+                enabled = enabled,
+                singleLine = true,
+                isError = show != null,
+                label = { Text("Server", fontSize = 11.sp) },
+                placeholder = { Text("Exness-MT5Trial16", fontSize = 12.sp) },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier
+                    .menuAnchor(MenuAnchorType.PrimaryEditable, enabled)
+                    .fillMaxWidth(),
+            )
+            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                for (name in matches) {
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(name, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                brokerOf[name]?.takeIf { it.isNotBlank() }?.let {
+                                    Text(it, fontSize = 10.sp,
+                                         color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        },
+                        onClick = { onChange(name); expanded = false },
+                    )
+                }
+                // Offer the free-typed value explicitly when it is not a known server.
+                if (q.isNotEmpty() && !exact) {
+                    DropdownMenuItem(
+                        text = { Text("Use \"$q\" — not listed", fontSize = 12.sp, color = Amber) },
+                        onClick = { onChange(q); expanded = false },
+                    )
+                }
+            }
+        }
+        show?.let {
+            Text("⚠ $it", fontSize = 10.sp, color = Red,
+                 modifier = Modifier.padding(start = 4.dp, top = 2.dp))
+        }
+    }
 }
 
 @Composable

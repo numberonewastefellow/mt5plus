@@ -99,6 +99,31 @@ data class StrategiesUi(
  * [count] == 0 means there is nothing to close on this side, and the button is disabled -- it
  * must never fall through to closing a position on the OTHER side.
  */
+/**
+ * The account P&L guard as the SERVER reports it (auto-close-all at a floating-P&L target). The
+ * server enforces it; this slice is only the phone's view of that state, so the switch/amount on
+ * screen reflect what is actually armed on the box. Its own slice so a price tick does not
+ * recompose the guard control.
+ */
+@Immutable
+data class GuardUi(
+    val enabled: Boolean = false,
+    val target: Double = 0.0,
+    /** "profit" | "loss" */
+    val side: String = "profit",
+    val fired: Boolean = false,
+)
+
+/**
+ * Which trade-screen layout is active. The top-bar chip cycles through them.
+ *  - CLASSIC: the original layout.
+ *  - COMPACT: denser (number-only quotes, inline LOT/SL/TP) for large-font / zoomed phones.
+ *  - SCALP:   COMPACT order form + a trimmed account badge and an MT5 candle-close countdown.
+ *
+ * Persisted as an ordinal Int in Secrets; see Secrets.layoutMode.
+ */
+enum class LayoutMode { CLASSIC, COMPACT, SCALP }
+
 @Immutable
 data class ArmedUi(
     /** "buy" | "sell" */

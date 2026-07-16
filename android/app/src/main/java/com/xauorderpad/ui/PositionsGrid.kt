@@ -203,6 +203,8 @@ private fun RowScope.Head(text: String, weight: Float, align: TextAlign = TextAl
     fontWeight = FontWeight.Bold,
     textAlign = align,
     color = MaterialTheme.colorScheme.onSurfaceVariant,
+    maxLines = 1,
+    softWrap = false,
 )
 
 @Composable
@@ -212,6 +214,8 @@ private fun RowScope.Mono(text: String, weight: Float) = Text(
     textAlign = TextAlign.End,
     fontFamily = FontFamily.Monospace,
     fontSize = 12.sp,
+    maxLines = 1,
+    softWrap = false,
 )
 
 /** A position with no stop loss. Amber, not red: it is a warning, not an error. */

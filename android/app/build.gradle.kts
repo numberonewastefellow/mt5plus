@@ -50,15 +50,21 @@ val devToken = devDefault("xau.token", "XAU_TOKEN")
 // Connect screen is still shown (URL + token pre-filled); the user taps CONNECT. DEBUG only.
 val devP12Password = devDefault("xau.p12Password", "XAU_P12_PASSWORD")
 
-// Opt-in for a NON-clean release: `assembleRelease -Pxau.embedSecrets=true` bakes the same
-// URL/token/p12-password the debug build uses (and bundles the demo certs -- see sourceSets below)
-// into a SIGNED, non-debuggable release, for handing to a tester without a manual setup.
+// The MASTER password for the default account (servers.json -> defaultAccount, currently the Exness
+// demo 472200942). Baked into BuildConfig so the ACCOUNT form pre-fills it; sourced from
+// local.properties (gitignored) so the secret lands in the APK but never in git. Blank -> the form
+// pre-fills login + server only and the user types the password once.
+val devAccountPassword = devDefault("xau.defaultAccountPassword", "XAU_DEFAULT_ACCOUNT_PASSWORD")
+
+// Whether the RELEASE build also bakes the URL/token/p12-password/account-password and bundles the
+// demo certs. DEFAULTS TO TRUE (baked into every build, per product decision) -- pass
+// `-Pxau.embedSecrets=false` to build a secret-free, extraction-proof release (empty DEFAULT_* fields,
+// no client.p12 packaged). Debug always bakes regardless.
 //
-// Absent (the default, and the shippable form), the release build is secret-free: the three
-// DEFAULT_* fields are "" and no client.p12 is packaged, so there is nothing to extract. Signing
-// stops someone RE-signing a modified APK as us; it does NOT hide a baked-in string, so the only
-// build that is safe to leak is this flag turned OFF.
-val embedSecrets = (project.findProperty("xau.embedSecrets") as String?)?.toBoolean() == true
+// SECURITY: with this on, the release APK carries a live token + client cert + the demo account's
+// password. Anyone holding the APK can `strings` them out and place orders on that (demo) account.
+// The signature stops someone RE-signing a modified APK as us; it does NOT hide a baked-in string.
+val embedSecrets = (project.findProperty("xau.embedSecrets") as String?)?.toBoolean() ?: true
 
 android {
     namespace = "com.xauorderpad"
@@ -103,6 +109,8 @@ android {
             buildConfigField("String", "DEFAULT_TOKEN", "\"$devToken\"")
             // Demo build: the password that unlocks the client.p12 bundled in assets/certs/.
             buildConfigField("String", "DEFAULT_P12_PASSWORD", "\"$devP12Password\"")
+            // The default account's master password -> the ACCOUNT form pre-fills it.
+            buildConfigField("String", "DEFAULT_ACCOUNT_PASSWORD", "\"$devAccountPassword\"")
         }
         release {
             // R8 off: ~15 files, nothing meaningful to shrink, and it only adds a way for
@@ -119,6 +127,7 @@ android {
             buildConfigField("String", "DEFAULT_BASE_URL",     "\"${if (embedSecrets) devBaseUrl else ""}\"")
             buildConfigField("String", "DEFAULT_TOKEN",        "\"${if (embedSecrets) devToken else ""}\"")
             buildConfigField("String", "DEFAULT_P12_PASSWORD", "\"${if (embedSecrets) devP12Password else ""}\"")
+            buildConfigField("String", "DEFAULT_ACCOUNT_PASSWORD", "\"${if (embedSecrets) devAccountPassword else ""}\"")
         }
     }
 

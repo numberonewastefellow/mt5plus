@@ -78,6 +78,30 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
             prefs.edit().putBoolean(KEY_CONFIRM_CLOSES, v).apply()
         }
 
+    // Which trade-screen layout is active, persisted as an ordinal (0=Classic, 1=Compact, 2=Scalp);
+    // see ui.LayoutMode. The top-bar chip cycles it. Seeded from the OLD boolean `compact_layout`
+    // pref if this device still has it (true -> Compact=1), so an in-place upgrade does not reset.
+    @Volatile private var cachedLayoutMode: Int =
+        prefs.getInt(KEY_LAYOUT_MODE, if (prefs.getBoolean(KEY_COMPACT_LAYOUT, false)) 1 else 0)
+
+    var layoutMode: Int
+        get() = cachedLayoutMode
+        set(v) {
+            cachedLayoutMode = v
+            prefs.edit().putInt(KEY_LAYOUT_MODE, v).apply()
+        }
+
+    // Selected candle timeframe for the Scalp countdown, in MINUTES (1/2/5/15/30/60/240).
+    // Default 15 (M15). Persisted so the choice survives a relaunch.
+    @Volatile private var cachedCandleTf: Int = prefs.getInt(KEY_CANDLE_TF, 15)
+
+    var candleTf: Int
+        get() = cachedCandleTf
+        set(v) {
+            cachedCandleTf = v
+            prefs.edit().putInt(KEY_CANDLE_TF, v).apply()
+        }
+
     // Which side the ENTRY button trades: "buy" or "sell". Persisted, like the web UI, so the
     // trader is not re-arming it every launch.
     //
@@ -153,6 +177,9 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
         private const val KEY_TOKEN = "token"
         private const val KEY_CONNECTED = "connected"
         private const val KEY_CONFIRM_CLOSES = "confirm_closes"
+        private const val KEY_COMPACT_LAYOUT = "compact_layout"   // legacy bool; migrated into KEY_LAYOUT_MODE
+        private const val KEY_LAYOUT_MODE = "layout_mode"
+        private const val KEY_CANDLE_TF = "candle_tf"
         private const val KEY_ARMED_SIDE = "armed_side"
 
         /**

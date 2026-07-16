@@ -1,0 +1,15 @@
+{
+  "servers": [
+    { "name": "Exness-MT5Trial16", "broker": "Exness — demo" },
+    { "name": "Exness-MT5Trial", "broker": "Exness — demo" },
+    { "name": "Exness-MT5Real", "broker": "Exness — live" },
+    { "name": "VTMarkets-Live 2", "broker": "VT Markets — live" },
+    { "name": "VTMarkets-Live 3", "broker": "VT Markets — live" },
+    { "name": "VTMarkets-Demo", "broker": "VT Markets — demo" }
+  ],
+  "defaultAccount": {
+    "login": 472200942,
+    "server": "Exness-MT5Trial16",
+    "label": "Exness Demo"
+  }
+}

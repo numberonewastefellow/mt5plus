@@ -85,6 +85,9 @@ data class Snapshot(
      * toggles them.
      */
     val strategies: Map<String, StrategyStatus>? = null,
+
+    /** The account P&L guard the SERVER is enforcing (auto-close-all at a target). See [Guard]. */
+    val guard: Guard? = null,
 ) {
     /** Spread in points -- the unit the UI shows. Null when either half is missing. */
     val spreadPoints: Double?
@@ -138,6 +141,29 @@ data class StrategyParams(
     val volume: Double? = null,
     @SerialName("max_positions") val maxPositions: Int? = null,
     val paper: Boolean? = null,
+)
+
+/**
+ * The account-level P&L guard, as the SERVER reports it (it rides the /ws snapshot). The worker
+ * enforces it — auto-closes the whole book when FLOATING P&L reaches [targetPl] — so this is the
+ * authoritative state; the phone reflects it rather than tracking its own. `fired` latches for one
+ * breach and clears once the book goes flat.
+ */
+@Immutable
+@Serializable
+data class Guard(
+    val enabled: Boolean = false,
+    @SerialName("target_pl") val targetPl: Double = 0.0,
+    /** "profit" (close at >= +target) | "loss" (close at <= -target). */
+    val side: String = "profit",
+    val fired: Boolean = false,
+)
+
+/** The /api/guard POST response: `{"ok":true,"guard":{…}}`. */
+@Serializable
+data class GuardResp(
+    val ok: Boolean = false,
+    val guard: Guard? = null,
 )
 
 @Immutable

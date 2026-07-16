@@ -334,6 +334,18 @@ class CloseWhereReq(BaseModel):
     filter: str = "all"          # "all" | "losing" | "profit"
 
 
+class GuardReq(BaseModel):
+    """Arm/disarm the account P&L guard: auto-close the whole book when FLOATING P&L hits a target.
+
+    All fields optional (send just `enabled` to toggle). The WORKER enforces it against live broker
+    P&L every poll; this endpoint only forwards — a guard that lived in the HTTP layer would be one
+    forged request away from being bypassed, same reasoning as StrategyReq.
+    """
+    enabled: bool | None = None
+    target_pl: float | None = None      # >= 0; the amount, in account currency
+    side: str | None = None             # "profit" (close at >= +target) | "loss" (close at <= -target)
+
+
 class StrategyReq(BaseModel):
     """Enable/disable + tune ONE automated strategy engine.
 
@@ -889,6 +901,24 @@ async def close_where(req: CloseWhereReq,
     log.info("close-where requested", extra={"event": "close_where_http",
                                              "filter": req.filter})
     return JSONResponse(await _do({"action": "close_where", "filter": req.filter}))
+
+
+@app.post("/api/guard")
+async def set_guard(req: GuardReq, x_token: str | None = Header(default=None)):
+    """Arm/disarm/retune the account P&L guard. Serialized through the worker queue with
+    ticks/orders, so a fire never races a manual order. The worker enforces it; this only forwards."""
+    _check_token(x_token)
+    if req.side is not None and req.side not in ("profit", "loss"):
+        raise HTTPException(status_code=400,
+                            detail=f"side must be profit|loss, got {req.side!r}")
+    if req.target_pl is not None:
+        if not math.isfinite(req.target_pl) or req.target_pl < 0 or req.target_pl > 1e7:
+            raise HTTPException(status_code=400,
+                                detail="target_pl must be a finite number in [0, 1e7]")
+    log.info("guard set", extra={"event": "guard_set_http", "enabled": req.enabled,
+                                 "target_pl": req.target_pl, "side": req.side})
+    return JSONResponse(await _do({"action": "guard", "enabled": req.enabled,
+                                   "target_pl": req.target_pl, "side": req.side}))
 
 
 @app.get("/api/config")

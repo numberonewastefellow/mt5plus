@@ -107,12 +107,12 @@ goto :done
 
 
 rem ------------------------------------------------------------ release -----
-rem Build the SIGNED release APK. Two forms:
-rem     deploy.bat release          -> CLEAN: no URL/token/cert baked in. The shippable build;
-rem                                    useless if extracted (nothing to extract).
-rem     deploy.bat release demo     -> embeds the dev URL + token + demo cert (-Pxau.embedSecrets),
-rem                                    for handing a ready-to-run build to a tester. As extractable
-rem                                    as debug, but signed with the real key and NOT debuggable.
+rem Build the SIGNED release APK. Secrets are baked BY DEFAULT now (xau.embedSecrets defaults true):
+rem     deploy.bat release          -> BAKED: URL + token + demo cert + default account compiled in.
+rem                                    Self-contained, but EXTRACTABLE -- treat the APK like the token.
+rem     deploy.bat release clean    -> secret-free (-Pxau.embedSecrets=false): nothing to extract; the
+rem                                    user types URL/token and imports a cert. The only public-safe form.
+rem     (`deploy.bat release demo` still works and is now identical to plain `release`.)
 rem
 rem Signing comes from android/.env (keystore passwords) via docker-compose. If the container was
 rem started BEFORE android/.env existed, it does not have those vars and the build fails the signing
@@ -121,11 +121,11 @@ rem gate -- run `docker compose up -d` once to recreate it, then retry.
 call :ensure_container || goto :fail
 
 set "EMBED="
-if /I "%~2"=="demo" set "EMBED=-Pxau.embedSecrets=true"
+if /I "%~2"=="clean" set "EMBED=-Pxau.embedSecrets=false"
 if defined EMBED (
-    echo [deploy] RELEASE build WITH embedded secrets ^(demo -- URL/token/cert baked in^)
+    echo [deploy] RELEASE build ^(clean, secret-free -- nothing to extract^)
 ) else (
-    echo [deploy] RELEASE build ^(clean, secret-free -- the shippable artifact^)
+    echo [deploy] RELEASE build WITH embedded secrets ^(URL/token/cert/account baked -- treat like the token^)
 )
 
 docker compose exec -T %SVC% sh ./gradlew :app:assembleRelease %EMBED%
