@@ -66,7 +66,9 @@ TIMEFRAME_M1 = 1
 SYMBOL_TRADE_MODE_FULL = 4
 TRADE_RETCODE_DONE = 10009
 TRADE_RETCODE_REQUOTE = 10004
+DEAL_ENTRY_IN = 0
 DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT, DEAL_ENTRY_OUT_BY = 1, 2, 3
+DEAL_TYPE_BUY, DEAL_TYPE_SELL = 0, 1
 
 _lock = threading.RLock()
 
@@ -243,8 +245,47 @@ def orders_get(symbol: str | None = None):
     return ()
 
 
+def _seed_deals():
+    """A deterministic book of today's closed trades for the /api/history endpoint test.
+
+    Five positions, each an IN leg + an OUT leg, paired by position_id:
+      wins:   +48.00 (1001), +9.00 (1004)         -> gross_profit +57.00
+      losses: -22.00 (1002), -52.00 (1005)        -> gross_loss   -74.00
+      flat:     0.00 (1003)
+    So net = -17.00, wins=2, losses=2, flat=1, closed_count=5, biggest_win=+48, biggest_loss=-52.
+    `pnl` on an OUT leg = profit + swap + commission; win/loss is classified on `profit` alone.
+    """
+    base = int(time.time()) - 3600
+    def deal(ticket, pid, entry, dtype, price, t, profit=0.0, swap=0.0, comm=0.0):
+        return SimpleNamespace(
+            ticket=ticket, order=ticket, position_id=pid, entry=entry, type=dtype,
+            price=price, time=t, profit=profit, swap=swap, commission=comm,
+            symbol="XAUUSD", volume=0.10, magic=0, comment="",
+        )
+    d = []
+    # 1001 BUY win +48 (profit 50, commission -2)
+    d += [deal(1, 1001, DEAL_ENTRY_IN, DEAL_TYPE_BUY, 2400.00, base + 10),
+          deal(2, 1001, DEAL_ENTRY_OUT, DEAL_TYPE_SELL, 2405.00, base + 70, 50.0, 0.0, -2.0)]
+    # 1002 SELL loss -22 (profit -20, commission -2)
+    d += [deal(3, 1002, DEAL_ENTRY_IN, DEAL_TYPE_SELL, 2410.00, base + 120),
+          deal(4, 1002, DEAL_ENTRY_OUT, DEAL_TYPE_BUY, 2412.00, base + 180, -20.0, 0.0, -2.0)]
+    # 1003 BUY flat 0
+    d += [deal(5, 1003, DEAL_ENTRY_IN, DEAL_TYPE_BUY, 2400.00, base + 200),
+          deal(6, 1003, DEAL_ENTRY_OUT, DEAL_TYPE_SELL, 2400.00, base + 260, 0.0, 0.0, 0.0)]
+    # 1004 BUY win +9 (profit 10, commission -1)
+    d += [deal(7, 1004, DEAL_ENTRY_IN, DEAL_TYPE_BUY, 2400.00, base + 300),
+          deal(8, 1004, DEAL_ENTRY_OUT, DEAL_TYPE_SELL, 2401.00, base + 360, 10.0, 0.0, -1.0)]
+    # 1005 SELL loss -52 (profit -50, commission -2)
+    d += [deal(9, 1005, DEAL_ENTRY_IN, DEAL_TYPE_SELL, 2415.00, base + 400),
+          deal(10, 1005, DEAL_ENTRY_OUT, DEAL_TYPE_BUY, 2420.00, base + 460, -50.0, 0.0, -2.0)]
+    return tuple(d)
+
+
+_SEED_DEALS = _seed_deals()
+
+
 def history_deals_get(*args, **kwargs):
-    return ()
+    return _SEED_DEALS
 
 
 def copy_rates_from_pos(symbol: str, timeframe: int, start: int, count: int):

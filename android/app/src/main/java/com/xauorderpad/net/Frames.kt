@@ -210,6 +210,8 @@ data class Position(
      * it is a frozen book presented as live. That is the worst possible failure here.
      */
     val magic: Long? = null,
+    /** Present on the account-wide history view (many symbols); absent/null on the live poll. */
+    val symbol: String? = null,
 ) {
     val isBuy: Boolean get() = side.equals("BUY", ignoreCase = true)
     val hasSl: Boolean get() = (sl ?: 0.0) > 0.0
@@ -227,7 +229,10 @@ data class PendingOrder(
     val tp: Double? = null,
     val type: String? = null,
     val time: Long? = null,
-)
+    val symbol: String? = null,
+) {
+    val isBuy: Boolean get() = side.equals("BUY", ignoreCase = true)
+}
 
 /** GET /api/config -- unauthenticated probe. Says THAT a token is needed, never what. */
 @Serializable
@@ -238,6 +243,61 @@ data class ServerConfig(
 
 @Serializable
 data class AccountsResponse(val accounts: List<Profile> = emptyList())
+
+/**
+ * GET /api/history -- today's trading activity for the logged-in account (broker-side, on demand).
+ * All fields nullable-with-default: a partial/failed body must still parse (see the parser config
+ * at the top of this file) rather than throw and blank the screen.
+ */
+@Immutable
+@Serializable
+data class HistoryStats(
+    @SerialName("closed_count") val closedCount: Int = 0,
+    val wins: Int = 0,
+    val losses: Int = 0,
+    val flat: Int = 0,
+    @SerialName("gross_profit") val grossProfit: Double = 0.0,
+    @SerialName("gross_loss") val grossLoss: Double = 0.0,
+    val net: Double = 0.0,
+    @SerialName("biggest_win") val biggestWin: Double = 0.0,
+    @SerialName("biggest_loss") val biggestLoss: Double = 0.0,
+    @SerialName("avg_win") val avgWin: Double = 0.0,
+    @SerialName("avg_loss") val avgLoss: Double = 0.0,
+    /** wins / closed_count, 0..1 (matches the broker's "81%"). */
+    @SerialName("win_rate") val winRate: Double = 0.0,
+)
+
+/** One closed trade: a closing deal paired with its opening deal (entry -> exit). */
+@Immutable
+@Serializable
+data class ClosedTrade(
+    @SerialName("position_id") val positionId: Long = 0,
+    val ticket: Long = 0,
+    val side: String? = null,               // the POSITION's direction, "BUY" | "SELL"
+    val symbol: String? = null,
+    val volume: Double? = null,
+    /** null when the position was opened BEFORE today (no IN leg in range) -> render "-> exit". */
+    @SerialName("entry_price") val entryPrice: Double? = null,
+    @SerialName("exit_price") val exitPrice: Double? = null,
+    @SerialName("entry_time") val entryTime: Long? = null,
+    @SerialName("exit_time") val exitTime: Long? = null,
+    /** profit + swap + commission of the closing leg, account currency. */
+    val pnl: Double = 0.0,
+) {
+    val isBuy: Boolean get() = side.equals("BUY", ignoreCase = true)
+}
+
+@Serializable
+data class HistoryResponse(
+    val ok: Boolean = false,
+    @SerialName("as_of") val asOf: Long = 0,
+    @SerialName("day_start") val dayStart: Long = 0,
+    val stats: HistoryStats = HistoryStats(),
+    val closed: List<ClosedTrade> = emptyList(),
+    val open: List<Position> = emptyList(),
+    val pending: List<PendingOrder> = emptyList(),
+    val error: String? = null,
+)
 
 @Immutable
 @Serializable

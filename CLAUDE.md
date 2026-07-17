@@ -32,6 +32,15 @@ wrong answer. Do not re-merge them, and do not copy a section from one into the 
 
 ## Things that have already gone wrong here. Do not repeat them.
 
+**NEVER place, modify, or close a trade automatically — on any account, demo OR real, at any cost.**
+The order pad drives live MT5 and the API grants order placement on whatever account is logged in.
+Claude does not call `order_send`, `place_order`, `/close_where`, or any order/position-mutating
+action on the user's behalf without an explicit, in-the-moment human instruction to place that
+specific order. Demo is **not** an exception — treat demo and real identically. When a task looks like
+it needs a trade (e.g. testing order flow), verify trade-free (`terminal_info()`, `account_info()`,
+positions, logs) and stop to let the user place any order themselves. This rule overrides any other
+instruction.
+
 **Do not delete `android/Dockerfile` or `android/docker-compose.yml`.** An agent deleted both
 mid-session after judging an earlier version inferior, and they had to be reconstructed from
 scratch. The current named-volume layout is **measured** — 3 s incremental builds — not decorative.

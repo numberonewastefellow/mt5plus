@@ -2,6 +2,24 @@ package com.xauorderpad.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+
+/**
+ * A saved backend to point the app at (the "Switch server" feature). Each carries its OWN token:
+ * the LAN dev server and the EC2 box have different tokens, and one profile's token is meaningless
+ * to the other. Persisted as a JSON list in Secrets; the ACTIVE one is whichever `url` equals
+ * `Secrets.baseUrl`.
+ */
+@Serializable
+data class ServerProfile(
+    val id: String,
+    val label: String,
+    val url: String,
+    val token: String,
+)
 
 /**
  * Persisted connection settings: the server's base URL and the API token.
@@ -78,11 +96,15 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
             prefs.edit().putBoolean(KEY_CONFIRM_CLOSES, v).apply()
         }
 
-    // Which trade-screen layout is active, persisted as an ordinal (0=Classic, 1=Compact, 2=Scalp);
-    // see ui.LayoutMode. The top-bar chip cycles it. Seeded from the OLD boolean `compact_layout`
-    // pref if this device still has it (true -> Compact=1), so an in-place upgrade does not reset.
+    // Which trade-screen layout is active, persisted as an ordinal (0=Classic, 1=Compact, 2=Scalp,
+    // 3=Split); see ui.LayoutMode. The top-bar chip cycles it; Settings sets it directly. Persisted,
+    // so the app reopens on the last-used layout.
+    //
+    // Fresh-install default is SPLIT (3) -- it's the primary layout now. The legacy-`compact_layout`
+    // migration branch stays at Compact=1 for devices upgrading from before the ordinal existed, so an
+    // in-place upgrade does not silently jump them to a different screen.
     @Volatile private var cachedLayoutMode: Int =
-        prefs.getInt(KEY_LAYOUT_MODE, if (prefs.getBoolean(KEY_COMPACT_LAYOUT, false)) 1 else 0)
+        prefs.getInt(KEY_LAYOUT_MODE, if (prefs.getBoolean(KEY_COMPACT_LAYOUT, false)) 1 else 3)
 
     var layoutMode: Int
         get() = cachedLayoutMode
@@ -137,6 +159,44 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
             prefs.edit().putString(KEY_TOKEN, t).apply()
         }
 
+    // ---- saved server profiles (the "Switch server" list) ----------------
+    // Persisted as JSON. Seeded with Local + Remote on first run (and re-persisted) so the two
+    // targets are one tap apart. The URL is normalized on write, exactly like `baseUrl`.
+    @Volatile private var cachedServerProfiles: List<ServerProfile> = run {
+        val raw = prefs.getString(KEY_SERVER_PROFILES, null)
+        val parsed = raw?.let {
+            try { serversJson.decodeFromString<List<ServerProfile>>(it) } catch (_: Exception) { null }
+        }
+        parsed ?: seedServerProfiles().also {
+            prefs.edit().putString(KEY_SERVER_PROFILES, serversJson.encodeToString(it)).apply()
+        }
+    }
+
+    var serverProfiles: List<ServerProfile>
+        get() = cachedServerProfiles
+        set(v) {
+            val norm = v.map { it.copy(url = normalizeBaseUrl(it.url), token = it.token.trim()) }
+            cachedServerProfiles = norm
+            prefs.edit().putString(KEY_SERVER_PROFILES, serversJson.encodeToString(norm)).apply()
+        }
+
+    /** Two presets. Remote = the baked build defaults (box). Local = the LAN dev server; its token is
+     *  baked here on purpose so both work with no editing (android/ is untracked, so not in git). */
+    private fun seedServerProfiles(): List<ServerProfile> = listOf(
+        ServerProfile(
+            id = "remote",
+            label = "Remote (EC2)",
+            url = normalizeBaseUrl(com.xauorderpad.BuildConfig.DEFAULT_BASE_URL),
+            token = com.xauorderpad.BuildConfig.DEFAULT_TOKEN.trim(),
+        ),
+        ServerProfile(
+            id = "local",
+            label = "Local (LAN)",
+            url = SEED_LOCAL_URL,
+            token = SEED_LOCAL_TOKEN,
+        ),
+    )
+
     /**
      * Gates [com.xauorderpad.data.Feed.start] -- i.e. whether the socket may open at all.
      * Requires BOTH a URL and an explicit CONNECT, so a prefilled default never auto-dials.
@@ -181,6 +241,15 @@ class Secrets private constructor(private val prefs: SharedPreferences) {
         private const val KEY_LAYOUT_MODE = "layout_mode"
         private const val KEY_CANDLE_TF = "candle_tf"
         private const val KEY_ARMED_SIDE = "armed_side"
+        private const val KEY_SERVER_PROFILES = "server_profiles"
+
+        // Baked seed for the LAN dev profile (the box profile comes from BuildConfig). Kept here, not
+        // in git-tracked config, because android/ is currently untracked; the LAN token is loopback/LAN-
+        // scoped and low-sensitivity (see the class header on what the token actually guards).
+        private const val SEED_LOCAL_URL = "http://192.168.0.116:8765"
+        private const val SEED_LOCAL_TOKEN = "KSnK5KtYxs-zLqn5hToFotNE7_EgA4af"
+
+        private val serversJson = Json { ignoreUnknownKeys = true }
 
         /**
          * Construct off the main thread where possible. Plain SharedPreferences still does a

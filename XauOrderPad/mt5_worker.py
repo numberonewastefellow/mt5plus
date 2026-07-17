@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import os
 import queue
 import threading
 import time
@@ -19,6 +20,7 @@ from typing import Any
 import MetaTrader5 as mt5
 
 import config
+import ticklog_state
 from strategies import ENGINES
 
 
@@ -79,6 +81,19 @@ class Mt5Worker:
         self._last_healthy: bool | None = None
         # Account snapshot throttle: log a snapshot at most once per N polls.
         self._snapshot_every_n_polls = max(1, config.POLL_HZ) * 60  # ~once/minute
+        # Opt-in tick logging (config.TICKLOG_ENABLED). A CSV file handle opened
+        # lazily on first captured tick, a millisecond watermark to dedupe, and the
+        # unix-seconds floor we ask copy_ticks_range from. Read-only; never trades.
+        self._tick_fh = None
+        self._tick_last_msc = 0
+        self._tick_from_ts = 0
+        # Runtime on/off for tick logging, authoritative over config.TICKLOG_ENABLED.
+        # Seeded from the persisted choice (ticklog.json) if the operator ever set one,
+        # else from the env default -- so a restart keeps whatever was last chosen.
+        self._ticklog = {
+            "enabled": bool(ticklog_state.load().get("enabled", config.TICKLOG_ENABLED)),
+            "rows": 0,
+        }
         self._thread = threading.Thread(target=self._run, name="mt5-worker",
                                         daemon=True)
 
@@ -126,6 +141,7 @@ class Mt5Worker:
                     except Exception as exc:  # never kill the worker
                         fut.set_exception(exc)
             self._poll_state()
+            self._capture_ticks()
 
     def _ensure_connected(self) -> bool:
         """Make sure the MT5 terminal is initialised and connected.
@@ -257,31 +273,13 @@ class Mt5Worker:
             net = 0.0
             pl = 0.0
             for p in positions:
-                vol = p.volume if p.type == mt5.POSITION_TYPE_BUY else -p.volume
-                net += vol
+                net += p.volume if p.type == mt5.POSITION_TYPE_BUY else -p.volume
                 pl += p.profit
-                pos_list.append({
-                    "ticket": p.ticket,
-                    "side": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
-                    "volume": p.volume, "price_open": p.price_open,
-                    "sl": p.sl, "tp": p.tp, "profit": p.profit,
-                    "time": p.time,
-                    "magic": int(p.magic),          # for Auto-Test foreign-magic detection
-                })
+                pos_list.append(self._shape_position(p))
             st["positions"] = pos_list
 
             orders = mt5.orders_get(symbol=self._symbol) or []
-            buy_types = (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT,
-                         mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_BUY_STOP_LIMIT)
-            ord_list = []
-            for o in orders:
-                ord_list.append({
-                    "ticket": o.ticket,
-                    "side": "BUY" if o.type in buy_types else "SELL",
-                    "volume": o.volume_current, "price_open": o.price_open,
-                    "sl": o.sl, "tp": o.tp, "type": "limit", "time": o.time_setup,
-                })
-            st["orders"] = ord_list
+            st["orders"] = [self._shape_order(o) for o in orders]
 
             st["net_lots"] = round(net, 4)
             st["floating_pl"] = round(pl, 2)
@@ -309,6 +307,10 @@ class Mt5Worker:
         st["strategy"] = st["strategies"].get("straddle")
         # Mirror the P&L guard so the phone shows what the SERVER is actually enforcing.
         st["guard"] = dict(self._guard)
+        # Mirror tick-logging status so the UI toggle reflects what the server is doing.
+        st["ticklog"] = {"enabled": self._ticklog["enabled"],
+                         "rows": self._ticklog["rows"],
+                         "path": config.TICKLOG_PATH}
         self._swap(st)
 
         # Drive the engines AFTER the swap so any orders they place show up on the
@@ -419,6 +421,29 @@ class Mt5Worker:
         g["fired"] = False
         return {"ok": True, "guard": dict(g)}
 
+    def _apply_ticklog(self, cmd: dict) -> dict:
+        """Turn tick logging on/off at runtime and persist the choice so it survives a restart.
+
+        Disabling flushes and closes the CSV handle so writing truly stops; a later enable
+        reopens it lazily in _capture_ticks. Never trades -- this only gates a file writer."""
+        if cmd.get("enabled") is not None:
+            enabled = bool(cmd["enabled"])
+            self._ticklog["enabled"] = enabled
+            ticklog_state.save(enabled)
+            if not enabled and self._tick_fh is not None:
+                try:
+                    self._tick_fh.flush()
+                    self._tick_fh.close()
+                except Exception:
+                    pass
+                self._tick_fh = None
+            log.info("tick logging %s", "enabled" if enabled else "disabled",
+                     extra={"event": "ticklog_toggled", "enabled": enabled,
+                            "path": config.TICKLOG_PATH})
+        return {"ok": True, "ticklog": {"enabled": self._ticklog["enabled"],
+                                        "rows": self._ticklog["rows"],
+                                        "path": config.TICKLOG_PATH}}
+
     def _swap(self, st: dict) -> None:
         with self._lock:
             self._state = st
@@ -438,6 +463,10 @@ class Mt5Worker:
             return self._close_where(cmd.get("filter") or "all")
         if action == "guard":
             return self._apply_guard(cmd)
+        if action == "ticklog":
+            return self._apply_ticklog(cmd)
+        if action == "history":
+            return self._history(cmd)
         if action == "login":
             return self._login(cmd)
         if action == "logout":
@@ -465,6 +494,69 @@ class Mt5Worker:
         start = datetime.datetime.fromtimestamp(int(ts))
         end = datetime.datetime.now() + datetime.timedelta(seconds=1)
         return mt5.copy_ticks_range(self._symbol, start, end, mt5.COPY_TICKS_ALL)
+
+    def _capture_ticks(self) -> None:
+        """Append every raw tick since the last poll to a CSV, when enabled.
+
+        Rides the connection the worker already owns (copy_ticks_range via
+        ticks_since), so it needs no second IPC and captures EVERY tick between
+        polls -- not just the 15 Hz snapshot _poll_state keeps. The whole body is
+        wrapped in try/except: a logging failure must never disturb ticks or
+        orders. It places NO orders and touches no trade path -- read-only.
+        """
+        if not self._ticklog["enabled"]:
+            return
+        if not (self._session_active and self._initialized):
+            return
+        try:
+            now = time.time()
+            frm = self._tick_from_ts or (now - 2.0)
+            ticks = self.ticks_since(int(frm))
+            if ticks is None or len(ticks) == 0:
+                return
+
+            if self._tick_fh is None:
+                path = config.TICKLOG_PATH
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                fresh = (not os.path.exists(path)) or os.path.getsize(path) == 0
+                self._tick_fh = open(path, "a", encoding="utf-8", newline="")
+                if fresh:
+                    self._tick_fh.write(
+                        "time_msc,iso_time,bid,ask,last,volume,flags,spread\n")
+                log.info("tick logging started",
+                         extra={"event": "ticklog_started", "path": path,
+                                "symbol": self._symbol})
+
+            wrote = 0
+            last_msc = self._tick_last_msc
+            for t in ticks:
+                msc = int(t["time_msc"])
+                if msc <= self._tick_last_msc:
+                    continue          # already written on a previous poll
+                bid = float(t["bid"])
+                ask = float(t["ask"])
+                # UTC, to match the time_msc epoch (MT5 tick times are UTC). A trailing
+                # 'Z' makes it unambiguous instead of a naive machine-local string.
+                iso = datetime.datetime.fromtimestamp(
+                    msc / 1000.0, datetime.timezone.utc
+                ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                self._tick_fh.write(
+                    f"{msc},{iso},{bid},{ask},{float(t['last'])},"
+                    f"{int(t['volume'])},{int(t['flags'])},{round(ask - bid, 6)}\n")
+                last_msc = max(last_msc, msc)
+                wrote += 1
+
+            if wrote:
+                self._tick_fh.flush()
+                self._tick_last_msc = last_msc
+                self._ticklog["rows"] += wrote
+            # Advance the fetch floor to just under the newest tick, so the next
+            # range stays small yet can't skip a tick straddling the boundary
+            # (the msc watermark above dedupes the deliberate 1 s overlap).
+            self._tick_from_ts = (last_msc / 1000.0 - 1.0) if last_msc else (now - 2.0)
+        except Exception as exc:  # never let logging disturb the trading loop
+            log.warning("tick logging error (continuing)",
+                        extra={"event": "ticklog_error", "err": str(exc)})
 
     def reconcile_strategies(self) -> None:
         """Rebuild every engine from the broker's open book.
@@ -832,6 +924,129 @@ class Mt5Worker:
                     "losses": losses}
         except Exception:
             return {"daily_realized": 0.0, "wins": 0, "losses": 0}
+
+    # ---- position / order shaping (shared by the live poll and the history query) ----
+    # Both the /ws poll and _history serialize the SAME dict shape; keeping one source stops
+    # the two from drifting apart. `symbol` is included so the account-wide history view can
+    # label rows -- harmless extra field for the symbol-filtered live poll.
+    @staticmethod
+    def _shape_position(p) -> dict:
+        return {
+            "ticket": p.ticket,
+            "side": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
+            "volume": p.volume, "price_open": p.price_open,
+            "sl": p.sl, "tp": p.tp, "profit": p.profit,
+            "time": p.time,
+            "symbol": getattr(p, "symbol", None),
+            "magic": int(p.magic),          # for Auto-Test foreign-magic detection
+        }
+
+    @staticmethod
+    def _shape_order(o) -> dict:
+        buy_types = (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_BUY_LIMIT,
+                     mt5.ORDER_TYPE_BUY_STOP, mt5.ORDER_TYPE_BUY_STOP_LIMIT)
+        return {
+            "ticket": o.ticket,
+            "side": "BUY" if o.type in buy_types else "SELL",
+            "volume": o.volume_current, "price_open": o.price_open,
+            "sl": o.sl, "tp": o.tp, "type": "limit", "time": o.time_setup,
+            "symbol": getattr(o, "symbol", None),
+        }
+
+    def _history(self, cmd: dict) -> dict:
+        """Today's CLOSED trades (entry->exit paired), plus current OPEN positions and PENDING
+        orders, ACCOUNT-WIDE, with aggregate performance stats. On-demand only (history_deals_get
+        is heavy). Uses the SAME local-midnight 'today' boundary as _compute_stats so these numbers
+        agree with the daily_realized shown live."""
+        try:
+            now = datetime.datetime.now()
+            start = datetime.datetime(now.year, now.month, now.day)
+            deals = mt5.history_deals_get(start, now) or []
+            out_entries = (mt5.DEAL_ENTRY_OUT, mt5.DEAL_ENTRY_INOUT,
+                           mt5.DEAL_ENTRY_OUT_BY)
+
+            # Pair each closing leg with its opening leg (by position_id) so a closed trade can
+            # show entry -> exit. A position OPENED before today has no IN deal in range -> its
+            # entry stays null and the UI renders it as "-> exit".
+            entries = {}   # position_id -> opening deal
+            for d in deals:
+                if d.entry == mt5.DEAL_ENTRY_IN:
+                    entries.setdefault(d.position_id, d)
+
+            closed = []
+            wins = losses = flat = 0
+            gross_profit = 0.0
+            gross_loss = 0.0
+            biggest_win = 0.0
+            biggest_loss = 0.0
+            for d in deals:
+                if d.entry not in out_entries:
+                    continue
+                pnl = d.profit + d.swap + d.commission
+                opening = entries.get(d.position_id)
+                if opening is not None:
+                    side = "BUY" if opening.type == mt5.DEAL_TYPE_BUY else "SELL"
+                else:
+                    # The CLOSING deal's type is the OPPOSITE of the position side (a BUY position
+                    # is closed by a SELL deal), so invert it to report the position's direction.
+                    side = "BUY" if d.type == mt5.DEAL_TYPE_SELL else "SELL"
+                closed.append({
+                    "position_id": int(d.position_id),
+                    "ticket": int(d.ticket),
+                    "side": side,
+                    "symbol": d.symbol,
+                    "volume": d.volume,
+                    "entry_price": (opening.price if opening is not None else None),
+                    "exit_price": d.price,
+                    "entry_time": (int(opening.time) if opening is not None else None),
+                    "exit_time": int(d.time),
+                    "pnl": round(pnl, 2),
+                })
+                if d.profit > 0:
+                    wins += 1
+                    gross_profit += pnl
+                    biggest_win = max(biggest_win, pnl)
+                elif d.profit < 0:
+                    losses += 1
+                    gross_loss += pnl
+                    biggest_loss = min(biggest_loss, pnl)
+                else:
+                    flat += 1
+            closed.sort(key=lambda r: r["exit_time"], reverse=True)
+
+            net = gross_profit + gross_loss
+            closed_count = wins + losses + flat
+            stats = {
+                "closed_count": closed_count,
+                "wins": wins, "losses": losses, "flat": flat,
+                "gross_profit": round(gross_profit, 2),
+                "gross_loss": round(gross_loss, 2),
+                "net": round(net, 2),
+                "biggest_win": round(biggest_win, 2),
+                "biggest_loss": round(biggest_loss, 2),
+                "avg_win": round(gross_profit / wins, 2) if wins else 0.0,
+                "avg_loss": round(gross_loss / losses, 2) if losses else 0.0,
+                # Over TOTAL closed (incl. flats) so 653/807 reads as the 81% the broker shows.
+                "win_rate": round(wins / closed_count, 4) if closed_count else 0.0,
+            }
+
+            open_positions = [self._shape_position(p)
+                              for p in (mt5.positions_get() or [])]
+            pending = [self._shape_order(o) for o in (mt5.orders_get() or [])]
+
+            return {
+                "ok": True,
+                "as_of": int(now.timestamp()),
+                "day_start": int(start.timestamp()),
+                "stats": stats,
+                "closed": closed,
+                "open": open_positions,
+                "pending": pending,
+            }
+        except Exception as exc:
+            log.exception("history query crashed",
+                          extra={"event": "history_exception"})
+            return {"ok": False, "error": f"history error: {exc}"}
 
     def _market_order(self, cmd: dict) -> dict:
         """Send a market order and return a structured result.

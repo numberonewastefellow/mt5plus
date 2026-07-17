@@ -60,6 +60,14 @@ certs/
 *.key
 *.csr
 
+# The LOCAL (LAN) mTLS material: a second server cert (SAN = the LAN IP) signed by the same CA,
+# plus the downloaded caddy.exe and its access logs. server.key is already covered by *.key above;
+# ignore the whole dir + binary so nothing local leaks. See start_server.bat `tls` mode.
+XauOrderPad/deploy/certs-lan/
+certs-lan/
+XauOrderPad/deploy/caddy.exe
+XauOrderPad/deploy/logs/
+
 # Server stdout/stderr captured when launching detached. Machine-local noise, and
 # the banner echoes the LAN URL, so keep it out of the repo.
 XauOrderPad/.server.*.log

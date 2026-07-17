@@ -119,10 +119,12 @@ data class GuardUi(
  *  - CLASSIC: the original layout.
  *  - COMPACT: denser (number-only quotes, inline LOT/SL/TP) for large-font / zoomed phones.
  *  - SCALP:   COMPACT order form + a trimmed account badge and an MT5 candle-close countdown.
+ *  - SPLIT:   two columns — controls on the left, a stripped positions list (entry + P&L, swipe to
+ *             close) on the right.
  *
  * Persisted as an ordinal Int in Secrets; see Secrets.layoutMode.
  */
-enum class LayoutMode { CLASSIC, COMPACT, SCALP }
+enum class LayoutMode { CLASSIC, COMPACT, SCALP, SPLIT }
 
 @Immutable
 data class ArmedUi(

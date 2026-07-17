@@ -34,8 +34,11 @@ import com.xauorderpad.svc.FeedService
 import com.xauorderpad.ui.AccountsScreen
 import com.xauorderpad.ui.CertsScreen
 import com.xauorderpad.ui.ConnectScreen
+import com.xauorderpad.ui.HistoryScreen
+import com.xauorderpad.ui.LayoutMode
 import com.xauorderpad.ui.LoginScreen
 import com.xauorderpad.ui.Screen
+import com.xauorderpad.ui.ServerScreen
 import com.xauorderpad.ui.SettingsScreen
 import com.xauorderpad.ui.StrategiesScreen
 import com.xauorderpad.ui.StrategyScreen
@@ -110,6 +113,12 @@ class MainActivity : ComponentActivity() {
                 val candleTf by vm.candleTf.collectAsStateWithLifecycle()
                 val tickTime by vm.tickTime.collectAsStateWithLifecycle()
                 val guard by vm.guard.collectAsStateWithLifecycle()
+                val closingTickets by vm.closingTickets.collectAsStateWithLifecycle()
+                val serverProfiles by vm.serverProfiles.collectAsStateWithLifecycle()
+                val serverBusy by vm.serverBusy.collectAsStateWithLifecycle()
+                val serverError by vm.serverError.collectAsStateWithLifecycle()
+                val history by vm.history.collectAsStateWithLifecycle()
+                val historyLoading by vm.historyLoading.collectAsStateWithLifecycle()
                 val strategies by vm.strategies.collectAsStateWithLifecycle()
                 val strategy by vm.strategy.collectAsStateWithLifecycle()
                 val armed by vm.armed.collectAsStateWithLifecycle()
@@ -182,6 +191,9 @@ class MainActivity : ComponentActivity() {
                         val onSl: (String) -> Unit = { vm.setSl(it) }
                         val onTp: (String) -> Unit = { vm.setTp(it) }
                         val onEnterArmed: () -> Unit = { vm.placeArmed() }
+                        // SPLIT's direct BUY/SELL buttons place a specific side (no arming).
+                        val onPlace: (String) -> Unit = { vm.placeOrder(it) }
+                        val onSelectLayout: (LayoutMode) -> Unit = { vm.setLayout(it) }
                         val onCloseArmed: () -> Unit = { vm.closeArmed() }
                         val onArmedSide: (String) -> Unit = { vm.setArmedSide(it) }
                         val onCloseWhere: (String) -> Unit = { vm.closeWhere(it) }
@@ -198,6 +210,13 @@ class MainActivity : ComponentActivity() {
                         val onSetGuard: (Boolean?, Double?, String?) -> Unit =
                             { en, tp, side -> vm.setGuard(en, tp, side) }
                         val onAccounts: () -> Unit = { vm.goto(Screen.ACCOUNTS) }
+                        val onServers: () -> Unit = { vm.goto(Screen.SERVERS) }
+                        val onSelectServer: (String) -> Unit = { vm.selectServer(it) }
+                        val onSaveServer: (String?, String, String, String) -> Unit =
+                            { id, label, url, tok -> vm.saveServer(id, label, url, tok) }
+                        val onDeleteServer: (String) -> Unit = { vm.deleteServer(it) }
+                        val onHistory: () -> Unit = { vm.goto(Screen.HISTORY) }   // goto() triggers the fetch
+                        val onRefreshHistory: () -> Unit = { vm.fetchHistory() }
                         val onStrategies: () -> Unit = { vm.goto(Screen.STRATEGIES) }
                         val onCerts: () -> Unit = { vm.goto(Screen.CERTS) }
                         val onSaveCerts: (ByteArray, ByteArray, String) -> Unit =
@@ -256,11 +275,14 @@ class MainActivity : ComponentActivity() {
                             onEnterArmed = callbacks.onEnterArmed,
                             onCloseArmed = callbacks.onCloseArmed,
                             onArmedSide = callbacks.onArmedSide,
+                            onPlace = callbacks.onPlace,
                             armed = armed,
                             onCloseWhere = callbacks.onCloseWhere,
                             onClosePosition = callbacks.onClosePosition,
+                            closingTickets = closingTickets,
                             onLogin = callbacks.onLogin,
                             onSettings = callbacks.onSettings,
+                            onHistory = callbacks.onHistory,
                             confirmCloses = confirmCloses,
                             serverUrl = vm.baseUrl,
                             live = live,
@@ -280,9 +302,12 @@ class MainActivity : ComponentActivity() {
                             strategies = strategies,
                             live = live,
                             confirmCloses = confirmCloses,
+                            layoutMode = layoutMode,
                             health = health,
                             certInfo = certInfo,
                             onToggleConfirm = callbacks.onToggleConfirm,
+                            onSelectLayout = callbacks.onSelectLayout,
+                            onServers = callbacks.onServers,
                             onAccounts = callbacks.onAccounts,
                             onStrategies = callbacks.onStrategies,
                             onCerts = callbacks.onCerts,
@@ -331,6 +356,27 @@ class MainActivity : ComponentActivity() {
                             live = live,
                             onSet = callbacks.onSetStrategy,
                             onBack = callbacks.onBackToStrategies,
+                            modifier = inset,
+                        )
+
+                        Screen.SERVERS -> ServerScreen(
+                            profiles = serverProfiles,
+                            current = vm.baseUrl,
+                            busy = serverBusy,
+                            error = serverError,
+                            onSelect = callbacks.onSelectServer,
+                            onSave = callbacks.onSaveServer,
+                            onDelete = callbacks.onDeleteServer,
+                            onBack = callbacks.onBackToSettings,
+                            modifier = inset,
+                        )
+
+                        Screen.HISTORY -> HistoryScreen(
+                            history = history,
+                            loading = historyLoading,
+                            serverUrl = vm.baseUrl,
+                            onRefresh = callbacks.onRefreshHistory,
+                            onBack = callbacks.onBackToTrade,
                             modifier = inset,
                         )
                     }

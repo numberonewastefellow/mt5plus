@@ -1,0 +1,53 @@
+# Local macOS build VM for the XauOrderPad iOS app — the iOS counterpart of
+# android/docker-compose.yml.
+#
+# ── The one unavoidable difference from the Android setup ──
+# Android builds in a Linux container (the SDK is Linux software). iOS cannot: the toolchain is
+# macOS-only, so this runs a FULL macOS VM via QEMU/KVM (dockurr/macos) rather than an SDK image.
+#
+# HARD PREREQUISITE (Windows 11): nested virtualization must be enabled and /dev/kvm must be exposed
+# inside the WSL2 backend, or the VM will not boot. Validate with a throwaway Xcode "Hello World"
+# archive BEFORE building real code. See README.md.
+#
+# Like the Android stack, this container is LONG-LIVED — bring it up with `up -d` and leave it warm.
+# Never `docker compose run --rm` (that throws away the installed macOS + Xcode).
+
+services:
+  build:
+    build: .
+    image: xauorderpad-ios-buildvm:local
+    container_name: xauorderpad-ios
+    stop_grace_period: 2m
+    restart: "no"
+
+    environment:
+      VERSION: "15"          # macOS 15 (Sequoia) — required for a recent Xcode / iOS SDK
+      RAM_SIZE: "8G"         # Xcode + Simulator need headroom; 8G is the practical floor
+      CPU_CORES: "4"
+      DISK_SIZE: "128G"      # macOS + Xcode (~40G) + simulators + archives. Do not undersize.
+
+    devices:
+      - /dev/kvm             # make-or-break: no KVM => no boot (or unusably slow)
+
+    cap_add:
+      - NET_ADMIN
+
+    ports:
+      - "8006:8006"         # web viewer:  http://localhost:8006  (use this to drive the VM)
+      - "5900:5900"         # VNC (optional; Screen Sharing / a VNC client)
+
+    volumes:
+      # The macOS disk image — persists the installed OS + Xcode across container restarts.
+      # Kept on E: (the big drive) rather than ./storage on D:. This is the ~60-100 GB consumer
+      # (macOS + Xcode + the installer download + the in-VM build cache). Docker auto-creates the
+      # folder on first `up`. Only THIS VM's disk moves to E: — the ~1-2 GB dockurr/macos base
+      # image stays in Docker's global data root (moving that needs the global Disk-image-location
+      # setting, deliberately left alone).
+      - E:/xau-ios-vm/storage:/storage
+
+      # THE BRIDGE back to Windows. dockurr/macos exports the container's /shared to the guest over
+      # 9p; inside macOS you `sudo mount_9p shared` once. Because ./shared is a Windows bind-mount,
+      # anything the guest writes here appears directly on the host — this is how source goes IN
+      # (./shared/src) and the built .ipa comes OUT (./shared/out), with no named-volume copy step.
+      # (Android needs a copy because app/build is a named volume; here a bind mount is enough.)
+      - ./shared:/shared

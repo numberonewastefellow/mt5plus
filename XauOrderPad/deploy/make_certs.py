@@ -49,7 +49,7 @@ try:
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key, pkcs12
     from cryptography.x509.oid import NameOID
 except ImportError:
     sys.exit("cryptography is not installed. Run:  python -m pip install --user cryptography")
@@ -103,6 +103,74 @@ def _key_pem(key) -> bytes:
     )
 
 
+def _mint_server_only(ip, args) -> None:
+    """Mint a SECOND server cert for another endpoint, signed by the EXISTING CA.
+
+    The EC2 box and the LAN box live at different IP addresses, and a server cert's IP-SAN is
+    verified against the address the client dialled (OkHttp checks iPAddress SANs). So each box
+    needs its OWN server cert -- but they can and should share ONE CA, so the phone's already-
+    imported ca.crt + client.p12 authenticate to both with nothing re-imported.
+
+    This reuses the CA already in deploy/certs (do NOT --force / regenerate it -- that would
+    invalidate the client.p12 on the phone). It writes ONLY server.crt + server.key, and only into
+    --out. It never touches ca.* or client.p12, and -- crucially -- writing into a separate dir
+    keeps this cert away from `mt5_ec2.py ship`, which copies exactly deploy/certs/server.crt. That
+    separation is what makes a wrong deployment (LAN cert -> the box) structurally impossible.
+    """
+    ca_crt_p = os.path.join(CERTS, "ca.crt")
+    ca_key_p = os.path.join(CERTS, "ca.key")
+    if not (os.path.exists(ca_crt_p) and os.path.exists(ca_key_p)):
+        sys.exit(f"--server-only needs an existing CA in {CERTS} (ca.crt + ca.key), and none was "
+                 f"found. Create the CA first with a normal run:  python make_certs.py --ip <elastic ip>")
+
+    out_dir = args.out or CERTS
+    if not os.path.isabs(out_dir):
+        out_dir = os.path.join(HERE, out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Refuse to clobber the EC2 material: if --out resolves back to deploy/certs, this would
+    # overwrite the box's server.crt (bound to the Elastic IP) with a LAN one -> broken EC2.
+    if os.path.abspath(out_dir) == os.path.abspath(CERTS):
+        sys.exit(f"--server-only must write to a SEPARATE dir, not {CERTS} (that holds the EC2 "
+                 f"server cert). Pass e.g.  --out certs-lan")
+
+    ca = x509.load_pem_x509_certificate(open(ca_crt_p, "rb").read())
+    ca_key = load_pem_private_key(open(ca_key_p, "rb").read(), password=None)
+
+    now = dt.datetime.now(dt.timezone.utc)
+    srv_key = _key()
+    srv = (
+        x509.CertificateBuilder()
+        .subject_name(_name(str(ip)))
+        .issuer_name(ca.subject)
+        .public_key(srv_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=5))
+        .not_valid_after(now + dt.timedelta(days=LEAF_DAYS))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        # The IP-SAN that makes an IP-literal URL verify. Without it: opaque handshake failure.
+        .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ip)]), critical=False)
+        .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
+                       critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    _write(os.path.join(out_dir, "server.crt"), _pem(srv))
+    _write(os.path.join(out_dir, "server.key"), _key_pem(srv_key), secret=True)
+
+    print(f"""
+  Wrote a SERVER-ONLY cert (same CA, untouched) to {out_dir}
+
+    server.crt  SAN = IP:{ip}   -> the LOCAL Caddy only
+    server.key                   (private; gitignored via *.key)
+
+  The CA and client.p12 in {CERTS} were NOT touched, so the phone needs NO re-import.
+  This cert lives OUTSIDE deploy/certs, so `mt5_ec2.py ship` can never send it to the box.
+
+  Point the local proxy at it:  caddy run --config Caddyfile.lan   (see start_server.bat tls)
+  The phone connects to:        https://{ip}:8443
+""")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate the mTLS CA, server and client certs.")
     ap.add_argument("--ip", required=True,
@@ -111,15 +179,29 @@ def main() -> None:
                     help="password for client.p12. Omit to generate and print one.")
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing CA. This INVALIDATES every issued client.")
+    ap.add_argument("--server-only", action="store_true",
+                    help="Reuse the EXISTING CA (deploy/certs) and mint ONLY a server cert for a "
+                         "second endpoint (e.g. the LAN box). Does not touch ca.* or client.p12. "
+                         "Use with --out so the new cert lands in its own dir and is never shipped.")
+    ap.add_argument("--out",
+                    help="Output dir for --server-only (relative to deploy/, or absolute). "
+                         "Default: the same certs/ dir. Use a SEPARATE dir (e.g. 'certs-lan') so the "
+                         "second server cert can never be picked up by 'mt5_ec2.py ship'.")
     args = ap.parse_args()
 
     try:
         ip = ipaddress.ip_address(args.ip)
     except ValueError:
         sys.exit(f"--ip {args.ip!r} is not a valid IP address.")
-    if not ip.is_global:
+
+    # --server-only: a private LAN IP is EXPECTED here, so don't nag about it. Full-CA mode still
+    # warns, because there a non-public IP usually means a wrong (non-Elastic) address for the box.
+    if not ip.is_global and not args.server_only:
         print(f"WARNING: {ip} is not a public address. If this is not the box's Elastic IP, "
               f"the phone will not be able to reach it.", file=sys.stderr)
+
+    if args.server_only:
+        return _mint_server_only(ip, args)
 
     os.makedirs(CERTS, exist_ok=True)
     ca_crt_p = os.path.join(CERTS, "ca.crt")

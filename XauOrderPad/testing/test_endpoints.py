@@ -375,9 +375,38 @@ def test_validation_error_does_not_echo_the_password():
     assert "login" in r.text
 
 
+def test_history_aggregates_todays_closed_deals():
+    """/api/history pairs entry->exit legs, tallies win/loss/flat, and totals net P&L.
+    The stub seeds a fixed book (see stub._seed_deals): 2 wins (+57), 2 losses (-74), 1 flat."""
+    r = httpx.get(f"{BASE}/api/history", timeout=30, headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+
+    s = body["stats"]
+    assert s["closed_count"] == 5
+    assert s["wins"] == 2 and s["losses"] == 2 and s["flat"] == 1
+    assert s["gross_profit"] == 57.00
+    assert s["gross_loss"] == -74.00
+    assert s["net"] == -17.00
+    assert s["biggest_win"] == 48.00
+    assert s["biggest_loss"] == -52.00
+    assert s["win_rate"] == round(2 / 5, 4)
+
+    # One closed row per OUT leg, newest first, with entry/exit paired.
+    closed = body["closed"]
+    assert len(closed) == 5
+    exits = [row["exit_time"] for row in closed]
+    assert exits == sorted(exits, reverse=True), "closed trades must be newest-first"
+    top = closed[0]
+    assert top["entry_price"] is not None and top["exit_price"] is not None
+    assert top["side"] in ("BUY", "SELL")
+
+
 @pytest.mark.parametrize("method,path,body", [
     ("GET", "/api/state", None),
     ("POST", "/close_where", {"filter": "losing"}),
+    ("GET", "/api/history", None),
 ])
 def test_gated_endpoints_401_without_token(method, path, body):
     config.API_TOKEN = TOKEN

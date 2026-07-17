@@ -45,36 +45,39 @@ cd /d d:\llm\ios\mt5plus\XauOrderPad
 
 ## Reach it from a phone on the LAN
 
-By default the server binds **`127.0.0.1`** — loopback. A phone **cannot** reach that, and **no
-firewall rule will change it**: uvicorn listens on exactly one address, and that address is not on
-your network. (It is not a Vite dev server; there is no hidden "Network" URL.) `netstat` shows the
-truth:
+**`start_server.bat` now does this for you.** If `XauOrderPad\.token.local` exists, the script binds
+uvicorn to **`0.0.0.0`** (LAN-reachable) and sets `XAUORDERPAD_TOKEN` from that file automatically —
+so a plain double-click gives you a phone-reachable server, and it **stays that way across restarts**
+(the previous behaviour silently reverted to loopback every time). The startup banner prints the
+`http://<your-lan-ip>:8765` URL and `Auth: token REQUIRED`.
+
+The phone's token is the contents of `.token.local`. In the Android app it is stored per-server (the
+**Local (LAN)** profile under Settings → Server); the browser UI prompts for it once and remembers it.
+
+> **Why the token is mandatory here.** `API_TOKEN` defaults to `""` — *no authentication*. On the LAN
+> that means any phone, laptop or smart TV on the Wi-Fi can `POST /order` and flatten your book, on a
+> server that sends **real MT5 orders**. So the server **refuses to bind to `0.0.0.0` without a
+> token** (fail-closed) — which is exactly why `start_server.bat` sets both together, and why a
+> missing `.token.local` makes it fall back to loopback instead.
+
+### Manual equivalent (if you are not using `start_server.bat`)
+
+```powershell
+$env:XAUORDERPAD_HOST  = "0.0.0.0"
+$env:XAUORDERPAD_TOKEN = "<the contents of .token.local, or any strong random string>"
+.venv\Scripts\python.exe server.py
+```
+
+A bare `python server.py` with no env vars binds **`127.0.0.1`** (loopback) and disables the token —
+which a phone **cannot** reach, and **no firewall rule will change it**: uvicorn listens on exactly
+one address, and that address is not on your network. `netstat` shows the truth:
 
 ```
 TCP    127.0.0.1:8765    LISTENING       <- loopback only. A phone gets connection-refused.
 TCP    0.0.0.0:8765      LISTENING       <- reachable from the LAN.
 ```
 
-### 1. Bind to the network, **with a token**
-
-```powershell
-$env:XAUORDERPAD_HOST  = "0.0.0.0"
-$env:XAUORDERPAD_TOKEN = "<strong random string>"
-.venv\Scripts\python.exe server.py
-```
-
-> **The token is not optional here.** `API_TOKEN` defaults to `""` — *no authentication*. On the
-> LAN that means any phone, laptop or smart TV on the Wi-Fi can `POST /order` and flatten your book,
-> on a server that sends **real MT5 orders**. The startup banner shouts if you get this wrong.
-
-The banner then prints the exact URL to type into the Android app:
-
-```
-  Network:  http://192.168.0.116:8765     <-- type this into the Android app
-  Auth:     token REQUIRED
-```
-
-### 2. Open the Windows Firewall — inbound TCP 8765
+### Open the Windows Firewall — inbound TCP 8765
 
 Needs an **Administrator** PowerShell, once:
 

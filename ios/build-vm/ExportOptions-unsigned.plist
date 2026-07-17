@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Export an UNSIGNED .ipa from an .xcarchive.
+
+  Signing is deliberately deferred to Windows Sideloadly (which signs with your free
+  Apple ID at install time), so this export attaches no certificate or provisioning
+  profile. Pair with `CODE_SIGNING_ALLOWED=NO` on the `archive` step.
+
+  method = development keeps the payload layout Sideloadly expects; signingStyle = manual
+  with no signingCertificate means "do not sign here".
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>development</string>
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>compileBitcode</key>
+    <false/>
+    <key>stripSwiftSymbols</key>
+    <true/>
+    <key>destination</key>
+    <string>export</string>
+</dict>
+</plist>

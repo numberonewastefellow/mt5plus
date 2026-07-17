@@ -346,6 +346,12 @@ class GuardReq(BaseModel):
     side: str | None = None             # "profit" (close at >= +target) | "loss" (close at <= -target)
 
 
+class TickLogReq(BaseModel):
+    """Turn opt-in tick logging on/off. The WORKER owns the writer and persists the choice
+    (ticklog.json), so it survives a restart; this endpoint only forwards the toggle."""
+    enabled: bool | None = None
+
+
 class StrategyReq(BaseModel):
     """Enable/disable + tune ONE automated strategy engine.
 
@@ -919,6 +925,33 @@ async def set_guard(req: GuardReq, x_token: str | None = Header(default=None)):
                                  "target_pl": req.target_pl, "side": req.side})
     return JSONResponse(await _do({"action": "guard", "enabled": req.enabled,
                                    "target_pl": req.target_pl, "side": req.side}))
+
+
+@app.post("/api/ticklog")
+async def set_ticklog(req: TickLogReq, x_token: str | None = Header(default=None)):
+    """Enable/disable tick logging to CSV. Forwarded through the worker queue; the worker
+    flips the writer and persists the flag so it survives a restart. Places no orders."""
+    _check_token(x_token)
+    log.info("ticklog set", extra={"event": "ticklog_set_http", "enabled": req.enabled})
+    return JSONResponse(await _do({"action": "ticklog", "enabled": req.enabled}))
+
+
+@app.get("/api/ticklog")
+def get_ticklog(x_token: str | None = Header(default=None)):
+    """Current tick-logging status: {enabled, rows, path}. Thin read of the worker snapshot."""
+    _check_token(x_token)
+    return worker.get_state().get("ticklog", {"enabled": False, "rows": 0,
+                                              "path": config.TICKLOG_PATH})
+
+
+@app.get("/api/history")
+async def history(x_token: str | None = Header(default=None)):
+    """Today's CLOSED trades (entry->exit paired) + current OPEN positions + PENDING orders,
+    account-wide, with aggregate stats (net/gross P&L, win %, biggest/avg win & loss). Read-only,
+    on-demand (history_deals_get is heavy); serialized through the worker queue so it never races a
+    tick or order. 'Today' is local midnight -- matches the daily_realized shown live."""
+    _check_token(x_token)
+    return JSONResponse(await _do({"action": "history"}))
 
 
 @app.get("/api/config")

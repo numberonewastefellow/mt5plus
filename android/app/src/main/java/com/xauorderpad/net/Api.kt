@@ -221,6 +221,13 @@ class Api(
         get("/api/accounts") { json.decodeFromString<AccountsResponse>(it) }
 
     /**
+     * Today's trading activity (closed/open/pending + stats). On the 60 s `tradeHttp()` budget,
+     * not the 15 s default: history_deals_get over a heavy scalping day can take real time.
+     */
+    suspend fun history(): ApiResult<HistoryResponse> =
+        get("/api/history", tradeHttp()) { json.decodeFromString<HistoryResponse>(it) }
+
+    /**
      * Log the terminal into a SAVED profile. The broker password is never sent from the
      * phone -- the server reads it from the Windows Credential Vault (accounts.py).
      *
@@ -315,8 +322,12 @@ class Api(
 
     // ---- plumbing --------------------------------------------------------
 
-    private suspend fun <T> get(path: String, parse: (String) -> T): ApiResult<T> =
-        execute({ Request.Builder().url(baseUrl() + path).get() }, http(), path, parse)
+    private suspend fun <T> get(
+        path: String,
+        client: OkHttpClient = http(),
+        parse: (String) -> T,
+    ): ApiResult<T> =
+        execute({ Request.Builder().url(baseUrl() + path).get() }, client, path, parse)
 
     private suspend fun <T> post(
         path: String,

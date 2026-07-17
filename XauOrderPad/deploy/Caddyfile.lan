@@ -1,0 +1,65 @@
+# The LOCAL (LAN) mTLS front door. Run by caddy_local.ps1 / `start_server.bat tls`, ON THIS PC.
+#
+# This is the LAN twin of the EC2 `Caddyfile`. Same design, same guarantees -- only the certificate
+# and the listen context differ:
+#
+#   * It presents ./certs-lan/server.crt (SAN = the LAN IP 192.168.0.116), NOT ./certs/server.crt
+#     (SAN = the EC2 Elastic IP). A cert's IP-SAN is verified against the address the phone dialled,
+#     so the LAN box needs its own. Both are signed by the SAME CA (./certs/ca.crt), so ONE client
+#     identity on the phone authenticates to both, and nothing is re-imported.
+#   * uvicorn stays on 127.0.0.1:8765 (see `start_server.bat tls`). This proxy is the only thing on
+#     the network, so if it is down the trading API is UNREACHABLE rather than reachable-in-cleartext.
+#     The deployment fails CLOSED -- identical posture to the box.
+#
+# Paths are RELATIVE: caddy_local.ps1 runs caddy from this deploy/ directory, so ./certs-lan and
+# ./certs resolve regardless of where the repo lives. Do not hardcode an absolute path here.
+{
+	# Explicit certificates -- our own CA, not ACME (which cannot issue for a bare IP anyway).
+	auto_https off
+
+	# The admin API listens UNAUTHENTICATED on 127.0.0.1:2019 and accepts a full config replacement,
+	# including one with no client_auth. Off means the running config can only come from this file.
+	admin off
+
+	servers {
+		# The phone connects to a bare IP and therefore sends NO SNI; with client_auth on, Caddy
+		# would otherwise 421 every request comparing an empty SNI to the Host. One site, reached by
+		# IP -> nothing to coalesce, nothing to confuse. Same rationale as the EC2 Caddyfile.
+		strict_sni_host insecure_off
+	}
+}
+
+:8443 {
+	tls ./certs-lan/server.crt ./certs-lan/server.key {
+		client_auth {
+			# THE line the whole design rests on: reject any connection without a certificate signed
+			# by our CA, DURING the TLS handshake. Downgrade this and :8443 becomes an unauthenticated
+			# path to a live-trading API. caddy_local.ps1 greps for this string and refuses to start
+			# if it is missing.
+			mode require_and_verify
+			trust_pool file ./certs/ca.crt
+		}
+	}
+
+	reverse_proxy 127.0.0.1:8765 {
+		header_up X-Client-Cert-CN {http.request.tls.client.subject}
+		# The /ws quote feed is a long-lived response; do not buffer it.
+		flush_interval -1
+	}
+
+	# Per-site access log with the token query param redacted (the browser web UI still uses
+	# /ws?token=; the Android app sends it as a header, which is never logged).
+	log {
+		output file ./logs/caddy-lan-access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format filter {
+			fields {
+				request>uri query {
+					delete token
+				}
+			}
+		}
+	}
+}

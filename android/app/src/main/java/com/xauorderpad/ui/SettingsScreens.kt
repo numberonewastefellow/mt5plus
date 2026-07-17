@@ -74,9 +74,12 @@ fun SettingsScreen(
     strategies: StrategiesUi,
     live: Boolean,
     confirmCloses: Boolean,
+    layoutMode: LayoutMode,
     health: Health,
     certInfo: com.xauorderpad.data.CertStore.Info?,
     onToggleConfirm: (Boolean) -> Unit,
+    onSelectLayout: (LayoutMode) -> Unit,
+    onServers: () -> Unit,
     onAccounts: () -> Unit,
     onStrategies: () -> Unit,
     onCerts: () -> Unit,
@@ -146,6 +149,23 @@ fun SettingsScreen(
             }
 
             Spacer(Modifier.height(18.dp))
+            SectionLabel("SCREEN")
+            Text(
+                "Which trade layout the app opens to. Remembered across restarts.",
+                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                LayoutMode.values().forEach { m ->
+                    LayoutChip(
+                        label = layoutLabel(m),
+                        selected = m == layoutMode,
+                        modifier = Modifier.weight(1f),
+                    ) { onSelectLayout(m) }
+                }
+            }
+
+            Spacer(Modifier.height(18.dp))
             SectionLabel("ENGINES")
             MenuRow(
                 title = "Strategies",
@@ -187,6 +207,13 @@ fun SettingsScreen(
                     )
                 }
             }
+
+            Spacer(Modifier.height(10.dp))
+            MenuRow(
+                title = "Server",
+                subtitle = "switch between saved servers — verifies then connects",
+                onClick = onServers,
+            )
 
             Spacer(Modifier.height(10.dp))
             MenuRow(
@@ -815,6 +842,37 @@ private fun MenuRow(
             }
             Text("›", fontSize = 20.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+    }
+}
+
+private fun layoutLabel(m: LayoutMode): String = when (m) {
+    LayoutMode.CLASSIC -> "Classic"
+    LayoutMode.COMPACT -> "Compact"
+    LayoutMode.SCALP -> "Scalp"
+    LayoutMode.SPLIT -> "Split"
+}
+
+/** A weighted chip for the "Default screen" picker — four across a phone-width row. */
+@Composable
+private fun LayoutChip(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val tint = MaterialTheme.colorScheme.primary
+    OutlinedButton(
+        onClick = onClick,
+        shape = RoundedCornerShape(6.dp),
+        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = if (selected) tint.copy(alpha = 0.22f) else Color.Transparent,
+            contentColor = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant,
+        ),
+        modifier = modifier.height(38.dp),
+    ) {
+        Text(label, fontSize = 12.sp, maxLines = 1,
+             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
     }
 }
 

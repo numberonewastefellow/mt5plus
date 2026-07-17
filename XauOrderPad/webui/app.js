@@ -1173,6 +1173,34 @@ function onState(s){
   try { if(typeof reconcileAutoTest === 'function') reconcileAutoTest(s); } catch(e){ console.warn('reconcileAutoTest', e); }
   try { if(typeof updateAccountBadgeFromState === 'function') updateAccountBadgeFromState(s); } catch(e){}
   try { if(typeof applySession === 'function') applySession(s); } catch(e){}
+  try { applyTickLog(s); } catch(e){}
+}
+
+// Tick-logging toggle: a BACKEND switch (not a local setting), so it POSTs /api/ticklog
+// and reflects the server's truth from each /ws frame. Wires its change handler once,
+// lazily, the first time the checkbox exists.
+let _tickLogWired = false;
+function applyTickLog(s){
+  const cb = document.getElementById('setTickLog');
+  if(!cb) return;
+  if(!_tickLogWired){
+    _tickLogWired = true;
+    cb.addEventListener('change', async ()=>{
+      try {
+        const resp = await API.post('/api/ticklog', {enabled: cb.checked});
+        const r = await resp.json();
+        if(r && r.ticklog) cb.checked = !!r.ticklog.enabled;   // reflect server truth
+        toast('ok', cb.checked ? 'Tick logging ON' : 'Tick logging OFF');
+      } catch(e){
+        toast('fail', 'Tick log toggle failed');
+      }
+    });
+  }
+  const t = s && s.ticklog;
+  if(!t) return;
+  if(document.activeElement !== cb) cb.checked = !!t.enabled;   // don't fight a mid-click
+  const info = document.getElementById('tickLogInfo');
+  if(info) info.textContent = t.enabled ? `→ ${t.path||''} (${t.rows||0} rows)` : '';
 }
 
 /* ---------------------------------------------------------------------------

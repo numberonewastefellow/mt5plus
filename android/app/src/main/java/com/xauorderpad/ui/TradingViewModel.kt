@@ -5,7 +5,10 @@ import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xauorderpad.data.Feed
+import com.xauorderpad.data.ServerProfile
+import com.xauorderpad.net.Api
 import com.xauorderpad.net.ApiResult
+import com.xauorderpad.net.HistoryResponse
 import com.xauorderpad.net.Link
 import com.xauorderpad.net.Profile
 import com.xauorderpad.net.Snapshot
@@ -45,7 +48,7 @@ private const val STALE_AFTER_MS = 10_000L
  * decides whether REAL orders go out sat next to an unrelated engine's toggle. On this screen
  * an engine can only be armed from its own page, where there is exactly one thing to arm.
  */
-enum class Screen { CONNECT, LOGIN, TRADE, SETTINGS, STRATEGIES, STRATEGY, ACCOUNTS, CERTS }
+enum class Screen { CONNECT, LOGIN, TRADE, SETTINGS, STRATEGIES, STRATEGY, ACCOUNTS, CERTS, HISTORY, SERVERS }
 
 /** One-shot message for the snackbar. `id` makes repeats of the same text fire again. */
 data class Toast(val text: String, val isError: Boolean, val id: Long)
@@ -245,6 +248,33 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
     private val _pendingCloses = MutableStateFlow<Set<Long>>(emptySet())
 
     /**
+     * Tickets the user has asked to close, for the SPLIT grid's row-close ANIMATION. Distinct from
+     * [_pendingCloses] (the dedup guard, which clears the instant the HTTP call returns): a ticket
+     * stays here from the tap until the position actually LEAVES the next server snapshot, so the row
+     * animates and holds its "closing" state until the close is CONFIRMED -- not merely acknowledged.
+     * A failed/timed-out close removes it here immediately so the row snaps back. Pruned against the
+     * live snapshot in `init` below. Only the SPLIT positions grid reads this; other layouts ignore it.
+     */
+    private val _closingTickets = MutableStateFlow<Set<Long>>(emptySet())
+    val closingTickets: StateFlow<Set<Long>> = _closingTickets.asStateFlow()
+
+    // Housekeeping: once a closed ticket actually leaves the snapshot (server dropped it), remove it
+    // from _closingTickets so the set stays bounded. Placed AFTER both `positions` and `_closingTickets`
+    // are initialised -- an init block earlier in the class ran while `_closingTickets` was still null
+    // (the Eagerly-started `positions` emits synchronously on first collect), which crashed at launch.
+    init {
+        viewModelScope.launch {
+            positions.collect { snap ->
+                if (_closingTickets.value.isNotEmpty()) {
+                    val live = snap.items.mapTo(HashSet()) { it.ticket }
+                    val kept = _closingTickets.value.filterTo(HashSet()) { it in live }
+                    if (kept.size != _closingTickets.value.size) _closingTickets.value = kept
+                }
+            }
+        }
+    }
+
+    /**
      * Separate from [busy] ON PURPOSE. The bulk-close bar used to be gated on the order path -- so a
      * BUY hanging on a flaky cellular link greyed out CLOSE ALL / CLOSE LOSING / CLOSE PROFIT for
      * the whole call. That is the panic path being disabled by the order path, at the exact moment
@@ -322,6 +352,13 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         val next = modes[(_layoutMode.value.ordinal + 1) % modes.size]
         secrets.layoutMode = next.ordinal
         _layoutMode.value = next
+    }
+
+    /** Set a specific layout directly (the Settings "Default screen" picker). Persisted, so it is
+     *  both "switch now" and "the layout the app reopens on". */
+    fun setLayout(mode: LayoutMode) {
+        secrets.layoutMode = mode.ordinal
+        _layoutMode.value = mode
     }
 
     /** Scalp candle timeframe in MINUTES (1/2/5/15/30/60/240). Persisted; see Secrets.candleTf. */
@@ -430,6 +467,67 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         _screen.value = Screen.TRADE
     }
 
+    // ---- saved server profiles (the "Switch server" list) ----------------
+
+    private val _serverProfiles = MutableStateFlow(Feed.secrets.serverProfiles)
+    val serverProfiles: StateFlow<List<ServerProfile>> = _serverProfiles.asStateFlow()
+    private val _serverBusy = MutableStateFlow(false)
+    val serverBusy: StateFlow<Boolean> = _serverBusy.asStateFlow()
+    private val _serverError = MutableStateFlow<String?>(null)
+    val serverError: StateFlow<String?> = _serverError.asStateFlow()
+
+    /**
+     * Verify a saved server, then switch to it ONLY if it answers. The probe is a throwaway [Api]
+     * pointed at the candidate's URL+token (reusing the shared TLS-configured client), hitting the
+     * authenticated /api/accounts: Ok = reachable + scheme/TLS ok + token valid; Unauthorized = bad
+     * token; TimedOut/Failed = unreachable. On success we run the same commit path as saveConnection.
+     */
+    fun selectServer(id: String) = viewModelScope.launch {
+        val p = _serverProfiles.value.find { it.id == id } ?: return@launch
+        _serverBusy.value = true
+        _serverError.value = null
+        try {
+            val probe = Api(http = { Feed.http }, baseUrl = { p.url }, token = { p.token })
+            when (val r = probe.accounts()) {
+                is ApiResult.Ok -> {
+                    secrets.baseUrl = p.url
+                    secrets.token = p.token
+                    secrets.markConnected()
+                    Feed.reconfigure()
+                    _screen.value = Screen.TRADE
+                }
+                is ApiResult.Unauthorized ->
+                    _serverError.value = "${p.label}: token rejected — check the token in Edit."
+                is ApiResult.TimedOut ->
+                    _serverError.value = "${p.label}: timed out — unreachable from this network?"
+                is ApiResult.Failed ->
+                    _serverError.value = "${p.label}: ${r.message}"
+            }
+        } finally {
+            _serverBusy.value = false
+        }
+    }
+
+    /** Add (id == null) or update a server profile, then persist. URL/token are normalized in Secrets. */
+    fun saveServer(id: String?, label: String, url: String, token: String) {
+        val list = _serverProfiles.value.toMutableList()
+        val lbl = label.ifBlank { "Server" }
+        if (id == null) {
+            list += ServerProfile(java.util.UUID.randomUUID().toString(), lbl, url, token)
+        } else {
+            val i = list.indexOfFirst { it.id == id }
+            if (i >= 0) list[i] = list[i].copy(label = lbl, url = url, token = token)
+            else list += ServerProfile(id, lbl, url, token)
+        }
+        secrets.serverProfiles = list
+        _serverProfiles.value = secrets.serverProfiles   // read back the normalized copy
+    }
+
+    fun deleteServer(id: String) {
+        secrets.serverProfiles = _serverProfiles.value.filterNot { it.id == id }
+        _serverProfiles.value = secrets.serverProfiles
+    }
+
     /**
      * Log out: drop the socket, forget the token, and go back to the Connect screen so the user
      * can see (and change) exactly which server they are about to talk to.
@@ -468,6 +566,9 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
 
     fun goto(s: Screen) {
         _screen.value = s
+        // Fetch today's activity on entry (on-demand; the screen also has a Refresh button).
+        if (s == Screen.HISTORY) fetchHistory()
+        if (s == Screen.SERVERS) _serverError.value = null   // drop a stale connect-failure banner
         if (s == Screen.LOGIN || s == Screen.ACCOUNTS) {
             // Drop any stale banner on the way IN. The banner is deliberately sticky WITHIN a
             // visit -- that is the whole point of it -- but it must not survive leaving and
@@ -515,6 +616,29 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
             is ApiResult.Unauthorized -> onUnauthorized(e)
             is ApiResult.TimedOut -> say("Timed out loading profiles — pull back and retry", error = true)
             is ApiResult.Failed -> say(r.message, error = true)
+        }
+    }
+
+    // ---- today's activity (history) --------------------------------------
+    // On-demand only (fetched when the screen opens + the Refresh button). Never auto-polled: the
+    // whole point of this screen is a stable snapshot the user can read, not a live-updating book.
+    private val _history = MutableStateFlow<HistoryResponse?>(null)
+    val history: StateFlow<HistoryResponse?> = _history.asStateFlow()
+    private val _historyLoading = MutableStateFlow(false)
+    val historyLoading: StateFlow<Boolean> = _historyLoading.asStateFlow()
+
+    fun fetchHistory() = viewModelScope.launch {
+        _historyLoading.value = true
+        val e = Feed.epoch
+        try {
+            when (val r = Feed.api.history()) {
+                is ApiResult.Ok -> _history.value = r.value
+                is ApiResult.Unauthorized -> onUnauthorized(e)
+                is ApiResult.TimedOut -> say("Timed out loading today's activity — tap ⟳ to retry", error = true)
+                is ApiResult.Failed -> say("History: ${r.message}", error = true)
+            }
+        } finally {
+            _historyLoading.value = false
         }
     }
 
@@ -941,17 +1065,24 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
         // and so the grid's own row-close cannot double-submit the same ticket. Freed in `finally`:
         // a failed close can be retried; a successful one is gone from the next snapshot anyway.
         _pendingCloses.value = _pendingCloses.value + ticket
+        _closingTickets.value = _closingTickets.value + ticket   // SPLIT row-close animation
         _inFlight.value += 1
         val e = Feed.epoch
         try {
             when (val r = Feed.api.close(ticket)) {
+                // Keep it in _closingTickets on success: the row holds its "closing" animation until
+                // the position actually leaves the next snapshot (pruned in init). Any failure path
+                // frees it so the row snaps back.
                 is ApiResult.Ok -> Unit   // closed -> the grid drops the row; no toast
-                is ApiResult.Unauthorized -> onUnauthorized(e)
-                is ApiResult.TimedOut -> say(
-                    "TIMED OUT — #$ticket may still have closed. Check the grid.",
-                    error = true,
-                )
-                is ApiResult.Failed -> say(r.message, error = true)
+                is ApiResult.Unauthorized -> { _closingTickets.value = _closingTickets.value - ticket; onUnauthorized(e) }
+                is ApiResult.TimedOut -> {
+                    _closingTickets.value = _closingTickets.value - ticket
+                    say("TIMED OUT — #$ticket may still have closed. Check the grid.", error = true)
+                }
+                is ApiResult.Failed -> {
+                    _closingTickets.value = _closingTickets.value - ticket
+                    say(r.message, error = true)
+                }
             }
         } finally {
             _inFlight.value -= 1

@@ -1,21 +1,35 @@
 package com.xauorderpad.ui
 
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -229,3 +243,157 @@ private fun RowScope.Warn(text: String, weight: Float) = Text(
     fontSize = 11.sp,
     color = Amber,
 )
+
+/**
+ * The SPLIT-layout right column: positions stripped to ENTRY price + P&L, swipe a row LEFT to close
+ * it. Same data as [PositionsGrid] (an ImmutableList, keyed by ticket) so a tick only touches P&L.
+ */
+@Composable
+fun SplitPositions(
+    state: PositionsUi,
+    onClose: (Long) -> Unit,
+    connected: Boolean,
+    live: Boolean,
+    closing: Set<Long> = emptySet(),
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                // start = 12 (4dp accent strip + 8dp row inset) keeps ENTRY over the price column.
+                .padding(start = 12.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
+        ) {
+            Text("ENTRY", Modifier.weight(1f), fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("P&L", Modifier.weight(1f), fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.End, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // Trailing column reserved for the ✕ close button on each row (keeps ENTRY/P&L aligned).
+            Spacer(Modifier.width(CLOSE_COL_WIDTH))
+        }
+        HorizontalDivider()
+
+        if (state.items.isEmpty()) {
+            Box(Modifier.fillMaxWidth().padding(16.dp), Alignment.Center) {
+                Text(
+                    if (connected) "No open positions" else "No data — not connected",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp,
+                )
+            }
+            return@Column
+        }
+
+        // Frozen, not hidden: the same rationale as PositionsGrid -- a blank list during a
+        // disconnect reads as "flat", the most dangerous lie this screen could tell.
+        if (!live) {
+            Box(
+                Modifier.fillMaxWidth().background(Amber.copy(alpha = 0.18f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text("NOT LIVE — P&L frozen", color = Amber, fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold)
+            }
+        }
+
+        LazyColumn {
+            items(state.items, key = { it.ticket }) { p ->
+                // animateItem(): when a confirmed close drops the ticket from the snapshot, the row
+                // slides/fades out instead of vanishing abruptly.
+                Column(Modifier.animateItem()) {
+                    SplitPositionRow(p, state.digits, onClose, closing = p.ticket in closing)
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                }
+            }
+        }
+    }
+}
+
+/** Fixed width reserved for the per-row ✕ close button (and the matching header spacer). Kept tight
+ *  so the ENTRY / P&L columns still fit their prices on ONE line in the narrow SPLIT panel. */
+private val CLOSE_COL_WIDTH = 26.dp
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SplitPositionRow(p: Position, digits: Int, onClose: (Long) -> Unit, closing: Boolean) {
+    // Optimistic feedback: on close request the row dims to 0.4 and holds there until the server
+    // confirms (the ticket leaves the snapshot -> the whole item animates out via animateItem()).
+    val rowAlpha by animateFloatAsState(if (closing) 0.4f else 1f, label = "rowClosingAlpha")
+    val dismiss = rememberSwipeToDismissBoxState(
+        confirmValueChange = { v ->
+            // While already closing, ignore further swipes (can't re-fire the same ticket).
+            if (!closing && v == SwipeToDismissBoxValue.EndToStart) onClose(p.ticket)
+            // Never dismiss the row ourselves: fire the close and snap back. The closed position
+            // disappears from the next snapshot (the list is keyed by ticket), which removes the row
+            // cleanly -- and if the close FAILS the row simply stays, no dangling empty slot.
+            false
+        },
+    )
+    SwipeToDismissBox(
+        state = dismiss,
+        // Swipe LEFT only; a right-swipe would fight the vertical scroll and there is no second action.
+        enableDismissFromStartToEnd = false,
+        gesturesEnabled = !closing,
+        backgroundContent = {
+            Box(
+                Modifier.fillMaxSize().background(Red.copy(alpha = 0.85f)).padding(horizontal = 12.dp),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Text("CLOSE", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+        },
+    ) {
+        val pl = p.profit ?: 0.0
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .height(IntrinsicSize.Min)
+                .background(MaterialTheme.colorScheme.surface)
+                .alpha(rowAlpha),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Left accent strip: green = LONG, red = SHORT. This is the ONLY long/short signal now,
+            // so the P&L colour is free to mean only profit/loss (a losing long no longer looks like
+            // a short). fillMaxHeight against the row's IntrinsicSize.Min makes it span the full row.
+            Box(
+                Modifier
+                    .width(4.dp)
+                    .fillMaxHeight()
+                    .background(if (p.isBuy) Green else Red),
+            )
+            Row(
+                Modifier
+                    .weight(1f)
+                    .padding(start = 6.dp, top = 10.dp, bottom = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    Fmt.price(p.priceOpen, digits),
+                    Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 12.sp,
+                )
+                Text(
+                    Fmt.signedMoney(pl),
+                    Modifier.weight(1f),
+                    color = if (pl < 0) Red else Green,
+                    textAlign = TextAlign.End,
+                    maxLines = 1,
+                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 12.sp,
+                )
+            }
+            // Trailing ✕: the explicit per-row close (swipe still works too). Glyph, not an icon
+            // asset — matches the app convention and needs no material-icons dependency.
+            Box(
+                Modifier
+                    .width(CLOSE_COL_WIDTH)
+                    .fillMaxHeight()
+                    .clickable(enabled = !closing) { onClose(p.ticket) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text("✕", color = Red, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}

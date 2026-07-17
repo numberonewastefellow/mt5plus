@@ -144,3 +144,18 @@ MT5_PATH = os.environ.get("XAUORDERPAD_MT5_PATH", "")   # e.g. r"C:\Program File
 MT5_LOGIN = 0
 MT5_PASSWORD = ""
 MT5_SERVER = ""
+
+# --- Tick logging (opt-in diagnostics, read-only) -------------------------
+# When enabled, the worker appends every raw tick (via copy_ticks_range, riding
+# the connection it already owns) to a CSV, so real ticks can be studied offline.
+# OFF by default: it must never be a surprise cost on a live/headless box. From
+# the environment like the settings above, so turning it on never edits a
+# git-tracked file. It places NO orders and touches no trade path -- purely a
+# reader bolted onto the existing poll loop, wrapped so a logging error can never
+# disrupt trading.
+TICKLOG_ENABLED = os.environ.get("XAUORDERPAD_TICKLOG", "") not in ("", "0", "false", "False")
+TICKLOG_PATH = os.environ.get(
+    "XAUORDERPAD_TICKLOG_PATH",
+    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                 "XauOrderPad", "xau_ticks.csv"),
+)

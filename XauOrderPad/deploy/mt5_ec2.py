@@ -620,6 +620,28 @@ def cmd_ship(cfg, args):
         sys.exit(f"Missing {', '.join(missing)} in {certs_dir}.\n"
                  f"Run:  python make_certs.py --ip <the elastic ip>")
 
+    # Guard against shipping the WRONG server cert. There are now two: the box's (SAN = the public
+    # Elastic IP, here in certs/) and the LAN one (SAN = a private 192.168.x.x, in certs-lan/, minted
+    # by `make_certs.py --server-only`). Shipping the LAN cert would hand the box a certificate that
+    # never verifies for its own public address -- an opaque handshake failure that looks like a
+    # network fault. The two live in different dirs so this cannot happen by path, but this is the
+    # belt to that braces: refuse if certs/server.crt's SAN is not a PUBLIC address.
+    import ipaddress as _ip
+    from cryptography import x509 as _x509
+    _crt = _x509.load_pem_x509_certificate(open(os.path.join(certs_dir, "server.crt"), "rb").read())
+    try:
+        _sans = _crt.extensions.get_extension_for_class(_x509.SubjectAlternativeName).value
+        _ips = [g.value for g in _sans if isinstance(g, _x509.IPAddress)]
+    except _x509.ExtensionNotFound:
+        _ips = []
+    if not _ips:
+        sys.exit(f"{certs_dir}\\server.crt has no IP-SAN. The phone dials the box by IP, so this cert "
+                 f"cannot verify. Re-mint:  python make_certs.py --ip <the elastic ip>")
+    if not any(_ip.ip_address(str(a)).is_global for a in _ips):
+        sys.exit(f"REFUSING TO SHIP: {certs_dir}\\server.crt is bound to {[str(a) for a in _ips]}, a "
+                 f"PRIVATE address -- that is the LAN cert, not the box's. The box needs the cert "
+                 f"whose SAN is the Elastic IP. Re-mint:  python make_certs.py --ip <the elastic ip>")
+
     ec2, _ = ec2_client(cfg)
     state = load_state()
     iid = require_instance(state)

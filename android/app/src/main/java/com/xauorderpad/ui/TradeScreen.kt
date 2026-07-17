@@ -4,6 +4,8 @@ import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -11,6 +13,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -87,11 +90,17 @@ fun TradeScreen(
     onEnterArmed: () -> Unit,
     onCloseArmed: () -> Unit,
     onArmedSide: (String) -> Unit,
+    /** Place a specific side directly ("buy"|"sell"). SPLIT-only: its two direct BUY/SELL buttons. */
+    onPlace: (String) -> Unit = {},
     armed: ArmedUi,
     onCloseWhere: (String) -> Unit,
     onClosePosition: (Long) -> Unit,
+    /** Tickets currently being closed — SPLIT grid uses this to animate the row. */
+    closingTickets: Set<Long> = emptySet(),
     onLogin: () -> Unit,
     onSettings: () -> Unit,
+    /** Open today's-activity screen. Shown in the top bar only when the broker is connected. */
+    onHistory: () -> Unit = {},
     /** Read-only here: the SWITCH lives in Settings now. This only decides whether to ask. */
     confirmCloses: Boolean,
     serverUrl: String,
@@ -117,6 +126,11 @@ fun TradeScreen(
     // Every bulk close is confirmed: they are irreversible and a single tap can flatten the
     // whole book. `confirm` holds the pending filter, or null.
     var confirm by remember { mutableStateOf<String?>(null) }
+    // Shared by every layout's bulk-close controls: confirm first (unless the user turned confirm
+    // off), else fire straight through. Same AlertDialog handles all of them.
+    val onBulkClose: (String) -> Unit = { filter ->
+        if (confirmCloses) confirm = filter else onCloseWhere(filter)
+    }
 
     // Every control height is a FRACTION of the real screen height, not a fixed dp.
     //
@@ -142,12 +156,28 @@ fun TradeScreen(
             bulkH = frac(0.044f, 34.dp, 46.dp),
         )
 
+    if (mode == LayoutMode.SPLIT) {
+        SplitBody(
+            serverUrl = serverUrl, strategies = strategies, mode = mode,
+            onCycleLayout = onCycleLayout, onSettings = onSettings, onHistory = onHistory,
+            health = health, link = link, onLogin = onLogin, live = live,
+            quote = quote,
+            form = form, canTrade = health.healthy && live, digits = positions.digits,
+            onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp, onPlace = onPlace,
+            onBulkClose = onBulkClose, closing = closing,
+            guard = guard, account = account, onSetGuard = onSetGuard,
+            positions = positions, onClosePosition = onClosePosition, closingTickets = closingTickets,
+            d = d,
+        )
+    } else {
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
         ServerBar(
             serverUrl = serverUrl,
             strategyDot = strategies.items.any { it.enabled },
             strategyKilled = strategies.items.any { it.killed },
             mode = mode,
+            showHistory = health.connected,
+            onHistory = onHistory,
             onCycleLayout = onCycleLayout,
             onSettings = onSettings,
         )
@@ -199,9 +229,7 @@ fun TradeScreen(
         // server re-evaluates the filter against live broker prices, and if the network really is
         // down the call fails loudly with a toast. Refusing to even ask, at the moment gold is
         // gapping against you, is the worse failure.
-        BulkCloseBar(enabled = !closing, d = d) { filter ->
-            if (confirmCloses) confirm = filter else onCloseWhere(filter)
-        }
+        BulkCloseBar(enabled = !closing, d = d, onPick = onBulkClose)
         Spacer(Modifier.height(d.gap))
 
         // Server-enforced auto-close-all at a floating-P&L target. Rendered once here, so it shows
@@ -222,6 +250,7 @@ fun TradeScreen(
             // that THIS gets the remainder.
             modifier = Modifier.weight(1f),
         )
+    }
     }
     }
 
@@ -270,6 +299,8 @@ private fun ServerBar(
     strategyDot: Boolean,
     strategyKilled: Boolean,
     mode: LayoutMode,
+    showHistory: Boolean,
+    onHistory: () -> Unit,
     onCycleLayout: () -> Unit,
     onSettings: () -> Unit,
 ) {
@@ -288,6 +319,17 @@ private fun ServerBar(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+
+        // Today's-activity screen. Only offered when the terminal is connected to the broker --
+        // there is no history to fetch otherwise, and the endpoint would just error.
+        if (showHistory) {
+            TextButton(
+                onClick = onHistory,
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+            ) {
+                Text("📊", fontSize = 15.sp)
+            }
+        }
 
         // Layout cycle chip. Taps through Classic -> Compact -> Scalp, persisted, so the designs can
         // be compared on the same phone with the same live feed. Temporary comparison scaffold.
@@ -722,6 +764,82 @@ private fun FieldLabel(text: String) = Text(
 )
 
 /**
+ * LOT on one line: inline label + short box + −/+ steppers. Shared by Compact/Scalp (fixed-width box)
+ * and Split (fills the narrow column when [fillField] is true).
+ */
+@Composable
+private fun CompactLotRow(
+    form: OrderForm,
+    d: Dims,
+    onLot: (String) -> Unit,
+    onStepLot: (Int) -> Unit,
+    fillField: Boolean = false,
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FieldLabel("LOT")
+        OutlinedButton(
+            onClick = { onStepLot(-1) },
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.width(42.dp).height(d.fieldH),
+        ) { Text("−", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+        BareField(
+            value = form.lot,
+            onValueChange = onLot,
+            height = d.fieldH,
+            keyboardType = KeyboardType.Decimal,
+            modifier = if (fillField) Modifier.weight(1f) else Modifier.width(104.dp),
+        )
+        OutlinedButton(
+            onClick = { onStepLot(1) },
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.width(42.dp).height(d.fieldH),
+        ) { Text("+", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+    }
+}
+
+/**
+ * SL / TP on one row: inline labels + short boxes + the $-equivalent [PointsHint]. Shared by
+ * Compact/Scalp and Split. The hint is a safety readout (these are POINT distances, not prices).
+ */
+@Composable
+private fun CompactSlTpRow(
+    form: OrderForm,
+    digits: Int,
+    d: Dims,
+    onSl: (String) -> Unit,
+    onTp: (String) -> Unit,
+) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.weight(1f)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                FieldLabel("SL")
+                BareField(form.slPoints, onSl, d.fieldH, KeyboardType.Number,
+                    Modifier.weight(1f), placeholder = "0")
+            }
+            PointsHint(form.slPoints, digits)
+        }
+        Column(Modifier.weight(1f)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                FieldLabel("TP")
+                BareField(form.tpPoints, onTp, d.fieldH, KeyboardType.Number,
+                    Modifier.weight(1f), placeholder = "0")
+            }
+            PointsHint(form.tpPoints, digits)
+        }
+    }
+}
+
+/**
  * The bordered input box WITHOUT the caption line -- the compact layout puts the label inline
  * (see [FieldLabel]) instead of above, so it must not carry its own. Same behaviour and height
  * control as [CompactField]; only the caption is gone.
@@ -784,61 +902,9 @@ private fun OrderFormBlock(
 ) {
     Column {
         if (compact) {
-            // LOT on one line: inline label + short box + steppers (no caption row above).
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                FieldLabel("LOT")
-                OutlinedButton(
-                    onClick = { onStepLot(-1) },
-                    contentPadding = PaddingValues(0.dp),
-                    modifier = Modifier.width(42.dp).height(d.fieldH),
-                ) { Text("−", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
-                BareField(
-                    value = form.lot,
-                    onValueChange = onLot,
-                    height = d.fieldH,
-                    keyboardType = KeyboardType.Decimal,
-                    modifier = Modifier.width(104.dp),
-                )
-                OutlinedButton(
-                    onClick = { onStepLot(1) },
-                    contentPadding = PaddingValues(0.dp),
-                    modifier = Modifier.width(42.dp).height(d.fieldH),
-                ) { Text("+", fontSize = 20.sp, fontWeight = FontWeight.Bold) }
-            }
-
+            CompactLotRow(form, d, onLot, onStepLot)
             Spacer(Modifier.height(d.gap))
-
-            // SL / TP: inline labels + short boxes, both on one row. The $-equivalent hint stays --
-            // it is a safety readout (these are POINT distances, not prices; see below), not chrome.
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Column(Modifier.weight(1f)) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        FieldLabel("SL")
-                        BareField(form.slPoints, onSl, d.fieldH, KeyboardType.Number,
-                            Modifier.weight(1f), placeholder = "0")
-                    }
-                    PointsHint(form.slPoints, digits)
-                }
-                Column(Modifier.weight(1f)) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        FieldLabel("TP")
-                        BareField(form.tpPoints, onTp, d.fieldH, KeyboardType.Number,
-                            Modifier.weight(1f), placeholder = "0")
-                    }
-                    PointsHint(form.tpPoints, digits)
-                }
-            }
-
+            CompactSlTpRow(form, digits, d, onSl, onTp)
             Spacer(Modifier.height(d.gap))
         } else {
         Row(
@@ -1103,7 +1169,10 @@ private fun GuardBar(
     val wouldFireNow = !armed && amt != null && amt > 0 && floatingPl != null &&
         (if (side == "loss") floatingPl <= -amt else floatingPl >= amt)
 
-    Column(Modifier.fillMaxWidth()) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        // Row 1 — arm switch + side selection. Kept on its own line so the amount field below
+        // gets the full column width; cramming all four into one row on the narrow SPLIT column
+        // squeezed the field to an unusable sliver.
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1120,16 +1189,17 @@ private fun GuardBar(
             )
             GuardSideChip("PROFIT", side == "profit", Green, enabled = !armed) { side = "profit" }
             GuardSideChip("LOSS", side == "loss", Red, enabled = !armed) { side = "loss" }
-            BareField(
-                value = amount,
-                onValueChange = { amount = it },
-                height = d.fieldH,
-                keyboardType = KeyboardType.Number,
-                modifier = Modifier.weight(1f),
-                placeholder = "close-all at…",
-                enabled = !armed,
-            )
         }
+        // Row 2 — the target amount, now full width so it is actually tappable/readable.
+        BareField(
+            value = amount,
+            onValueChange = { amount = it },
+            height = d.fieldH,
+            keyboardType = KeyboardType.Number,
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = "close-all at…",
+            enabled = !armed,
+        )
         val (msg, msgColor) = when {
             armed -> ("Auto-close ALL at ${if (guard.side == "loss") "-" else "+"}" +
                 "${trimAmount(guard.target)}  ·  FLOATING ${Fmt.signedMoney(floatingPl)}") to Green
@@ -1170,6 +1240,147 @@ private fun GuardSideChip(
 /** 500.0 -> "500", 500.5 -> "500.5" -- no trailing ".0" on whole amounts. */
 private fun trimAmount(v: Double): String =
     if (v == v.toLong().toDouble()) v.toLong().toString() else v.toString()
+
+/**
+ * SPLIT layout: controls in a left column, a stripped positions list (entry + P&L, swipe-to-close)
+ * in a right column. Identity banner on top, totals footer at the bottom, both spanning. Pure
+ * rearrangement — every control reuses the same callbacks the stacked layouts use.
+ */
+@Composable
+private fun SplitBody(
+    serverUrl: String,
+    strategies: StrategiesUi,
+    mode: LayoutMode,
+    onCycleLayout: () -> Unit,
+    onSettings: () -> Unit,
+    onHistory: () -> Unit,
+    health: Health,
+    link: Link,
+    onLogin: () -> Unit,
+    live: Boolean,
+    quote: Quote,
+    form: OrderForm,
+    canTrade: Boolean,
+    digits: Int,
+    onLot: (String) -> Unit,
+    onStepLot: (Int) -> Unit,
+    onSl: (String) -> Unit,
+    onTp: (String) -> Unit,
+    onPlace: (String) -> Unit,
+    onBulkClose: (String) -> Unit,
+    closing: Boolean,
+    guard: GuardUi,
+    account: AccountUi,
+    onSetGuard: (Boolean?, Double?, String?) -> Unit,
+    positions: PositionsUi,
+    onClosePosition: (Long) -> Unit,
+    closingTickets: Set<Long>,
+    d: Dims,
+) {
+    Column(Modifier.fillMaxSize().padding(horizontal = 8.dp, vertical = 8.dp)) {
+        ServerBar(
+            serverUrl = serverUrl,
+            strategyDot = strategies.items.any { it.enabled },
+            strategyKilled = strategies.items.any { it.killed },
+            mode = mode,
+            showHistory = health.connected,
+            onHistory = onHistory,
+            onCycleLayout = onCycleLayout,
+            onSettings = onSettings,
+        )
+        Spacer(Modifier.height(d.gap))
+        StatusBanner(health, link, onLogin)
+        Spacer(Modifier.height(d.gap))
+
+        Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // LEFT — controls. Scrolls if a large font/zoom pushes them past the available height,
+            // so they never overlap (the whole reason the stacked layouts got the font-scale work).
+            Column(
+                Modifier.weight(0.55f).fillMaxHeight().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(d.gap),
+            ) {
+                QuoteBlock(quote, live, d, compact = true)
+                CompactLotRow(form, d, onLot, onStepLot, fillField = true)
+                CompactSlTpRow(form, digits, d, onSl, onTp)
+                SplitEntryButtons(quote, digits, canTrade, d, onBuy = { onPlace("buy") }, onSell = { onPlace("sell") })
+                SplitBulkCloses(enabled = !closing, d = d, onPick = onBulkClose)
+                GuardBar(guard = guard, floatingPl = account.floatingPl, d = d, onSetGuard = onSetGuard)
+            }
+            // RIGHT — positions: entry price + P&L only, ✕ or swipe a row to close it.
+            SplitPositions(
+                state = positions,
+                onClose = onClosePosition,
+                connected = health.connected,
+                live = live,
+                closing = closingTickets,
+                modifier = Modifier.weight(0.45f).fillMaxHeight(),
+            )
+        }
+        Spacer(Modifier.height(d.gap))
+        AccountStrip(account)
+    }
+}
+
+/**
+ * SPLIT's two DIRECT entry buttons: BUY buys (long), SELL sells (short) — no arming step. Each shows
+ * its fill price (BUY→ask, SELL→bid). Ordering is async/non-blocking (vm.placeOrder). SPLIT-only.
+ */
+@Composable
+private fun SplitEntryButtons(
+    quote: Quote,
+    digits: Int,
+    canTrade: Boolean,
+    d: Dims,
+    onBuy: () -> Unit,
+    onSell: () -> Unit,
+) {
+    val dg = quote.digits ?: digits
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        EntrySideButton("BUY", quote.ask, dg, Green, canTrade, d, Modifier.weight(1f), onBuy)
+        EntrySideButton("SELL", quote.bid, dg, Red, canTrade, d, Modifier.weight(1f), onSell)
+    }
+}
+
+@Composable
+private fun EntrySideButton(
+    label: String,
+    price: Double?,
+    digits: Int,
+    tint: Color,
+    canTrade: Boolean,
+    d: Dims,
+    modifier: Modifier,
+    onClick: () -> Unit,
+) {
+    Button(
+        onClick = onClick,
+        enabled = canTrade,
+        colors = ButtonDefaults.buttonColors(containerColor = tint),
+        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 3.dp),
+        modifier = modifier.heightIn(min = d.actionH),
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(label, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Text(Fmt.price(price, digits), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+        }
+    }
+}
+
+/** Bulk closes, responsive: a row when the column is wide enough, stacked when it is narrow. */
+@Composable
+private fun SplitBulkCloses(enabled: Boolean, d: Dims, onPick: (String) -> Unit) {
+    BoxWithConstraints {
+        if (maxWidth >= 260.dp) {
+            BulkCloseBar(enabled = enabled, d = d, onPick = onPick)
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(d.gap)) {
+                BulkBtn("CLOSE ALL", MaterialTheme.colorScheme.primary, enabled, d, Modifier.fillMaxWidth()) { onPick("all") }
+                BulkBtn("CLOSE LOSING", Red, enabled, d, Modifier.fillMaxWidth()) { onPick("losing") }
+                BulkBtn("CLOSE PROFIT", Green, enabled, d, Modifier.fillMaxWidth()) { onPick("profit") }
+            }
+        }
+    }
+}
 
 @Composable
 private fun AccountStrip(a: AccountUi) {

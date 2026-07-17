@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  App Transport Security + local-network privacy for a personal, sideloaded trading client.
+
+  Why NSAllowsArbitraryLoads = true:
+    • The LAN path is plain HTTP to an arbitrary local IP (http://192.168.x:8765) — ATS blocks
+      cleartext by default.
+    • The EC2 path is HTTPS to a bare IP whose cert is signed by our PRIVATE CA — not a system-
+      trusted root. Trust is enforced instead in code (TradingURLSessionDelegate pins our CA and
+      presents the client cert), which is stricter than ATS, not weaker.
+  The Connect screen warns loudly whenever the active transport is cleartext.
+
+  NSLocalNetworkUsageDescription is required from iOS 14+ to connect to LAN devices; without it the
+  first LAN connection is silently blocked.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+    </dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Connects to your XauOrderPad trading server on the local network.</string>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>
