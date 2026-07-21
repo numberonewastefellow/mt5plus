@@ -7,6 +7,8 @@ terminal). The server binds to 127.0.0.1 unless XAUORDERPAD_HOST says otherwise.
 
 import os
 
+import instance_paths
+
 # --- Symbol ---------------------------------------------------------------
 # Exness often suffixes symbols (e.g. "XAUUSDm"). Set the exact name your
 # terminal shows. If AUTO_RESOLVE_SYMBOL is True and the exact name is not
@@ -50,6 +52,30 @@ STRATEGY_DEFAULTS = {
 STRATEGY_MAGICS = {
     "straddle": 532027,
     "ladder": 532028,
+    "rider": 532029,          # vol-regime trend-rider (paper/suggestion only)
+}
+
+# Vol-Regime Trend-Rider — a PAPER/SUGGESTION engine. It computes the verified
+# M5 thrust-follow + trailing-stop signal and surfaces a "trade now" card + paper
+# P&L; it places NO orders (the human taps to execute via the normal order path).
+# Tunables mirror analysis/eda RiderConfig. See analysis/eda/RIDER.md.
+RIDER_DEFAULTS = {
+    "thrust_mult": 1.5,       # |body| > mult*ATR(14) on M5 = a thrust
+    "sl": 6.0,                # $/oz initial stop distance
+    "trail": 6.0,             # $/oz trailing distance
+    "tp": 50.0,               # $/oz far cap (mostly rides the trail)
+    "max_hold": 24,           # M5 bars (~2h) time-stop
+    "atr_win": 100,           # rolling window for the ATR-median regime gate
+    "use_ny_hours": False,    # also restrict signals to NY hours (13-16 UTC)
+    "risk_frac": 0.01,        # Kelly-small: fraction of equity risked per trade
+    "max_daily_loss": 200.0,  # USD — the kill-switch, and on a real account the ONLY cap
+    # Execution. Two independent switches, one per account class, both re-read on
+    # EVERY poll so a mid-session account switch changes behaviour immediately.
+    # OFF/OFF = the engine only publishes a card and the human taps Place.
+    # `auto_real` is in VolRegimeRider.NEVER_RESTORE: it is saved but never restored,
+    # so real-money execution cannot resume by itself after a crash or a restart.
+    "auto_demo": False,       # place automatically while connected to a DEMO account
+    "auto_real": False,       # place automatically while connected to a REAL account
 }
 
 # Crash recovery. On (re)start each engine rebuilds its open book from the BROKER
@@ -80,20 +106,66 @@ LADDER_RESUME_MAX_AGE_S = 600      # 10 minutes
 #     trigger, and that cannot be backtested. Hence paper=True by default: the
 #     engine logs what it WOULD do and places nothing, so the trigger's edge can
 #     be measured before a cent is risked.
+#
+# MEASURED ON A LIVE DEMO RUN, 2026-07-21, account 472200942. The engine was left
+# armed with side=buy, trigger=4071.60, max_positions=1, target=1.00, retrace=0.30.
+# In ~25 minutes it turned over 68 ladders and 79 closed trades for a net -19.13 at
+# 0.01 lots. Two numbers explain the whole result, and both are encoded below:
+#
+#   * `target` was hit ZERO times. Every single exit was the retrace trail. A target
+#     is only reachable if price can run `target` WITHOUT ever pulling back
+#     `retrace`; 1.00 behind a 0.30 trail cannot happen. Hence `_param_guard`.
+#   * The trigger was never CONSUMED. Once price sat above 4071.60 the engine
+#     re-armed on the next 66 ms poll and bought again, forever. Hence `cooldown_s`,
+#     `max_ladders_per_day`, and the re-arm latch that requires price to trade back
+#     THROUGH the trigger before a new ladder may start.
 LADDER_DEFAULTS = {
     "side": "sell",          # "buy" | "sell"
     "trigger": 0.0,          # arm price; 0 = not set (engine will not fire)
     "volume": 0.01,          # lots per position
-    "max_positions": 1,      # see above -- >1 multiplies the spread cost
+    "max_positions": 1,      # count cap; 0 = UNCAPPED. >1 multiplies the spread cost
+    "max_lots": 0.0,         # total open lots cap; 0 = UNCAPPED. See the note below
     "entry_mode": "step",    # "step" (spaced by price) | "timer" (N per second)
     "entry_step": 0.30,      # step mode: add only on a new extreme this far on
     "entry_gap_ms": 200,     # timer mode: min ms between entries (200 = 5/sec)
     "target": 1.00,          # $/oz profit per position (1.00 = 1000 points)
-    "retrace": 0.30,         # $/oz pullback from the extreme -> close out
+    # How the ladder gets OUT. Two shapes, and they behave nothing alike:
+    #   "retrace" -- trail `retrace` behind the extreme. Tightens as the move runs,
+    #                so it exits early and often. This is the validated default.
+    #   "floor"   -- one fixed level at `trigger -/+ floor_offset`. The ladder is
+    #                given the whole distance from the trigger to work in, and is
+    #                flattened only if price returns to where it was armed.
+    "stop_mode": "retrace",
+    "retrace": 0.30,         # retrace mode: $/oz pullback from the extreme -> close out
+    "floor_offset": 0.0,     # floor mode: $/oz BEYOND the trigger before flushing
     "hard_sl": 3.00,         # $/oz broker-side stop, in case this process dies
     "max_daily_loss": 200.0, # USD kill-switch
+    "cooldown_s": 0.0,       # min seconds between ladders; 0 = none
+    "max_ladders_per_day": 0,  # 0 = unlimited
+    "close_batch": 25,       # max positions closed per poll cycle -- see below
     "paper": True,           # log-only; places NO orders. Default ON.
 }
+
+# Why `max_lots` matters more than `max_positions`, and why the flush is BATCHED.
+#
+# Uncapped pyramiding is not dangerous in the way it first looks. With a per-position
+# `target`, a FAST run drains itself: early rungs hit their target and close as price
+# passes them, so the open book only ever holds the rungs opened within the last
+# `target` of movement. The dangerous case is the opposite -- a SLOW GRIND. Timer mode
+# adds a rung whenever price beats the previous entry, so a creeping uptrend
+# accumulates steadily while nothing ever reaches the target. At 5 entries/sec a grind
+# of 1.00 over five minutes is ~1500 rungs = 15 lots, and a floor exit closes all of
+# them at once. `max_lots` is the only thing standing in front of that; 0 (uncapped)
+# is supported, but a real number is strongly advised on anything live.
+#
+# Which leads to the flush. `mt5.order_send` is SYNCHRONOUS and runs on the worker
+# thread, inside the ~66 ms poll budget. Closing N positions costs N*2 broker round
+# trips, so flattening a large book in one cycle would freeze the poll loop for
+# seconds -- and that same loop is what feeds prices, the P&L guard, the manual order
+# pad, AND the stop that just decided to bail out. So the exit closes at most
+# `close_batch` positions per cycle and resumes on the next one: the book still
+# empties promptly, but every individual cycle stays inside its budget.
+ENTRY_GAP_MS_MIN = 100     # floor on entry_gap_ms: 0 would mean one order_send PER POLL
 
 # --- Server ---------------------------------------------------------------
 # HOST: bind address. Two legitimate values, and one that is never legitimate:
@@ -154,8 +226,9 @@ MT5_SERVER = ""
 # reader bolted onto the existing poll loop, wrapped so a logging error can never
 # disrupt trading.
 TICKLOG_ENABLED = os.environ.get("XAUORDERPAD_TICKLOG", "") not in ("", "0", "false", "False")
+# Default lands in the INSTANCE's state dir, so two accounts cannot interleave their
+# ticks into one CSV and quietly ruin the file for analysis. Still overridable by env.
 TICKLOG_PATH = os.environ.get(
     "XAUORDERPAD_TICKLOG_PATH",
-    os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                 "XauOrderPad", "xau_ticks.csv"),
+    str(instance_paths.state_dir() / "xau_ticks.csv"),
 )

@@ -45,6 +45,17 @@ cd /d d:\llm\ios\mt5plus\XauOrderPad
 
 ## Reach it from a phone on the LAN
 
+There are **two modes**, and `start_server.bat` takes the mode as an argument:
+
+| Mode | Command | Link | Use it when |
+|---|---|---|---|
+| **Plain HTTP** | `start_server.bat` *(or `start_server.bat plain`)* | `http://<lan-ip>:8765` | Quick LAN access. The **token crosses the LAN in cleartext**, and the phone **cannot add a REAL account** over it. |
+| **Encrypted (TLS)** | `start_server.bat tls` *(or double-click `start_tls.bat`)* | `https://<lan-ip>:8443` | You want an encrypted link and/or to **add a real account from the phone**. Reuses the EC2 mTLS setup. |
+
+Plain mode is documented immediately below; TLS mode is under **[Encrypted LAN (TLS)](#encrypted-lan-tls--required-to-add-a-real-account)**.
+
+### Plain HTTP (quick, unencrypted)
+
 **`start_server.bat` now does this for you.** If `XauOrderPad\.token.local` exists, the script binds
 uvicorn to **`0.0.0.0`** (LAN-reachable) and sets `XAUORDERPAD_TOKEN` from that file automatically —
 so a plain double-click gives you a phone-reachable server, and it **stays that way across restarts**
@@ -106,6 +117,66 @@ A useful discriminator: from *another* device on the Wi-Fi, open
 > the inbound firewall.
 
 The phone app is documented in **[../android/README.md](../android/README.md)**.
+
+## Encrypted LAN (TLS) — required to add a REAL account
+
+Plain mode (above) works, but it has two limits: the API **token crosses the LAN in cleartext**, and
+the Android app **refuses to send a broker password over plain HTTP** — so you cannot *add / log in a
+real account* from the phone on `http://…:8765`. TLS mode fixes both by reusing the **exact same mTLS
+front door the EC2 box uses** (Caddy + our private CA), pointed at a local certificate.
+
+**What TLS mode does:** uvicorn moves to **`127.0.0.1`** (loopback) and a local **Caddy** runs the
+mutual-TLS front door on **8443**, forwarding to loopback. Caddy is then the only thing on the
+network, so if it stops the trading API is *unreachable* rather than reachable-without-TLS
+(fail-closed — identical to the box).
+
+### One-time: mint the LAN certificate
+
+There are **two server certificates, one CA**: the EC2 cert (`deploy/certs/server.crt`, SAN = the
+Elastic IP) and a LAN cert (`deploy/certs-lan/server.crt`, SAN = your PC's LAN IP). They share the
+**same CA**, so the phone's already-imported `ca.crt` + `client.p12` authenticate to **both** — you
+import nothing new.
+
+Mint the LAN cert once (this **reuses** the existing CA and does **not** touch the EC2 material):
+
+```powershell
+cd d:\llm\ios\mt5plus\XauOrderPad\deploy
+python make_certs.py --ip 192.168.0.116 --server-only --out certs-lan
+```
+
+Use your PC's actual LAN IP if it differs. The cert is **bound to that IP**, so set a **DHCP
+reservation** for it on your router — otherwise a new lease breaks the cert (same reason the box
+needs an Elastic IP). The LAN cert lives outside `deploy/certs/`, so `mt5_ec2.py ship` can never send
+it to the box; `ship` also now refuses a cert whose SAN is a private IP.
+
+### Start it
+
+```powershell
+cd d:\llm\ios\mt5plus\XauOrderPad
+start_server.bat tls          & rem  (or just double-click start_tls.bat)
+```
+
+The first run downloads `caddy.exe` into `deploy\` (gitignored). Two windows open — **uvicorn**
+(loopback) and **Caddy** (the 8443 door). `caddy_local.ps1` validates the config, proves
+`require_and_verify` is present, adds an inbound firewall rule for **8443** (best-effort — run the
+`.bat` from an **Administrator** shell if the phone times out), and self-tests that a connection
+**without** a client certificate is rejected before handing the window to Caddy.
+
+> **The uvicorn window's banner still says "a phone CANNOT connect" — ignore that in TLS mode.** It
+> describes uvicorn's *own* socket, which is now intentionally loopback-only. The phone does not talk
+> to uvicorn; it talks to **Caddy on 8443**, which forwards to it. `401 Unauthorized` lines in that
+> window are just the local desktop browser without a token — harmless.
+
+### Point the phone at it
+
+In the Android app, **Settings → Servers**, edit the LAN profile:
+
+- **URL:** `https://192.168.0.116:8443` (type the `https://` and `:8443` explicitly).
+- **Token:** the same `.token.local` value.
+- **Certificates:** `ca.crt` + `client.p12` — **already imported** for the EC2 box, so nothing to do.
+  (If this phone has never talked to the box, import them once: **Settings → Certificates (mTLS)**.)
+
+Then **Select & connect**. You can now add the real account (the password is encrypted over https).
 
 ## Controls
 

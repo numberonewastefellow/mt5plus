@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <!--
+      The app mark is now "Om! + candles": a gold ॐ over the red/green candlesticks (see
+      ic_launcher_om_fg.png). This is the launcher icon, and on One UI it is also what the
+      notification shows as its main icon. The monochrome (themed-icon) layer keeps the old
+      candles-only silhouette, which reads far cleaner as a single-colour shape than a tinted
+      ॐ+candles would.
+    -->
+    <foreground android:drawable="@drawable/ic_launcher_om_fg" />
     <monochrome android:drawable="@drawable/ic_launcher_foreground" />
 </adaptive-icon>

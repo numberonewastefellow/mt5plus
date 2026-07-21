@@ -10,5 +10,15 @@
         <item name="android:statusBarColor">#101214</item>
         <item name="android:navigationBarColor">#101214</item>
         <item name="android:windowBackground">#101214</item>
+
+        <!--
+          Android 12+ system splash (shown on COLD start, before Compose can draw). By default it
+          paints the LAUNCHER icon (the candlesticks) on a flat ground, which read as an unrelated
+          screen ahead of the "Om!" welcome. Point it at the gold emblem on the welcome's own dark
+          ground instead, so the splash IS the start of the Om! moment and cross-dissolves into it
+          (MainActivity sets the exit animation). minSdk is 34, so these API-31 attrs always apply.
+        -->
+        <item name="android:windowSplashScreenBackground">#0A0B0D</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_emblem</item>
     </style>
 </resources>

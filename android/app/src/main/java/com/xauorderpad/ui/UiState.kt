@@ -28,6 +28,17 @@ data class Quote(
     /** Already converted to POINTS. The raw `spread` field is a price difference. */
     val spreadPoints: Double? = null,
     val digits: Int? = null,
+    /**
+     * The symbol's point size, straight from the broker (`symbol_info.point`).
+     *
+     * Carried separately from [digits] because the two are NOT interchangeable here and
+     * assuming they were is a live bug this app already had: anything converting a PRICE
+     * distance into the POINT distance `/order` wants must divide by THIS, not by
+     * `10^-digits`. On this feed `point = 0.001`, and code that fell back to `digits = 2`
+     * computed a stop TEN TIMES too tight. `null` means the broker has not told us yet --
+     * in which case nothing may be placed. Refuse, do not guess.
+     */
+    val point: Double? = null,
 )
 
 @Immutable

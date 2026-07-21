@@ -31,6 +31,8 @@ import threading
 import time
 from pathlib import Path
 
+import instance_paths
+
 log = logging.getLogger("XauOrderPad.browser")
 
 # Common per-browser install locations, checked after the registry lookup.
@@ -108,9 +110,12 @@ def _profile_dir() -> str:
     Using a separate ``--user-data-dir`` keeps the app window isolated from the
     user's normal Chrome profile, guarantees it opens as its own window even
     when Chrome is already running, and lets it remember size/position.
+
+    PER-INSTANCE. This directory is also the marker
+    ``kill_existing_app_windows()`` matches on, so sharing it across servers
+    would make each new instance close the previous one's window -- see there.
     """
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    profile = Path(base) / "XauOrderPad" / "browser-profile"
+    profile = instance_paths.state_dir() / "browser-profile"
     profile.mkdir(parents=True, exist_ok=True)
     return str(profile)
 
@@ -141,12 +146,24 @@ def kill_existing_app_windows() -> None:
     chrome/msedge process whose command line references OUR profile dir -- this
     targets only our windows and never the user's normal browser. Best-effort:
     failures here are logged and ignored so the launch still proceeds.
+
+    "OUR" means THIS INSTANCE's profile directory, not the app's in general. The
+    match used to be the literal ``*XauOrderPad\\browser-profile*``, which every
+    instance's command line contains -- so on a multi-account box, starting the
+    second server would close the first one's trading window while its account
+    was live. Matching the full per-instance path keeps each kill local.
     """
-    # Match by the unique profile-dir marker in the process command line.
+    # Match by the unique profile-dir marker in the process command line. The path
+    # is escaped for PowerShell's -like: doubled quotes, and [ ] * ? neutralised so
+    # a directory containing one cannot turn into a wildcard that matches siblings.
+    marker = _profile_dir()
+    for ch in ("`", "[", "]", "*", "?"):
+        marker = marker.replace(ch, "`" + ch)
+    marker = marker.replace("'", "''")
     ps = (
         "Get-CimInstance Win32_Process -Filter "
         "\"Name='chrome.exe' or Name='msedge.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*XauOrderPad\\browser-profile*' } | "
+        f"Where-Object {{ $_.CommandLine -like '*{marker}*' }} | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
         "-ErrorAction SilentlyContinue }"
     )

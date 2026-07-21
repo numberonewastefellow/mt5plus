@@ -129,7 +129,98 @@ data class StrategyStatus(
     val spread: Double? = null,
     val warning: String? = null,
     val params: StrategyParams? = null,
+    /** Rungs currently open, and what they add up to in lots. */
+    @SerialName("open_positions") val openPositions: Int? = null,
+    @SerialName("open_lots") val openLots: Double? = null,
+    @SerialName("ladders_done") val laddersDone: Int? = null,
+    @SerialName("ladders_today") val laddersToday: Int? = null,
+    /**
+     * What the dialled stop ACTUALLY costs: the stop is measured on the entry-side price
+     * but realised on the exit side, so the operator gives up `stop + spread`. Derived
+     * SERVER-SIDE (see `TrendLadder._extra_status`) precisely so this screen and the web
+     * panel cannot quote different numbers for the same engine.
+     */
+    @SerialName("effective_stop") val effectiveStop: Double? = null,
+    /** Where a floor-mode stop sits, in price. Null in retrace mode. */
+    @SerialName("floor_price") val floorPrice: Double? = null,
+    /**
+     * Positions still queued for closing. A flush is drained in batches so a large book
+     * cannot freeze the worker's poll loop, so this counts DOWN over several polls -- a
+     * non-zero value means "closing in progress", not "stuck".
+     */
+    @SerialName("flush_remaining") val flushRemaining: Int? = null,
+
+    // ---- rider-only; null on every other engine ----------------------------
+    /** The current SUGGESTION. Only `kind == "enter"` is actionable. See [RiderCard]. */
+    val card: RiderCard? = null,
+    /** True while the rider only SUGGESTS. False once an auto-trade switch covers this account. */
+    @SerialName("suggestion_only") val suggestionOnly: Boolean? = null,
+    /**
+     * What the engine will do with its next signal, decided SERVER-SIDE:
+     * `"off"` | `"suggest"` | `"auto-demo"` | `"AUTO-REAL"`. Render it; do not recompute it
+     * from the two switches, or this screen and the web panel can describe the same engine
+     * differently.
+     */
+    val execution: String? = null,
+    /**
+     * May the operator usefully tap PLACE right now? Server-derived (rider `_actionable`):
+     * the card was issued on the newest closed bar, the engine is armed, and it is not
+     * already placing by itself.
+     *
+     * Do NOT substitute `card.kind == "enter"`. The card keeps that kind for the whole
+     * trade (up to ~2 h), so it would offer a long-expired entry price.
+     */
+    val actionable: Boolean? = null,
+    /** Ticket of the REAL position the rider is currently riding, if any. */
+    @SerialName("live_ticket") val liveTicket: Long? = null,
+    /** Where the engine-side trailing stop currently sits, in price. */
+    @SerialName("live_stop") val liveStop: Double? = null,
+    /**
+     * CAUTION: the LADDER sends `paper_pl_per_oz` (pl) and the RIDER sends `paper_pnl_per_oz`
+     * (pnl). Different fields, different engines -- merging them would silently show one
+     * engine's record on the other's page.
+     */
+    @SerialName("paper_pnl_per_oz") val paperPnlPerOz: Double? = null,
+    /** Accrued at the lot each trade was SIZED at -- a real running total, not a rescale. */
+    @SerialName("paper_pnl_usd") val paperPnlUsd: Double? = null,
+    @SerialName("paper_trades") val paperTrades: Int? = null,
+    @SerialName("in_paper_position") val inPaperPosition: Boolean? = null,
+    val note: String? = null,
 )
+
+/**
+ * One rider SUGGESTION.
+ *
+ * Named RiderCard, not Card: `androidx.compose.material3.Card` is imported on every screen
+ * that would render this, and a clashing name there is a compile error at best and the wrong
+ * symbol at worst.
+ *
+ * ── The unit trap ──
+ * [entry], [sl] and [tp] are ABSOLUTE PRICES. The /order endpoint takes POINT DISTANCES.
+ * Anything that turns this card into an order MUST convert (see TradingViewModel.placeRiderCard);
+ * posting the price straight through is ACCEPTED by the broker, not rejected -- it just places a
+ * stop miles away. The web UI shipped that bug once already.
+ */
+@Immutable
+@Serializable
+data class RiderCard(
+    /** "enter" | "close" | "flat" | "hold". Only "enter" carries a tradable side/lot/prices. */
+    val kind: String? = null,
+    val side: String? = null,
+    val lot: Double? = null,
+    val entry: Double? = null,
+    val sl: Double? = null,
+    val tp: Double? = null,
+    val reason: String? = null,
+    @SerialName("bar_ts") val barTs: Long? = null,
+    @SerialName("pnl_oz") val pnlOz: Double? = null,
+    val status: String? = null,
+    val note: String? = null,
+) {
+    /** Fail closed: no side or no lot means there is nothing a human could be asked to confirm. */
+    val isActionable: Boolean get() = kind == "enter" && side != null && lot != null
+    val isBuy: Boolean get() = side.equals("buy", ignoreCase = true)
+}
 
 @Immutable
 @Serializable
@@ -137,10 +228,23 @@ data class StrategyParams(
     val side: String? = null,
     val trigger: Double? = null,
     val target: Double? = null,
+    /** "retrace" (trail the extreme) | "floor" (fixed level at the trigger). */
+    @SerialName("stop_mode") val stopMode: String? = null,
     val retrace: Double? = null,
+    @SerialName("floor_offset") val floorOffset: Double? = null,
     val volume: Double? = null,
+    /** 0 means UNCAPPED for both of these -- they are ceilings, not counts. */
     @SerialName("max_positions") val maxPositions: Int? = null,
+    @SerialName("max_lots") val maxLots: Double? = null,
     val paper: Boolean? = null,
+    /**
+     * Rider execution switches, one per account class. Read here (not off the top-level
+     * status) because the SWITCH must show what was actually SAVED, so a rejected or
+     * ignored write is visible rather than reflected back optimistically.
+     */
+    @SerialName("auto_demo") val autoDemo: Boolean? = null,
+    @SerialName("auto_real") val autoReal: Boolean? = null,
+    @SerialName("max_daily_loss") val maxDailyLoss: Double? = null,
 )
 
 /**
@@ -212,6 +316,13 @@ data class Position(
     val magic: Long? = null,
     /** Present on the account-wide history view (many symbols); absent/null on the live poll. */
     val symbol: String? = null,
+    /**
+     * Who asked for this position: "R" rider-suggested, "L" ladder, "S" straddle, "" manual.
+     *
+     * DERIVED SERVER-SIDE, from magic/comment, so the phone and the web UI can never disagree
+     * about what a row came from. Do NOT re-derive it here -- read it.
+     */
+    val origin: String? = null,
 ) {
     val isBuy: Boolean get() = side.equals("BUY", ignoreCase = true)
     val hasSl: Boolean get() = (sl ?: 0.0) > 0.0

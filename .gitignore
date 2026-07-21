@@ -37,6 +37,13 @@ android/.env
 # account MT5 is logged into -- treat it like the .pem above.
 .token.local
 *.token.local
+# PER-INSTANCE tokens (.token.a1.local, .token.a2.local, ...). The multi-instance
+# launcher writes one token file per instance, and the two patterns above do NOT
+# match them: `*.token.local` only matches names ENDING in ".token.local", while
+# these end in ".<instance>.local". Without this line `.token.a1.local` is an
+# untracked, NOT-ignored live trading token, one `git add -A` from being published.
+.token.*.local
+*.token.*.local
 
 # Operator login cheat-sheets: they contain a live API token verbatim (even a demo one
 # grants order placement), so keep them local. The PROCEDURE lives in deploy/README.md;

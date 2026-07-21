@@ -20,6 +20,9 @@ from typing import Any
 import MetaTrader5 as mt5
 
 import config
+import instance_lock
+import instance_paths
+import log_context
 import ticklog_state
 from strategies import ENGINES
 
@@ -61,7 +64,18 @@ class Mt5Worker:
         # a ~65s IPC-timeout that blocks the GIL and freezes uvicorn, so the UI
         # can never load to log in. An explicit /api/login flips this True.
         self._session_active = False
+        # Exclusive claim on the account this server drives (instance_lock.FileLock).
+        # None until a successful /api/login. Held for as long as we drive the account;
+        # the OS drops it if we die, so there is no stale state to clean up on boot.
+        self._account_lock = None
+        # Set by _verify_terminal when we land on a terminal that is not ours, so the
+        # UI can report a config fault instead of a bogus "broker disconnected".
+        self._wrong_terminal = None
         self._poll_count = 0
+        # Bar cache for the strategy engines: {key: (wall_clock_bucket, count, array)}.
+        # See recent_bars(). Cleared on login/symbol change -- bars from the previous
+        # account's symbol must never be handed to an engine on the new one.
+        self._bars_cache: dict[str, tuple] = {}
         self._stats = {"daily_realized": 0.0, "wins": 0, "losses": 0}
         # Account-level P&L guard: when enabled, the whole book auto-closes the moment FLOATING P&L
         # reaches the target (profit >= +target, or loss <= -target). It STAYS enabled and re-arms
@@ -94,6 +108,11 @@ class Mt5Worker:
             "enabled": bool(ticklog_state.load().get("enabled", config.TICKLOG_ENABLED)),
             "rows": 0,
         }
+        # Machine-wide claim on tick capture. Taken by _apply_ticklog on an explicit
+        # enable, or by _claim_ticklog_on_boot when the persisted state says "on" --
+        # without the latter, two instances that were both left enabled would resume
+        # capturing on restart having never passed through the toggle that checks.
+        self._ticklog_lock = None
         self._thread = threading.Thread(target=self._run, name="mt5-worker",
                                         daemon=True)
 
@@ -110,6 +129,10 @@ class Mt5Worker:
                 mt5.shutdown()
             except Exception:
                 pass
+            # Release on a CLEAN shutdown so the account frees up immediately rather
+            # than at process exit. A dirty exit is already covered -- the OS drops it.
+            self._release_account_lock()
+            self._release_ticklog_lock()
 
     def get_state(self) -> dict[str, Any]:
         with self._lock:
@@ -122,7 +145,30 @@ class Mt5Worker:
         return fut
 
     # ---- worker thread internals ----------------------------------------
+    def _claim_ticklog_on_boot(self) -> None:
+        """Honour a persisted `ticklog: on` only if this instance can claim the slot.
+
+        On the worker thread, before the first poll. If another instance already
+        holds it we turn tick logging OFF for this one and say so -- better than two
+        servers quietly capturing because both were enabled when they last ran.
+        """
+        if not self._ticklog["enabled"]:
+            return
+        try:
+            lock = instance_lock.ticklog_lock()
+            lock.acquire({"instance": instance_paths.instance_name(),
+                          "port": config.PORT, "what": "ticklog"})
+            self._ticklog_lock = lock
+        except instance_lock.LockHeld as held:
+            self._ticklog["enabled"] = False
+            log.warning("tick logging disabled at boot: another instance is capturing",
+                        extra={"event": "ticklog_boot_refused", "holder": held.holder})
+        except instance_lock.LockUnavailable as exc:
+            log.error("ticklog lock unavailable at boot -- capturing anyway",
+                      extra={"event": "ticklog_lock_unavailable", "error": str(exc)})
+
     def _run(self) -> None:
+        self._claim_ticklog_on_boot()
         period = 1.0 / max(1, config.POLL_HZ)
         while not self._stop.is_set():
             deadline = time.monotonic() + period
@@ -158,7 +204,11 @@ class Mt5Worker:
         if self._initialized:
             ti = mt5.terminal_info()
             if ti is not None and ti.connected:
-                return True
+                # Re-assert the binding on EVERY poll, not just at connect time. It is
+                # free -- `ti` is already in hand -- and it turns "we were on the right
+                # terminal when we attached" into "we are on it now", which is the
+                # claim the close-all path actually depends on.
+                return self._verify_terminal(ti)
             # lost connection -> drop and re-init below
             self._initialized = False
             log.warning(
@@ -179,6 +229,9 @@ class Mt5Worker:
                 extra={"event": "mt5_init_failed",
                        "code": code, "mt5_last_error_msg": msg},
             )
+            return False
+        # INVARIANT: we are attached to OUR terminal, or we are attached to nothing.
+        if not self._verify_terminal():
             return False
         self._initialized = True
         self._resolve_symbol()
@@ -202,6 +255,61 @@ class Mt5Worker:
         self.reconcile_strategies()
         return True
 
+    def _verify_terminal(self, ti=None) -> bool:
+        """Prove we attached to the terminal config.MT5_PATH names. Fail closed.
+
+        Why this exists: `positions_get()` only ever returns the ATTACHED account's
+        book, which is what makes cross-account damage impossible -- but only while
+        each server is really on its own terminal. If that binding is ever wrong, a
+        close-all flattens someone else's account with no error anywhere. So the
+        binding is asserted rather than assumed.
+
+        Comparing `terminal_info().path`, established by measurement during bring-up:
+
+          * `.path` is the DIRECTORY holding terminal64.exe -- not the exe -- so the
+            configured path is dirname()'d before comparison.
+          * `.path` is the right field and `.data_path` is NOT: for a normal install
+            they differ (`C:\\Program Files\\MetaTrader 5` vs
+            `%APPDATA%\\MetaQuotes\\Terminal\\<hash>`), and only coincide for a
+            /portable one. Comparing data_path would reject every non-portable setup.
+
+        No MT5_PATH configured (single-account mode) -> nothing to verify, and there
+        is only one terminal anyway.
+
+        `ti` may be passed in by a caller that already fetched it, so running this on
+        every poll costs nothing.
+        """
+        if not config.MT5_PATH:
+            self._wrong_terminal = None
+            return True
+        if ti is None:
+            ti = mt5.terminal_info()
+        if ti is None:
+            return False
+        want = os.path.normcase(os.path.normpath(os.path.dirname(config.MT5_PATH)))
+        got = os.path.normcase(os.path.normpath(getattr(ti, "path", "") or ""))
+        if want == got:
+            self._wrong_terminal = None
+            return True
+
+        # Attached to the WRONG terminal: drop the connection rather than drive it.
+        # Not retried into a trade path -- _poll_state publishes healthy=False and the
+        # order endpoints refuse on that.
+        log.error("attached to the WRONG terminal -- refusing to drive it",
+                  extra={"event": "wrong_terminal_attached",
+                         "expected_path": want, "actual_path": got,
+                         "actual_login": getattr(mt5.account_info(), "login", None)})
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        self._initialized = False
+        # Latched so _poll_state can say WHY. Without it the UI would read
+        # "terminal not connected", sending the operator to hunt a broker outage
+        # instead of the configuration error this actually is.
+        self._wrong_terminal = {"expected": want, "actual": got}
+        return False
+
     def _resolve_symbol(self) -> None:
         si = mt5.symbol_info(config.SYMBOL)
         if si is None and config.AUTO_RESOLVE_SYMBOL:
@@ -220,6 +328,15 @@ class Mt5Worker:
                 if not self._session_active:
                     st.update(connected=False, healthy=False,
                               logged_out=True, error="logged out")
+                elif self._wrong_terminal:
+                    # A configuration fault, not a broker one. Say which terminal we
+                    # got so the fix is obvious from the banner alone.
+                    st.update(connected=False, healthy=False,
+                              wrong_terminal=self._wrong_terminal,
+                              error=("attached to the WRONG MT5 terminal "
+                                     f"({self._wrong_terminal['actual'] or 'unknown'}); "
+                                     f"this instance expects {self._wrong_terminal['expected']}. "
+                                     "Trading is blocked. Check XAUORDERPAD_MT5_PATH."))
                 else:
                     code, msg = mt5.last_error()
                     st.update(connected=False, healthy=False,
@@ -262,6 +379,12 @@ class Mt5Worker:
                                  "is_demo": int(acc.trade_mode) != 2,
                                  "margin_mode": int(acc.margin_mode),     # 0=netting 2=hedging
                                  **self._stats}
+                # Stamp every subsequent log line with WHO this server is trading as.
+                # Done here, off the account_info() this loop already fetched, rather
+                # than only at login: if the account is switched in the terminal by
+                # hand, the logs follow it within one poll instead of lying until the
+                # next /api/login. set_account() no-ops when nothing changed.
+                log_context.set_account(acc.login, acc.server, int(acc.trade_mode) != 2)
 
             # `magic` is exposed so the Auto-Test sync verifier can distinguish
             # positions opened by THIS APP (magic == config.MAGIC) from positions
@@ -428,6 +551,30 @@ class Mt5Worker:
         reopens it lazily in _capture_ticks. Never trades -- this only gates a file writer."""
         if cmd.get("enabled") is not None:
             enabled = bool(cmd["enabled"])
+            if enabled and not self._ticklog["enabled"]:
+                # ONE capturer per machine. Each instance writes its own CSV, but two
+                # instances capturing at once doubles the copy_ticks_range work on a
+                # shared terminal host for two files nobody asked for -- and silently,
+                # since each one's UI would report success.
+                try:
+                    lock = instance_lock.ticklog_lock()
+                    lock.acquire({"instance": instance_paths.instance_name(),
+                                  "port": config.PORT, "what": "ticklog"})
+                    self._ticklog_lock = lock
+                except instance_lock.LockHeld as held:
+                    log.warning("tick logging refused: another instance is capturing",
+                                extra={"event": "ticklog_refused_duplicate",
+                                       "holder": held.holder})
+                    return {"ok": False, "error": f"tick logging is {held.describe()}",
+                            "ticklog": {"enabled": False, "rows": self._ticklog["rows"],
+                                        "path": config.TICKLOG_PATH}}
+                except instance_lock.LockUnavailable as exc:
+                    # Same policy as the account lock: a broken lock mechanism must not
+                    # block a diagnostic that places no orders.
+                    log.error("ticklog lock unavailable -- enabling anyway",
+                              extra={"event": "ticklog_lock_unavailable", "error": str(exc)})
+            elif not enabled:
+                self._release_ticklog_lock()
             self._ticklog["enabled"] = enabled
             ticklog_state.save(enabled)
             if not enabled and self._tick_fh is not None:
@@ -480,9 +627,48 @@ class Mt5Worker:
         return {"ok": False, "error": f"unknown action {action!r}"}
 
     # ---- strategy support (worker-thread only; called from strategy.evaluate) ----
+    @property
+    def poll_count(self) -> int:
+        """Polls since start/login. Engines throttle heavy work off this (see
+        `StrategyBase._check_kill`), using the same `% POLL_HZ` idiom `_poll_state`
+        uses for the account stats."""
+        return self._poll_count
+
+    def recent_bars(self, tf: int, count: int, bucket_s: int, key: str):
+        """Last `count` bars, CACHED until the timeframe's next bar can have closed.
+
+        Every engine that wants bars calls this on EVERY poll -- 15x/sec -- but an M5
+        bar can only close on a 5-minute wall-clock boundary, so 4499 of every 4500
+        of those calls used to fetch a byte-identical array over MT5's IPC and then
+        throw it away (straddle.py did exactly that: fetch 107 M1 bars, then discard
+        when `_last_bar_ts` was unchanged). The poll loop has a ~66 ms budget that
+        already contains ~6 IPC round-trips; this removes two of them.
+
+        Refetch only when the wall-clock bucket rolls, or when a caller asks for MORE
+        bars than are cached. Cached per `key` so M1 and M5 do not evict each other.
+
+        The still-forming bar is deliberately NOT kept fresh: every caller here reads
+        the last CLOSED bar (index -2) for signals and takes live prices from the poll
+        snapshot instead, so a stale final bar changes no decision.
+        """
+        bucket = int(time.time() // max(1, bucket_s))
+        hit = self._bars_cache.get(key)
+        if hit is not None and hit[0] == bucket and hit[1] >= int(count):
+            return hit[2]
+        bars = mt5.copy_rates_from_pos(self._symbol, tf, 0, int(count))
+        # Never cache a failed read -- MT5 returns None on a dropped terminal, and
+        # caching that would keep the engine blind until the next bucket rolls.
+        if bars is not None:
+            self._bars_cache[key] = (bucket, int(count), bars)
+        return bars
+
     def recent_m1(self, count: int):
         """Last `count` M1 bars for the active symbol (structured np array)."""
-        return mt5.copy_rates_from_pos(self._symbol, mt5.TIMEFRAME_M1, 0, int(count))
+        return self.recent_bars(mt5.TIMEFRAME_M1, count, 60, "m1")
+
+    def recent_m5(self, count: int):
+        """Last `count` M5 bars for the active symbol (structured np array)."""
+        return self.recent_bars(mt5.TIMEFRAME_M5, count, 300, "m5")
 
     def ticks_since(self, ts: int):
         """Every tick from unix time `ts` to now, for the active symbol.
@@ -680,6 +866,23 @@ class Mt5Worker:
             pass
         return 0
 
+    def _release_ticklog_lock(self) -> None:
+        """Stop claiming the machine-wide tick-capture slot."""
+        lock, self._ticklog_lock = self._ticklog_lock, None
+        if lock is not None:
+            lock.release()
+
+    def _release_account_lock(self) -> None:
+        """Give up exclusivity on the account this server was driving, if any.
+
+        Best-effort by design: release() never raises, and even if this were skipped
+        entirely the OS drops the lock when the process exits. That is the property
+        that makes the whole scheme safe against a crash.
+        """
+        lock, self._account_lock = self._account_lock, None
+        if lock is not None:
+            lock.release()
+
     def _log_login_failed(self, stage: str, login, server, code, msg) -> None:
         """Record WHY a login was refused. Without this the only trace of a failed
         switch is a bare `400` in the access log, which is indistinguishable from a
@@ -704,6 +907,49 @@ class Mt5Worker:
 
         prev_open = self._open_position_count()    # outgoing account's open trades
 
+        # ---- exclusivity: one account, one server -----------------------------
+        # Taken BEFORE MT5 is touched, so a refused login leaves the current session
+        # exactly as it was -- no half-switch where we dropped account A and then
+        # could not take B. The old lock is released only after the new one is held
+        # AND the broker accepted us (below), for the same reason.
+        #
+        # This is not belt-and-braces: two processes CAN attach to one terminal and
+        # drive one account simultaneously (measured), and that would give the account
+        # two close-all paths and two P&L guards that cannot see each other.
+        new_lock = instance_lock.account_lock(int(login), server)
+        # Re-logging into the account we ALREADY drive must not be refused by our own
+        # lock. Byte-range locks are per-HANDLE, not per-process: a second handle onto
+        # the same file conflicts even from this very process, so without this check
+        # "log in again to the account you are already on" would fail with
+        # "already in use", naming ourselves. Same path -> keep the lock we hold.
+        if (self._account_lock is not None
+                and self._account_lock.path == new_lock.path
+                and self._account_lock.held):
+            new_lock = self._account_lock
+        else:
+            try:
+                new_lock.acquire({"instance": instance_paths.instance_name(),
+                                  "port": config.PORT, "login": int(login),
+                                  "server": server})
+            except instance_lock.LockHeld as held:
+                log.warning("login refused: account already driven by another server",
+                            extra={"event": "account_login_refused_duplicate",
+                                   "login": login, "server": server,
+                                   "holder": held.holder})
+                # NOTE for the caller: nothing was touched. MT5 was not contacted, the
+                # previous session is intact -- so `already_logged_in` must NOT trigger
+                # the session-restore path in server.login().
+                return {"ok": False, "prev_open": prev_open, "already_logged_in": True,
+                        "error": f"account {login} is {held.describe()}"}
+            except instance_lock.LockUnavailable as exc:
+                # The lock MECHANISM is broken (disk / permissions / AV), not a genuine
+                # duplicate. Fail OPEN and shout: a filesystem fault must not make a
+                # single-account desk untradeable. A real duplicate still raises LockHeld.
+                log.error("account lock unavailable -- proceeding WITHOUT duplicate protection",
+                          extra={"event": "account_lock_unavailable",
+                                 "login": login, "server": server, "error": str(exc)})
+                new_lock = None
+
         if not self._initialized:
             # Terminal not attached yet -> initialize WITH credentials (launches
             # terminal64.exe if needed).
@@ -714,6 +960,11 @@ class Mt5Worker:
             if not mt5.initialize(**kwargs):
                 code, msg = mt5.last_error()
                 self._log_login_failed("initialize", login, server, code, msg)
+                # The broker refused us, so we are NOT driving this account -- give the
+                # lock back. Holding it after a failed login would make the account
+                # permanently unopenable by any instance until this process exits.
+                if new_lock is not None:
+                    new_lock.release()
                 return {"ok": False, "prev_open": prev_open,
                         "error": f"initialize/login failed ({code}: {msg})"}
             self._initialized = True
@@ -722,8 +973,30 @@ class Mt5Worker:
             if not mt5.login(int(login), password=password, server=server):
                 code, msg = mt5.last_error()
                 self._log_login_failed("switch", login, server, code, msg)
+                if new_lock is not None:
+                    new_lock.release()
                 return {"ok": False, "prev_open": prev_open,
                         "error": f"login failed ({code}: {msg})"}
+
+        # The login path calls mt5.initialize()/login() directly, so it never went
+        # through _ensure_connected's check -- assert the binding here too. A login
+        # that lands on someone else's terminal must not be reported as success.
+        if not self._verify_terminal():
+            if new_lock is not None and new_lock is not self._account_lock:
+                new_lock.release()
+            return {"ok": False, "prev_open": prev_open,
+                    "error": ("logged in, but the terminal is NOT this instance's "
+                              f"({config.MT5_PATH}). Refusing to drive it.")}
+
+        # Broker accepted us and we hold the new lock -> now, and only now, drop the
+        # OUTGOING account's lock so another server may take it over.
+        #
+        # `is not new_lock` guards the same-account re-login above, where new_lock IS
+        # the lock we already hold: releasing then re-storing it would hand our own
+        # account away to any instance that asked for it in between.
+        if self._account_lock is not new_lock:
+            self._release_account_lock()
+        self._account_lock = new_lock
 
         self._session_active = True
         self._resolve_symbol()
@@ -734,13 +1007,26 @@ class Mt5Worker:
         self._guard = {"enabled": False, "target_pl": 0.0, "side": "profit", "fired": False}
         self._poll_count = 0
         self._last_healthy = None
+        # Bars belong to the account's symbol. _resolve_symbol() above may have picked a
+        # different suffix (XAUUSDm vs XAUUSD), so a surviving cache would feed the new
+        # account's engines the OLD symbol's prices -- and reconcile_strategies() below
+        # runs immediately after.
+        self._bars_cache.clear()
+
+        acc = mt5.account_info()
+        tmode = int(acc.trade_mode) if acc is not None else None
+        # Publish the identity BEFORE anything else logs. _poll_state would pick this
+        # up within ~67 ms anyway, but that is too late for the lines below: the
+        # `account_login` event itself, and every strategy_reconciled line from
+        # reconcile_strategies(), would carry "account": null -- and those are exactly
+        # the lines you go looking for when asking "what happened on this account?".
+        if acc is not None:
+            log_context.set_account(acc.login, acc.server, tmode != 2)
+
         # The book belongs to the account too. Re-derive every engine from THIS
         # account's positions: an engine still holding the previous account's tickets
         # would be trying to close trades that are no longer even visible.
         self.reconcile_strategies()
-
-        acc = mt5.account_info()
-        tmode = int(acc.trade_mode) if acc is not None else None
         log.info("account login",
                  extra={"event": "account_login",
                         "login": getattr(acc, "login", None),
@@ -772,6 +1058,11 @@ class Mt5Worker:
         self._last_healthy = None
         log.info("account logout",
                  extra={"event": "account_logout", "prev_open": prev_open})
+        # Hand the account back so another instance may drive it.
+        self._release_account_lock()
+        # AFTER the log line above, so the logout itself is still attributed to the
+        # account being left. Subsequent lines carry "account": null.
+        log_context.clear_account()
         return {"ok": True, "prev_open": prev_open}
 
     def _place_order(self, cmd: dict) -> dict:
@@ -929,6 +1220,39 @@ class Mt5Worker:
     # Both the /ws poll and _history serialize the SAME dict shape; keeping one source stops
     # the two from drifting apart. `symbol` is included so the account-wide history view can
     # label rows -- harmless extra field for the symbol-filtered live poll.
+    # Origin letters. Kept here, server-side, so the webapp and the Android app
+    # render the SAME label from the SAME rule -- two clients cannot drift.
+    _ORIGIN_LETTERS = {"ladder": "L", "straddle": "S", "rider": "R"}
+
+    # Broker comments a client may ask for, by name. A WHITELIST, not free text:
+    # the comment is what `_origin_of` reads back, so letting a client write it
+    # directly would let a forged request mislabel someone else's trade.
+    _ORIGIN_COMMENTS = {"rider": "XauOrderPad rider"}
+
+    @classmethod
+    def _order_comment(cls, origin) -> str:
+        return cls._ORIGIN_COMMENTS.get(str(origin or "").strip().lower(), "XauOrderPad")
+
+    @classmethod
+    def _origin_of(cls, magic: int, comment: str) -> str:
+        """Who opened this position: 'L' ladder, 'S' straddle, 'R' rider-suggested,
+        '' manual (or a foreign magic).
+
+        Attribution lives on the BROKER's position record (magic + comment), not in
+        a local ledger, so it survives app restarts, server restarts and reinstalls,
+        and is identical on every device. Costs nothing: both fields are already on
+        the TradePosition object `positions_get()` returned -- no extra IPC, no disk.
+        """
+        for sid, letter in cls._ORIGIN_LETTERS.items():
+            if magic == int(config.STRATEGY_MAGICS.get(sid, -1)):
+                return letter
+        # A rider SUGGESTION is placed by the human through the manual path, so it
+        # keeps config.MAGIC (close-all/close-one must still find it) and carries
+        # its origin in the broker comment instead.
+        if magic == int(config.MAGIC) and "rider" in (comment or "").lower():
+            return "R"
+        return ""
+
     @staticmethod
     def _shape_position(p) -> dict:
         return {
@@ -939,6 +1263,8 @@ class Mt5Worker:
             "time": p.time,
             "symbol": getattr(p, "symbol", None),
             "magic": int(p.magic),          # for Auto-Test foreign-magic detection
+            # who opened it -- rendered as a badge by BOTH clients (see _origin_of)
+            "origin": Mt5Worker._origin_of(int(p.magic), getattr(p, "comment", "") or ""),
         }
 
     @staticmethod
@@ -1098,7 +1424,7 @@ class Mt5Worker:
             "price": requested_price,
             "deviation": int(config.DEFAULT_DEVIATION),
             "magic": int(config.MAGIC),
-            "comment": "XauOrderPad",
+            "comment": self._order_comment(cmd.get("origin")),
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": _pick_filling(si),
         }

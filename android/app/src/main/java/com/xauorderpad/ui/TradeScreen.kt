@@ -183,13 +183,16 @@ fun TradeScreen(
         )
         Spacer(Modifier.height(d.gap))
 
-        // Scalp swaps the full status banner for a trimmed identity + candle countdown. Every other
-        // mode keeps the full banner. Critical states (disconnect / logged out / REAL) survive both.
+        // Scalp adds a candle countdown next to the identity; every other mode keeps the plain
+        // banner. Both show the SAME compact account badge, and critical states (disconnect /
+        // logged out / REAL) survive either.
         if (mode == LayoutMode.SCALP) {
             ScalpHeader(health, link, live, tickTime, candleTf, onSelectTf, onLogin)
         } else {
             StatusBanner(health, link, onLogin)
         }
+        // Market clocks, on every layout -- see SessionBar for why this needs its own row.
+        SessionBar()
         Spacer(Modifier.height(d.gap))
 
         QuoteBlock(quote, live, d, compact)
@@ -202,7 +205,7 @@ fun TradeScreen(
         // last snapshot, which survives the socket's death -- so it still reports "healthy" from
         // a frame that may be minutes old, and BUY/SELL would stay armed against a frozen price.
         // No `busy` term any more: the entry/close buttons fire-and-forget so a burst is not gated.
-        OrderFormBlock(form, canTrade = health.healthy && live, digits = positions.digits,
+        OrderFormBlock(form, canTrade = health.healthy && live,
             armed = armed, quote = quote, inFlight = inFlight, d = d, compact = compact,
             onLot = onLot, onStepLot = onStepLot, onSl = onSl, onTp = onTp,
             onEnterArmed = onEnterArmed, onCloseArmed = onCloseArmed)
@@ -349,7 +352,8 @@ private fun ServerBar(
             onClick = onSettings,
             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
         ) {
-            Text("⚙", fontSize = 18.sp)
+            // The gear is now the "Om!" mark (gold ॐ), kept to the gear's visual size.
+            Text("ॐ", fontSize = 16.sp, color = Amber)
             if (strategyDot || strategyKilled) {
                 Spacer(Modifier.width(3.dp))
                 Text("●", fontSize = 11.sp, color = if (strategyKilled) Red else Green)
@@ -360,14 +364,14 @@ private fun ServerBar(
 
 /**
  * The banner's (text, colour, action) decision, shared by the full [StatusBanner] and the Scalp
- * [ScalpHeader] so the two can NEVER disagree about state. `trimmed` only shortens the healthy
- * demo/real identity line -- every fault state (disconnect / logged out / not-healthy / token) is
- * identical in both, and a REAL account stays a loud red badge either way.
+ * [ScalpHeader] so the two can NEVER disagree about state -- including the identity line, which used
+ * to be shortened for Scalp only and is now the same compact badge in every layout. A REAL account
+ * stays a loud red badge either way.
  *
  * Order matters: a connection problem MASKS a broker problem, so report the outermost one. Showing
  * "market closed" while the socket is actually dead would send the user hunting the wrong fault.
  */
-private fun bannerState(h: Health, link: Link, trimmed: Boolean): Triple<String, Color, String?> = when {
+private fun bannerState(h: Health, link: Link): Triple<String, Color, String?> = when {
     link is Link.Unauthorized -> Triple("Token rejected — reconnect", Red, null)
     link is Link.Down -> Triple("Disconnected: ${link.reason} · retry ${link.retryInSec}s", Red, null)
     link is Link.Connecting -> Triple("Connecting…", Amber, null)
@@ -375,29 +379,44 @@ private fun bannerState(h: Health, link: Link, trimmed: Boolean): Triple<String,
     !h.healthy -> Triple(h.error ?: "Trading not allowed", Red, null)
 
     // isDemo == false means a REAL account. This screen has three one-tap buttons that flatten a
-    // book -- make it impossible to miss which account you are on. Trimmed keeps it LOUD (red, ●).
-    h.isDemo == false -> Triple(
-        if (trimmed) "● R-${brokerShort(h.server)}${loginSuffix(h.login)}"
-        else "● REAL ACCOUNT — ${h.server.orEmpty()}",
-        Red, null,
-    )
+    // book -- make it impossible to miss which account you are on, so real keeps the loud ● and red.
+    h.isDemo == false -> Triple("● REAL ${accountTag(h.server, h.login)}", Red, null)
 
-    else -> Triple(
-        if (trimmed) "D-${brokerShort(h.server)}${loginSuffix(h.login)}"
-        else "● DEMO · ${h.server ?: "connected"}",
-        Green, null,
-    )
+    else -> Triple("DEMO ${accountTag(h.server, h.login)}", Green, null)
 }
 
-/** First 2 letters of the broker (before the "-" in the server name), e.g. Exness-MT5Trial16 -> EX. */
-private fun brokerShort(server: String?): String =
-    server?.substringBefore('-')?.trim()?.take(2)?.uppercase().orEmpty().ifEmpty { "?" }
+/**
+ * The account identity: `ExS6 472200942`.
+ *
+ * Only the SERVER is abbreviated. The login is printed in full and the demo/real word is spelled
+ * out, because compacting the server alone already freed most of the row -- the long form that used
+ * to sit here was `● DEMO · Exness-MT5Trial16`, which ate the width AND omitted the account number
+ * entirely. Abbreviating the number too was a step past useful: the digits are the one thing you
+ * cross-check against MT5.
+ */
+private fun accountTag(server: String?, login: Long?): String =
+    listOf(brokerShort(server), login?.toString().orEmpty())
+        .filter { it.isNotEmpty() }
+        .joinToString(" ")
 
-private fun loginSuffix(login: Long?): String = login?.let { " ($it)" } ?: ""
+/**
+ * Server -> a 4-char tag: 2 chars of the broker, its last letter uppercased, then the server's final
+ * character. `Exness-MT5Trial16` -> `ExS6`, `Exness-MT5Real35` -> `ExS5`.
+ *
+ * That trailing character is not decoration. Abbreviating the broker alone collapses BOTH of those
+ * servers to the same "ExS", so the badge could no longer tell you which server you were pointed at
+ * -- on a screen where the answer decides whether a click spends real money.
+ */
+private fun brokerShort(server: String?): String {
+    val s = server?.trim().orEmpty()
+    val broker = s.substringBefore('-').trim()
+    if (broker.isEmpty()) return "?"
+    return "${broker.take(2)}${broker.last().uppercaseChar()}${s.last()}"
+}
 
 @Composable
 private fun StatusBanner(h: Health, link: Link, onLogin: () -> Unit) {
-    val (text, color, action) = bannerState(h, link, trimmed = false)
+    val (text, color, action) = bannerState(h, link)
     Row(
         Modifier
             .fillMaxWidth()
@@ -426,7 +445,7 @@ private fun ScalpHeader(
     onSelectTf: (Int) -> Unit,
     onLogin: () -> Unit,
 ) {
-    val (text, color, action) = bannerState(h, link, trimmed = true)
+    val (text, color, action) = bannerState(h, link)
     // Only show the countdown when there is no fault to report AND the feed is live.
     val showCandle = action == null && live
     // produceState runs regardless (cheap); we just gate its RENDERING.
@@ -743,10 +762,14 @@ private fun CompactField(
  * relabelled to dollars without changing the wire contract, so it shows the arithmetic instead.
  */
 @Composable
-private fun PointsHint(raw: String, digits: Int) {
+private fun PointsHint(raw: String, point: Double?) {
     val pts = raw.trim().toDoubleOrNull()
     if (pts == null || pts <= 0.0) return
-    val dollars = pts * Math.pow(10.0, -digits.toDouble())
+    // The broker's own point size, not 10^-digits. Those coincide on most symbols and NOT
+    // on this one (point 0.001, and code that assumed digits=2 was out by 10x), so a hint
+    // derived from digits would quietly reassure the user of the wrong dollar figure.
+    if (point == null || point <= 0.0) return
+    val dollars = pts * point
     Text(
         "= $" + Fmt.price(dollars, 2),
         fontSize = 10.sp,
@@ -808,7 +831,7 @@ private fun CompactLotRow(
 @Composable
 private fun CompactSlTpRow(
     form: OrderForm,
-    digits: Int,
+    point: Double?,
     d: Dims,
     onSl: (String) -> Unit,
     onTp: (String) -> Unit,
@@ -823,7 +846,7 @@ private fun CompactSlTpRow(
                 BareField(form.slPoints, onSl, d.fieldH, KeyboardType.Number,
                     Modifier.weight(1f), placeholder = "0")
             }
-            PointsHint(form.slPoints, digits)
+            PointsHint(form.slPoints, point)
         }
         Column(Modifier.weight(1f)) {
             Row(
@@ -834,7 +857,7 @@ private fun CompactSlTpRow(
                 BareField(form.tpPoints, onTp, d.fieldH, KeyboardType.Number,
                     Modifier.weight(1f), placeholder = "0")
             }
-            PointsHint(form.tpPoints, digits)
+            PointsHint(form.tpPoints, point)
         }
     }
 }
@@ -887,7 +910,9 @@ private fun BareField(
 private fun OrderFormBlock(
     form: OrderForm,
     canTrade: Boolean,
-    digits: Int,
+    // No `digits` here on purpose: the only thing this block needed it for was the
+    // points->dollars hint, which must divide by the broker's `point` (quote.point),
+    // not by 10^-digits. Keeping a digits param around would invite that mistake back.
     armed: ArmedUi,
     quote: Quote,
     inFlight: Int,
@@ -904,7 +929,7 @@ private fun OrderFormBlock(
         if (compact) {
             CompactLotRow(form, d, onLot, onStepLot)
             Spacer(Modifier.height(d.gap))
-            CompactSlTpRow(form, digits, d, onSl, onTp)
+            CompactSlTpRow(form, quote.point, d, onSl, onTp)
             Spacer(Modifier.height(d.gap))
         } else {
         Row(
@@ -954,7 +979,7 @@ private fun OrderFormBlock(
                     keyboardType = KeyboardType.Number,
                     placeholder = "0 = none",
                 )
-                PointsHint(form.slPoints, digits)
+                PointsHint(form.slPoints, quote.point)
             }
             Column(Modifier.weight(1f)) {
                 CompactField(
@@ -965,7 +990,7 @@ private fun OrderFormBlock(
                     keyboardType = KeyboardType.Number,
                     placeholder = "0 = none",
                 )
-                PointsHint(form.tpPoints, digits)
+                PointsHint(form.tpPoints, quote.point)
             }
         }
 
@@ -1290,6 +1315,9 @@ private fun SplitBody(
         )
         Spacer(Modifier.height(d.gap))
         StatusBanner(health, link, onLogin)
+        // Same market clocks as the stacked layouts -- this is the other of the only two call sites,
+        // so covering both puts the bar on all four layout modes.
+        SessionBar()
         Spacer(Modifier.height(d.gap))
 
         Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1301,7 +1329,7 @@ private fun SplitBody(
             ) {
                 QuoteBlock(quote, live, d, compact = true)
                 CompactLotRow(form, d, onLot, onStepLot, fillField = true)
-                CompactSlTpRow(form, digits, d, onSl, onTp)
+                CompactSlTpRow(form, quote.point, d, onSl, onTp)
                 SplitEntryButtons(quote, digits, canTrade, d, onBuy = { onPlace("buy") }, onSell = { onPlace("sell") })
                 SplitBulkCloses(enabled = !closing, d = d, onPick = onBulkClose)
                 GuardBar(guard = guard, floatingPl = account.floatingPl, d = d, onSetGuard = onSetGuard)

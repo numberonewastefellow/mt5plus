@@ -337,6 +337,13 @@ kbd{
 .side-pill.buy{color:var(--buy); background:var(--buy-bg)}
 .side-pill.sell{color:var(--sell); background:var(--sell-bg)}
 .side-pill.pending{color:var(--warn); background:var(--accent-soft)}
+/* Origin badge (R rider / L ladder / S straddle) -- sits INSIDE the side cell,
+   deliberately smaller and muted so it never competes with the buy/sell pill. */
+.origin-pill{
+  margin-left:4px; font-size:9px; font-weight:800; letter-spacing:.08em;
+  padding:1px 4px; border-radius:3px;
+  color:var(--accent); background:var(--accent-soft);
+}
 .pnl-cell{font-weight:700}
 .close-x{
   font-family:var(--font-ui); font-size:11px; font-weight:700;

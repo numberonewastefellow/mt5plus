@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Copy to instances.json and edit. instances.json is GITIGNORED: it names real",
+    "accounts and local paths.",
+    "",
+    "ONE ENTRY PER ACCOUNT. Every entry needs its OWN port and its OWN terminal64.exe",
+    "-- two entries sharing an mt5_path means two servers driving one terminal, and a",
+    "close-all from either flattens a book the other is also managing. The loader",
+    "refuses to start on a duplicate port or path rather than let that happen.",
+    "",
+    "Make each terminal by copying an MT5 install and running it with /portable, which",
+    "puts its data folder inside the copy instead of the shared %APPDATA% one:",
+    "    robocopy \"C:\\Program Files\\MetaTrader 5\" D:\\mt5\\instances\\a1 /E",
+    "    D:\\mt5\\instances\\a1\\terminal64.exe /portable",
+    "",
+    "TOKEN: each instance reads .token.<name>.local, falling back to .token.local.",
+    "Give every instance its own -- the token is the only credential the trade",
+    "endpoints check, so a shared one lets any saved phone profile drive any account.",
+    "Generate one with:",
+    "    python -c \"import secrets;print(secrets.token_urlsafe(24))\"",
+    "",
+    "The single-account setup needs none of this: with no XAUORDERPAD_INSTANCE set,",
+    "start_server.bat works exactly as it always has."
+  ],
+  "instances": [
+    {
+      "name": "a1",
+      "port": 8766,
+      "label": "Exness demo 1",
+      "mt5_path": "D:\\mt5\\instances\\a1\\terminal64.exe"
+    },
+    {
+      "name": "a2",
+      "port": 8767,
+      "label": "Exness demo 2",
+      "mt5_path": "D:\\mt5\\instances\\a2\\terminal64.exe"
+    }
+  ]
+}

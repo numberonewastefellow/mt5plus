@@ -32,6 +32,8 @@ from pydantic import BaseModel, Field, field_validator
 
 import accounts
 import config
+import instance_paths
+import log_context
 from logger_setup import setup_logging
 from mt5_worker import Mt5Worker
 
@@ -41,7 +43,18 @@ WEBUI_DIR = Path(__file__).parent / "webui"
 # Initialise the JSONL daily logger BEFORE constructing the worker, so any
 # logging calls inside the worker's __init__ / start path land in the file
 # from the very first line.
-setup_logging("XauOrderPad")
+#
+# The NAMESPACE stays "XauOrderPad" (every module's getLogger("XauOrderPad.x") is a
+# child of it); the FOLDER and FILENAME are per-instance, so N servers write N files
+# instead of interleaving one -- each with its own midnight rollover and prune, which
+# cannot then race over the other's files. Unset XAUORDERPAD_INSTANCE -> original paths.
+#
+# set_instance FIRST: it is what stamps `instance` onto every line, including the
+# "logger ready" line that setup_logging itself emits.
+log_context.set_instance(instance_paths.instance_name())
+setup_logging("XauOrderPad",
+              file_prefix=instance_paths.app_name(),
+              log_dir=instance_paths.log_dir())
 log = logging.getLogger("XauOrderPad.server")
 
 
@@ -188,11 +201,37 @@ def _require_auth_when_networked() -> None:
         )
 
 
+def _require_terminal_path_when_instanced() -> None:
+    """A named instance MUST name its terminal. Same fail-closed posture as above.
+
+    With several terminals running, `mt5.initialize()` WITHOUT a path does not pick
+    "yours" -- it attaches to the machine's registry default. That was measured during
+    bring-up: with three terminals up, a pathless initialize landed on
+    `C:\\Program Files\\MetaTrader 5` every time, regardless of which account the
+    caller wanted.
+
+    So on a multi-instance box a blank MT5_PATH means every instance silently drives
+    the SAME terminal -- and a close-all then flattens an account nobody aimed it at.
+    Refuse to start instead. Unset XAUORDERPAD_INSTANCE (single-account mode) keeps
+    the historical "attach to whatever is running" behaviour, which is correct there
+    because there IS only one.
+    """
+    if instance_paths.instance_name() and not config.MT5_PATH:
+        raise SystemExit(
+            f"REFUSING TO START: XAUORDERPAD_INSTANCE="
+            f"{instance_paths.instance_name()!r} is set but XAUORDERPAD_MT5_PATH is "
+            f"empty. With several terminals running, a pathless mt5.initialize() "
+            f"attaches to the machine default -- i.e. possibly another account's "
+            f"terminal. Set XAUORDERPAD_MT5_PATH to this instance's terminal64.exe."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail closed BEFORE the worker starts or the socket serves: a networked bind with no token
     # is refused outright, not merely warned about.
     _require_auth_when_networked()
+    _require_terminal_path_when_instanced()
     # `server_started` is the first event of the run. Subsequent events
     # (orders, account snapshots, etc.) can be filtered against this line's
     # `pid` field to attribute everything to the right process instance.
@@ -218,8 +257,15 @@ async def lifespan(app: FastAPI):
     # fully fail-safe -- a missing browser never affects the trading server.
     if getattr(config, "LAUNCH_BROWSER", False):
         from browser_launch import launch_when_ready
-        url = f"http://{config.HOST}:{config.PORT}/"
-        launch_when_ready(url, config.HOST, config.PORT,
+        # HOST may be a BIND address (0.0.0.0 / ::), which Windows refuses as a CONNECT
+        # target -- so wait_for_port() could never succeed, and every LAN start burned the
+        # full 15 s timeout and then printed an un-openable http://0.0.0.0:8765/. This
+        # window opens on the machine running the server, so loopback is always the right
+        # thing to dial. Same all-interfaces test as _print_banner() above; _lan_ip() is
+        # deliberately NOT used here -- that answers "what do I type into the phone?".
+        dial = "127.0.0.1" if config.HOST in ("0.0.0.0", "::") else config.HOST
+        url = f"http://{dial}:{config.PORT}/"
+        launch_when_ready(url, dial, config.PORT,
                           getattr(config, "BROWSER_MODE", "app"))
     try:
         yield
@@ -314,6 +360,11 @@ class PlaceReq(BaseModel):
     sl: float | None = None
     tp: float | None = None
     auto_test: bool = False     # Auto-Test → backend demo-only guard (see /order)
+    # Who suggested this order (e.g. "rider"). Attribution ONLY -- it selects a
+    # broker comment from a server-side whitelist (Mt5Worker._order_comment) and
+    # cannot change magic, routing, or any guard. Unknown values fall back to the
+    # plain manual comment, so a forged value can only mislabel itself as manual.
+    origin: str | None = None
 
 
 class CloseReq(BaseModel):
@@ -375,16 +426,42 @@ class StrategyReq(BaseModel):
     max_concurrent: int | None = None
     vol_filter: bool | None = None
     # ladder
+    #
+    # This list is an ALLOWLIST, not documentation: pydantic drops anything not declared
+    # here, silently and with a 200. A parameter added to the engine but forgotten here is
+    # accepted by the API, echoed back unchanged in `params`, and simply never applied --
+    # which looks exactly like an engine that ignores its own settings.
     side: str | None = None
     trigger: float | None = None
     max_positions: int | None = None
+    max_lots: float | None = None
     entry_mode: str | None = None
     entry_step: float | None = None
     entry_gap_ms: int | None = None
     target: float | None = None
+    stop_mode: str | None = None
     retrace: float | None = None
+    floor_offset: float | None = None
     hard_sl: float | None = None
+    cooldown_s: float | None = None
+    max_ladders_per_day: int | None = None
+    close_batch: int | None = None
     paper: bool | None = None
+    # rider (vol-regime trend-rider; paper/suggestion only)
+    thrust_mult: float | None = None
+    sl: float | None = None
+    trail: float | None = None
+    tp: float | None = None
+    max_hold: int | None = None
+    atr_win: int | None = None
+    use_ny_hours: bool | None = None
+    risk_frac: float | None = None
+    # Execution switches, one per account class. The ENGINE decides what these mean
+    # and re-checks the connected account every poll (StrategyBase.evaluate); setting
+    # auto_real here does not by itself let anything trade on a real account, because
+    # the engine must also declare `allows_real`.
+    auto_demo: bool | None = None
+    auto_real: bool | None = None
     # shared
     volume: float | None = None
     max_daily_loss: float | None = None
@@ -742,9 +819,16 @@ async def login(req: LoginReq, x_token: str | None = Header(default=None)):
 
         if not res.get("ok"):
             err = res.get("error") or "login failed"
-            # The attempt just killed whatever session was running. Put it back if we can, and
-            # SAY SO either way -- a user told only "login failed" has no reason to suspect they
-            # are now off the market with positions open.
+            # A DUPLICATE rejection is refused before MT5 is contacted at all, so the
+            # existing session is untouched. Restoring here would re-login the account
+            # we are already on -- which now fails against our OWN account lock (locks
+            # are per-handle, so the same process conflicts with itself) and would
+            # produce a bogus "the terminal is now DISCONNECTED" scare.
+            if res.get("already_logged_in"):
+                raise HTTPException(status_code=409, detail=err)
+            # Otherwise the attempt just killed whatever session was running. Put it back if we
+            # can, and SAY SO either way -- a user told only "login failed" has no reason to
+            # suspect they are now off the market with positions open.
             if prev:
                 restored = await _restore_session(prev)
                 if restored:
@@ -860,6 +944,7 @@ async def order(req: PlaceReq, x_token: str | None = Header(default=None)):
         "sl": req.sl,
         "tp": req.tp,
         "auto_test": req.auto_test,
+        "origin": req.origin,      # which UI suggested it (attribution audit trail)
     })
 
     res = await _do({"action": "order", **req.model_dump()})

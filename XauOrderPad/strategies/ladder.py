@@ -1,9 +1,9 @@
-"""Trend-Ladder — DEMO-ONLY. Arm a trigger, pyramid into the move, exit on a retrace.
+"""Trend-Ladder — DEMO-ONLY. Arm a trigger, pyramid into the move, exit on a stop.
 
     Arm    : side + trigger price ("SELL if it goes below 4119")
     Enter  : once triggered, add positions while price keeps moving your way
     Target : each position closes at +`target` $/oz
-    Stop   : price retraces `retrace` $/oz from the extreme -> close everything
+    Stop   : `stop_mode` decides — trail the extreme, or hold a floor at the trigger
 
 ── Read ../../analysis/TREND_LADDER_STRATEGY.md before touching the defaults ──
 
@@ -13,8 +13,9 @@ that shaped the guards in this file:
   1. The spread is FIXED at 0.24/oz and does not tighten. With no directional
      edge, expectancy is -1 spread per trade, and NO arrangement of target and
      stop escapes it (a full target x trail sweep lands every cell on -0.24).
-     => `_spread_guard`: refuse to arm when target <= live spread. A target
-        inside the spread cannot win, and the engine must not pretend otherwise.
+     => `_param_guard`: refuse to arm when a distance that MUST be crossed to win
+        is inside the live spread. Such a setting cannot win, and the engine must
+        not pretend otherwise.
 
   2. The ladder is a pure MULTIPLIER, not an edge. Same trigger, same TP, same
      stop -- only the position count changes: 1 pos -$30/ladder, 10 pos -$105.
@@ -28,6 +29,31 @@ that shaped the guards in this file:
         places nothing, so the trigger's edge can be measured before a cent is
         risked. This is the whole point of the engine's first life.
 
+── And one finding this file learned the hard way, in production ──
+
+Run of 2026-07-21, live on demo 472200942, side=buy trigger=4071.60 target=1.00
+retrace=0.30 max_positions=1: **68 ladders and 79 closed trades in ~25 minutes**,
+net -19.13, with the `target` hit exactly ZERO times.
+
+Two separate mistakes, both now fixed here, both worth understanding before editing:
+
+  * **The trigger was never CONSUMED.** Finding 3 above describes a *one-shot
+    discretionary call*. What was built was a standing price level: the ladder
+    completed, `_ladder` was set to None, and 66 ms later a fresh one armed against
+    the same still-crossed trigger and bought again. The discretionary edge is spent
+    on ladder #1; ladders #2..#68 are machine re-entries at a level price happens to
+    be oscillating around, which is precisely the thing finding 3 says has no edge.
+    => a crossing is now an EVENT: `_rearm_ok` latches off when a ladder ends and
+       only latches back on once price has traded back THROUGH the trigger. Plus
+       `cooldown_s` and `max_ladders_per_day`.
+
+  * **The target was unreachable and nothing said so.** A target is reachable only
+    if price can run `target` WITHOUT first pulling back `retrace`. 1.00 behind a
+    0.30 trail is not a strategy, it is a decoration -- but the old guard only
+    compared the target to the SPREAD, so it passed the config happily.
+    => `_param_guard` refuses what is arithmetically impossible and WARNS about what
+       is merely very unlikely. The two are different and are treated differently.
+
 The decision logic lives in `LadderState`, deliberately free of MT5 and of this
 class, so the replay harness in analysis/ can run the EXACT code that trades
 against historical ticks. If the harness and the engine ever disagree, the engine
@@ -36,6 +62,7 @@ has drifted from the model that was validated -- fix the engine, not the doc.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
 
@@ -49,40 +76,99 @@ class LadderState:
     """Pure decision logic: ticks in, actions out. No MT5, no I/O, no clock.
 
     Feed it (bid, ask, t_ms) and it returns a list of actions:
-        ("enter", price)          -- open one position at `price`
-        ("exit_all", price, why)  -- close everything at `price`
+        ("enter", rid, price)                 -- open one position, tagged `rid`
+        ("exit_one", rid, exit_px, entry_px)  -- close the ONE position tagged `rid`
+        ("exit_all", exit_px, why, rungs)     -- close everything; rungs = [(rid, entry)]
+
+    Every exit action carries the ENTRY price of what it is closing. It has to: the
+    rung is removed from `entries` at the moment the action is emitted, so a consumer
+    that tried to look the entry up afterwards would find nothing. Paper mode did
+    exactly that and silently booked zero P&L for every stop-out -- the one number
+    paper mode exists to produce.
 
     A SELL enters at the BID (the number on the chart) and exits at the ASK,
     because closing a short means BUYING. That asymmetry is not a modelling
     choice -- it is how the broker fills, and it is the entire cost of the
     strategy. A BUY is the mirror image.
+
+    Every rung carries an integer `rid` that is unique for the life of the ladder.
+    Rungs used to be identified by their entry PRICE, which worked only while
+    `max_positions` was 1: uncapped pyramiding at 5 entries/second produces
+    duplicate prices within seconds, and a price-keyed lookup then closes the wrong
+    position -- or, worse, reports success having closed nothing.
     """
 
-    def __init__(self, side: str, trigger: float, target: float, retrace: float,
-                 max_positions: int, entry_mode: str, entry_step: float,
-                 entry_gap_ms: int) -> None:
+    def __init__(self, side: str, trigger: float, target: float,
+                 max_positions: int, max_lots: float, volume: float,
+                 entry_mode: str, entry_step: float, entry_gap_ms: int,
+                 stop_mode: str = "retrace", retrace: float = 0.30,
+                 floor_offset: float = 0.0) -> None:
         self.side = side
         self.is_sell = side == "sell"
         self.trigger = float(trigger)
         self.target = float(target)
-        self.retrace = float(retrace)
+        # 0 means UNCAPPED for both caps. They are independent: whichever binds
+        # first stops the pyramid, so an operator can cap by count, by size, by
+        # both, or by neither.
         self.max_positions = int(max_positions)
+        self.max_lots = float(max_lots)
+        self.volume = float(volume)
         self.entry_mode = entry_mode
         self.entry_step = float(entry_step)
         self.entry_gap_ms = int(entry_gap_ms)
+        self.stop_mode = stop_mode
+        self.retrace = float(retrace)
+        self.floor_offset = float(floor_offset)
 
         self.armed = False
-        self.entries: list[float] = []     # fill prices of OPEN positions
+        self.entries: list[tuple[int, float]] = []   # (rid, fill price) of OPEN rungs
         self.n_taken = 0                   # total ever opened this ladder
         self.extreme: float | None = None  # best price reached (low for sell)
+        self._next_rid = 0
         self._last_entry_ms = 0
 
+    # ---- geometry ---------------------------------------------------------
+    @property
+    def open_lots(self) -> float:
+        return round(len(self.entries) * self.volume, 8)
+
+    @property
+    def floor(self) -> float:
+        """The price at which floor mode gives up, on the SAME series as the trigger.
+
+        The operator names a level off the chart ("buy above 4071.60"), so the level
+        that cancels it has to be read off that same number -- not off the other side
+        of the spread. Realising the exit still costs the spread on top; that is
+        surfaced as `effective_stop` rather than hidden inside this number.
+        """
+        return (self.trigger + self.floor_offset) if self.is_sell \
+            else (self.trigger - self.floor_offset)
+
+    def _room(self) -> bool:
+        """Is there space for one more rung under BOTH caps?"""
+        if self.max_positions > 0 and len(self.entries) >= self.max_positions:
+            return False
+        if self.max_lots > 0 and (len(self.entries) + 1) * self.volume > self.max_lots + 1e-9:
+            return False
+        return True
+
+    def _add(self, price: float, t_ms: int) -> tuple:
+        rid = self._next_rid
+        self._next_rid += 1
+        self.entries.append((rid, price))
+        self.n_taken += 1
+        self._last_entry_ms = t_ms
+        return ("enter", rid, price)
+
+    # ---- the loop ---------------------------------------------------------
     def on_tick(self, bid: float, ask: float, t_ms: int) -> list[tuple]:
         acts: list[tuple] = []
         # The price we ENTER at, and the price we EXIT at. Never the same one.
         entry_px = bid if self.is_sell else ask
         exit_px = ask if self.is_sell else bid
-        # "Our way" -- the chart price moving in our favour.
+        # "Our way" -- the chart price moving in our favour. This is the series the
+        # operator set the trigger against, so it is the series that arms us and the
+        # series the floor is measured on.
         mark = bid if self.is_sell else ask
 
         if not self.armed:
@@ -91,10 +177,7 @@ class LadderState:
                 return acts
             self.armed = True
             self.extreme = mark
-            acts.append(("enter", entry_px))
-            self.entries.append(entry_px)
-            self.n_taken += 1
-            self._last_entry_ms = t_ms
+            acts.append(self._add(entry_px, t_ms))
             return acts
 
         # track the extreme (lowest bid for a sell, highest ask for a buy)
@@ -103,66 +186,78 @@ class LadderState:
         elif (mark < self.extreme) if self.is_sell else (mark > self.extreme):
             self.extreme = mark
 
-        # 1) TARGET -- close any position that has reached +target, marked at the
-        #    price we would actually get OUT at.
+        # 1) TARGET -- close any rung that has reached +target, marked at the price
+        #    we would actually get OUT at. Runs before the stop so that on a tick
+        #    where both fire, the winner is booked rather than swept up in the flush.
         still = []
-        for e in self.entries:
+        for rid, e in self.entries:
             pl = (e - exit_px) if self.is_sell else (exit_px - e)
             if pl >= self.target:
-                acts.append(("exit_one", exit_px, e))
+                acts.append(("exit_one", rid, exit_px, e))
             else:
-                still.append(e)
+                still.append((rid, e))
         self.entries = still
 
-        # 2) RETRACE STOP -- the whole ladder, not per position. It trails the
-        #    EXTREME, not the entry, so it tightens as the move runs. (Measured:
-        #    that makes it ~4x closer than the target, which is why the target is
-        #    hit only 1.7% of the time. See the doc.)
-        pull = (mark - self.extreme) if self.is_sell else (self.extreme - mark)
-        if self.entries and pull >= self.retrace:
-            acts.append(("exit_all", exit_px, "retrace"))
+        # 2) STOP -- whole-ladder, never per rung.
+        if self.entries and self._stop_hit(mark):
+            acts.append(("exit_all", exit_px, self.stop_mode, list(self.entries)))
             self.entries = []
             return acts
 
         # 3) ADD -- only while price is still making new ground our way.
-        if len(self.entries) < self.max_positions and self.n_taken < self.max_positions:
+        if self._room():
+            last = self.entries[-1][1] if self.entries else entry_px
             if self.entry_mode == "step":
                 # Spaced by PRICE: each entry needs room to clear the spread.
-                last = self.entries[-1] if self.entries else entry_px
                 moved = (last - entry_px) if self.is_sell else (entry_px - last)
                 ok = moved >= self.entry_step
             else:
-                # Spaced by TIME. Measured median 1s move is 0.044 -- so entries
-                # land ~0.04 apart while each needs 0.24 to break even. Available
-                # because it was asked for; it is not the default for that reason.
-                last = self.entries[-1] if self.entries else entry_px
+                # Spaced by TIME, and only ever at a BETTER price than the last rung
+                # -- that "better" test is what makes timer mode mean "keep adding
+                # while it runs" rather than "keep adding". Measured median 1s move
+                # is 0.044, so entries land ~0.04 apart while each needs a full
+                # spread to break even; that is the cost of the cadence, not a bug.
                 better = (entry_px < last) if self.is_sell else (entry_px > last)
                 ok = better and (t_ms - self._last_entry_ms) >= self.entry_gap_ms
             if ok:
-                acts.append(("enter", entry_px))
-                self.entries.append(entry_px)
-                self.n_taken += 1
-                self._last_entry_ms = t_ms
+                acts.append(self._add(entry_px, t_ms))
         return acts
 
-    def rollback_entry(self, price: float) -> None:
+    def _stop_hit(self, mark: float) -> bool:
+        """Has the ladder-wide stop been breached, on the entry-side price series?
+
+        `floor`   -- one fixed level derived from the trigger. It does NOT move, so
+                     the ladder gets the whole distance it has travelled to work in,
+                     and is flattened only if price returns to where it was armed.
+        `retrace` -- trails the EXTREME, not the entry, so it tightens as the move
+                     runs. Measured: that makes it ~4x closer than the target, which
+                     is why the target is hit only 1.7% of the time. See the doc.
+        """
+        if self.stop_mode == "floor":
+            return (mark >= self.floor) if self.is_sell else (mark <= self.floor)
+        pull = (mark - self.extreme) if self.is_sell else (self.extreme - mark)
+        return pull >= self.retrace
+
+    # ---- reconciliation with the broker -----------------------------------
+    def rollback_entry(self, rid: int) -> None:
         """Undo an entry the broker REFUSED.
 
-        on_tick() appends to `entries` and then emits the "enter" action, so by the
-        time the order is actually sent the state already believes it holds the
-        position. If order_send then fails -- market closed, no money, bad stops --
-        the state is left holding a PHANTOM: an entry with no ticket behind it.
+        on_tick() appends the rung and then emits the "enter" action, so by the time
+        the order is actually sent the state already believes it holds the position.
+        If order_send then fails -- market closed, no money, bad stops -- the state
+        is left holding a PHANTOM: a rung with no ticket behind it.
 
-        That is not cosmetic. The phantom consumes a max_positions slot, makes the
-        engine "manage" a position that does not exist, and sends the retrace stop
-        chasing a ticket the broker has never heard of. The model must match the
-        broker, so an order that did not happen must not appear to have happened.
+        That is not cosmetic. The phantom consumes a cap slot, makes the engine
+        "manage" a position that does not exist, and sends the stop chasing a ticket
+        the broker has never heard of. The model must match the broker, so an order
+        that did not happen must not appear to have happened.
         """
-        for i in range(len(self.entries) - 1, -1, -1):
-            if abs(self.entries[i] - price) < 1e-9:
-                self.entries.pop(i)
-                self.n_taken = max(0, self.n_taken - 1)
-                return
+        self.drop(rid)
+        self.n_taken = max(0, self.n_taken - 1)
+
+    def drop(self, rid: int) -> None:
+        """Forget one rung -- it is closed, or it never existed."""
+        self.entries = [(r, p) for (r, p) in self.entries if r != rid]
 
     @property
     def done(self) -> bool:
@@ -173,7 +268,11 @@ class LadderState:
 class TrendLadder(StrategyBase):
     ID = "ladder"
     NAME = "Trend Ladder"
-    needs_hedging = False          # all positions are the same side
+    # Every rung is a SEPARATE position with its own entry, ticket and target. A
+    # netting account collapses them into one aggregate line, which would make the
+    # rung->ticket map fiction and `exit_one` meaningless. This mattered little while
+    # max_positions was 1; it is fatal once the pyramid is uncapped.
+    needs_hedging = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -182,21 +281,37 @@ class TrendLadder(StrategyBase):
         self.trigger = float(p["trigger"])
         self.volume = float(p["volume"])
         self.max_positions = int(p["max_positions"])
+        self.max_lots = float(p["max_lots"])
         self.entry_mode = str(p["entry_mode"])
         self.entry_step = float(p["entry_step"])
         self.entry_gap_ms = int(p["entry_gap_ms"])
         self.target = float(p["target"])
+        self.stop_mode = str(p["stop_mode"])
         self.retrace = float(p["retrace"])
+        self.floor_offset = float(p["floor_offset"])
         self.hard_sl = float(p["hard_sl"])
         self.max_daily_loss = float(p["max_daily_loss"])
+        self.cooldown_s = float(p["cooldown_s"])
+        self.max_ladders_per_day = int(p["max_ladders_per_day"])
+        self.close_batch = int(p["close_batch"])
         self.paper = bool(p["paper"])
         # runtime
         self._ladder: LadderState | None = None
-        self._tickets: list[int] = []
+        self._tickets: dict[int, int] = {}       # rung id -> broker ticket
+        self._flush: list[int] = []              # tickets still to close, batched
+        self._flush_why = ""
         self._paper_pl = 0.0            # realized $/oz, paper mode only
         self._paper_trades = 0
         self._ladders_done = 0
         self._last_spread = 0.0
+        # D1: a trigger CROSSING is an event, not a state. Enabling the engine is the
+        # operator's discretionary act, so the first ladder may fire immediately; every
+        # later one waits for price to trade back through the trigger.
+        self._rearm_ok = True
+        self._last_ladder_end = 0.0
+        self._ladders_today = 0
+        self._today = None
+        self._managing_check = 0.0      # last broker re-check while managing (~1 Hz)
         self._adopt_basis: str | None = None     # how the extreme was reconstructed
         self._adopt_extreme: float | None = None
 
@@ -206,49 +321,110 @@ class TrendLadder(StrategyBase):
 
     def _params(self) -> dict:
         return {"side": self.side, "trigger": self.trigger, "volume": self.volume,
-                "max_positions": self.max_positions, "entry_mode": self.entry_mode,
+                "max_positions": self.max_positions, "max_lots": self.max_lots,
+                "entry_mode": self.entry_mode,
                 "entry_step": self.entry_step, "entry_gap_ms": self.entry_gap_ms,
-                "target": self.target, "retrace": self.retrace,
+                "target": self.target, "stop_mode": self.stop_mode,
+                "retrace": self.retrace, "floor_offset": self.floor_offset,
                 "hard_sl": self.hard_sl, "max_daily_loss": self.max_daily_loss,
-                "paper": self.paper}
+                "cooldown_s": self.cooldown_s,
+                "max_ladders_per_day": self.max_ladders_per_day,
+                "close_batch": self.close_batch, "paper": self.paper}
 
     def _apply(self, params: dict) -> None:
         for k in ("trigger", "volume", "entry_step", "target", "retrace",
-                  "hard_sl", "max_daily_loss"):
+                  "floor_offset", "max_lots", "hard_sl", "max_daily_loss",
+                  "cooldown_s"):
             if params.get(k) is not None:
                 setattr(self, k, float(params[k]))
-        for k in ("max_positions", "entry_gap_ms"):
+        for k in ("max_positions", "entry_gap_ms", "max_ladders_per_day",
+                  "close_batch"):
             if params.get(k) is not None:
                 setattr(self, k, int(params[k]))
         if params.get("side") in ("buy", "sell"):
             self.side = params["side"]
         if params.get("entry_mode") in ("step", "timer"):
             self.entry_mode = params["entry_mode"]
+        if params.get("stop_mode") in ("retrace", "floor"):
+            self.stop_mode = params["stop_mode"]
         if params.get("paper") is not None:
             self.paper = bool(params["paper"])
-        # Changing params mid-ladder would mean a ladder running under two
-        # different rules -- and a P&L nobody can attribute. Start fresh instead.
-        self._ladder = None
+        # Never below the floor. entry_gap_ms is the ONLY thing bounding how many
+        # order_send round trips land on the worker thread, and each one is
+        # synchronous inside a ~66 ms poll budget. At 0 the cadence becomes one order
+        # PER POLL -- 15/sec -- which starves prices, the P&L guard and the manual
+        # order pad, including the very poll that would have decided to stop.
+        self.entry_gap_ms = max(int(config.ENTRY_GAP_MS_MIN), int(self.entry_gap_ms))
+        self.close_batch = max(1, int(self.close_batch))
+        # Changing params mid-ladder would mean ONE ladder running under two different
+        # rules -- and a P&L nobody can attribute. So the next ladder starts fresh.
+        #
+        # But the positions already open are REAL. This used to drop the LadderState
+        # while leaving `_tickets` populated, which meant the next poll armed a brand
+        # new ladder and bought AGAIN: two live positions, engine believing one, and
+        # the original left with nothing watching its exit.
+        #
+        # So an open book is HANDED OVER rather than abandoned. The existing
+        # LadderState is kept -- it holds the rungs and the extreme, and it carries its
+        # own copies of the parameters, so the open book finishes under exactly the
+        # rules it was opened under. `_managing` blocks every new entry until it has
+        # drained; only then does a fresh ladder start, under the new rules.
+        if self._ladder is not None and self._ladder.entries:
+            self._managing = True
+            log.info("ladder params changed mid-ladder -- managing the open book "
+                     "under its original rules, no new entries",
+                     extra={"event": "ladder_params_handover", "strategy": self.ID,
+                            "open": len(self._ladder.entries)})
+        else:
+            self._ladder = None
+        self._rearm_ok = True
 
     def _extra_status(self) -> dict:
         warn = None
-        if self.max_positions > 1:
-            warn = (f"max_positions={self.max_positions}: the ladder MULTIPLIES cost, "
-                    f"not edge — each extra position pays another ~{self._last_spread:.2f}/oz "
-                    f"spread. Measured: 1 pos −$30/ladder, 10 pos −$105.")
+        if self.max_positions > 1 or self.max_positions == 0:
+            cap = "UNCAPPED" if self.max_positions == 0 else str(self.max_positions)
+            warn = (f"max_positions={cap}: the ladder MULTIPLIES cost, not edge -- each "
+                    f"extra position pays another ~{self._last_spread:.2f}/oz spread. "
+                    f"Measured: 1 pos -$30/ladder, 10 pos -$105.")
+            if self.max_positions == 0 and self.max_lots <= 0:
+                warn += (" With max_lots=0 as well, nothing bounds the book: a slow grind "
+                         "at this cadence accumulates rungs faster than the target drains "
+                         "them. Set max_lots before running this live.")
+        if self.stop_mode == "retrace" and self.target > self.retrace * 2.5:
+            warn = ((warn + " ") if warn else "") + (
+                f"target {self.target:.2f} sits behind a {self.retrace:.2f} trail: price must "
+                f"run the full target without ever pulling back {self.retrace:.2f}. Measured "
+                f"live 2026-07-21: 0 target hits in 79 trades.")
+        open_n = len(self._ladder.entries) if self._ladder else 0
         return {
             "paper": self.paper,
-            "open_positions": len(self._ladder.entries) if self._ladder else 0,
+            "open_positions": open_n,
+            "open_lots": round(open_n * self.volume, 8),
             "ladders_done": self._ladders_done,
+            "ladders_today": self._ladders_today,
             "paper_pl_per_oz": round(self._paper_pl, 3),
             "paper_trades": self._paper_trades,
             "spread": round(self._last_spread, 3),
+            # What the dialled stop ACTUALLY costs. The stop is measured on the
+            # entry-side price but realised on the exit-side one, so the operator dials
+            # X and receives X + spread before any slippage. Derived server-side so both
+            # clients render the same number.
+            "effective_stop": round((self.floor_offset if self.stop_mode == "floor"
+                                     else self.retrace) + self._last_spread, 3),
+            "floor_price": (round(self._floor_price(), 3)
+                            if self.stop_mode == "floor" and self.trigger > 0 else None),
+            "flush_remaining": len(self._flush),
             "warning": warn,
         }
 
+    def _floor_price(self) -> float:
+        return (self.trigger + self.floor_offset) if self.side == "sell" \
+            else (self.trigger - self.floor_offset)
+
     def _on_killed(self) -> None:
         self._ladder = None
-        self._tickets = []
+        self._tickets = {}
+        self._flush = []
 
     # ---- crash recovery ---------------------------------------------------
     def _adopt(self, worker, positions: list) -> int:
@@ -257,7 +433,8 @@ class TrendLadder(StrategyBase):
         Entries, tickets and side all come straight off the positions. The one thing
         the broker does NOT store is the EXTREME -- the lowest bid (highest ask) the
         ladder reached -- and that is precisely what the retrace stop measures from.
-        Lose it and the stop is meaningless.
+        Lose it and the stop is meaningless. (Floor mode does not need it, but the
+        mode can be switched at any time, so it is reconstructed either way.)
 
         So reconstruct it from tick history: the earliest position's open time is when
         this ladder began, and min(bid) over that window IS the extreme, exactly.
@@ -272,14 +449,11 @@ class TrendLadder(StrategyBase):
         is_sell = int(poss[0].type) == 1                # MT5: 0=BUY, 1=SELL
         side = "sell" if is_sell else "buy"
         entries = [float(p.price_open) for p in poss]
-        # Same {entry, ticket} shape _enter() builds, so exit_one can close a single
-        # adopted position by its entry price exactly as it would a live one.
-        tickets = [{"entry": float(p.price_open), "ticket": int(p.ticket)} for p in poss]
 
         # best entry = a real observed extreme (fallback + a floor on the tick scan)
         best_entry = min(entries) if is_sell else max(entries)
 
-        extreme, basis = best_entry, "entries (approximate — no ticks)"
+        extreme, basis = best_entry, "entries (approximate -- no ticks)"
         try:
             ticks = worker.ticks_since(int(poss[0].time))
             if ticks is not None and len(ticks):
@@ -294,17 +468,27 @@ class TrendLadder(StrategyBase):
                           extra={"event": "ladder_adopt_ticks_failed", "strategy": self.ID})
 
         self.side = side
+        # An adopted book may already be larger than the configured cap (the cap was
+        # lowered while it was open, or the process died mid-pyramid). Widen the cap to
+        # fit rather than pretend the extra positions are not there -- but leave an
+        # UNCAPPED setting uncapped.
+        cap = 0 if self.max_positions <= 0 else max(self.max_positions, len(entries))
         st = LadderState(side, trigger=self.trigger, target=self.target,
-                         retrace=self.retrace, max_positions=max(self.max_positions,
-                                                                 len(entries)),
-                         entry_mode=self.entry_mode, entry_step=self.entry_step,
-                         entry_gap_ms=self.entry_gap_ms)
+                         max_positions=cap, max_lots=self.max_lots,
+                         volume=self.volume, entry_mode=self.entry_mode,
+                         entry_step=self.entry_step, entry_gap_ms=self.entry_gap_ms,
+                         stop_mode=self.stop_mode, retrace=self.retrace,
+                         floor_offset=self.floor_offset)
         st.armed = True                 # it already fired -- do not re-trigger
-        st.entries = entries
+        # Same (rid, price) shape on_tick builds, and the same rid->ticket map, so
+        # exit_one can close a single adopted rung exactly as it would a live one.
+        st.entries = list(enumerate(entries))
+        st._next_rid = len(entries)
         st.n_taken = len(entries)
         st.extreme = extreme
         self._ladder = st
-        self._tickets = tickets
+        self._tickets = {i: int(p.ticket) for i, p in enumerate(poss)}
+        self._flush = []
         self._adopt_basis = basis
         self._adopt_extreme = extreme
 
@@ -312,7 +496,7 @@ class TrendLadder(StrategyBase):
                     len(entries),
                     extra={"event": "ladder_adopted", "strategy": self.ID,
                            "side": side, "entries": entries,
-                           "tickets": [x["ticket"] for x in tickets],
+                           "tickets": list(self._tickets.values()),
                            "extreme": round(extreme, 3), "extreme_basis": basis})
         return len(entries)
 
@@ -321,7 +505,7 @@ class TrendLadder(StrategyBase):
 
     # ---- control ----------------------------------------------------------
     def update(self, params: dict | None, enabled: bool | None) -> dict:
-        """Enable, then immediately re-check the spread guard.
+        """Enable, then immediately re-check the parameter guard.
 
         Without this the guard only ran on the next worker poll, so POST returned
         `enabled: true, error: null` for a configuration the engine was about to
@@ -329,9 +513,14 @@ class TrendLadder(StrategyBase):
         flipped to disabled. An API that reports success for a request it is in the
         middle of rejecting is worse than one that just says no.
         """
+        if enabled:
+            # Enabling IS the operator's discretionary act, so the first ladder may
+            # fire on a trigger price has already crossed. Everything after it waits.
+            self._rearm_ok = True
+            self._last_ladder_end = 0.0
         res = super().update(params, enabled)
-        if self.enabled and not self._spread_guard(self._last_spread):
-            return self.status()          # _spread_guard already disabled + explained
+        if self.enabled and not self._param_guard(self._last_spread):
+            return self.status()          # _param_guard already disabled + explained
         return res
 
     # ---- main loop --------------------------------------------------------
@@ -352,24 +541,68 @@ class TrendLadder(StrategyBase):
             return
         spread = float(ask) - float(bid)
         self._last_spread = spread
+        now = time.time()
 
-        # MANAGING an adopted book: work the exits (target + retrace) on the positions
-        # we inherited, but open nothing new. Note this runs BEFORE the trigger and
-        # spread guards -- those gate NEW entries, and a position already open must be
-        # managed regardless of whether a fresh one would be allowed. Bailing out here
-        # on "no trigger set" would strand exactly the positions we just rescued.
+        # DRAINING a flush takes priority over everything, including the trigger. The
+        # book is already condemned; the only job left is to get it closed without
+        # blowing the poll budget. Nothing new opens until it is empty.
+        if self._flush:
+            self._drain(worker)
+            self._state = f"flushing: {len(self._flush)} left"
+            if self._flush:
+                return
+            self._finish_ladder(now)
+            # A book that was being MANAGED (adopted after a restart, or handed over by
+            # a param change) has now finished. Ask the broker whether we are genuinely
+            # flat before leaving that state -- `_clear_managing_if_flat` checks the
+            # positions rather than our own bookkeeping, which is the point of it.
+            if self._managing:
+                self._clear_managing_if_flat(worker)
+            return
+
+        # MANAGING an adopted book: work the exits (target + stop) on the positions we
+        # inherited, but open nothing new. Note this runs BEFORE the trigger and
+        # parameter guards -- those gate NEW entries, and a position already open must
+        # be managed regardless of whether a fresh one would be allowed. Bailing out
+        # here on "no trigger set" would strand exactly the positions we just rescued.
         if self._managing:
             if self._ladder is None:
                 self._clear_managing_if_flat(worker)
                 return
-            acts = self._ladder.on_tick(float(bid), float(ask), int(time.time() * 1000))
+            # Re-check against the BROKER, ~1 Hz.
+            #
+            # Managing is driven from `_ladder.entries`, which is our own memory. If every
+            # position is closed behind our back -- the hard SL fires, the operator flattens
+            # by hand, the account is switched -- that memory becomes a phantom book, and the
+            # engine sits managing positions that no longer exist. It would only notice at the
+            # next stop event, which may be hours away, and until then it refuses to open
+            # anything new because its book "looks full". That is precisely the failure
+            # strategies/state.py exists to warn about; the broker is the only real answer.
+            #
+            # Throttled to 1 Hz rather than run every poll: it costs one positions_get, and
+            # managing is a transient recovery state, not the hot path. (Same shape as the
+            # ~1 Hz throttle on _compute_stats.)
+            if now - self._managing_check >= 1.0:
+                self._managing_check = now
+                if not self.positions(worker):
+                    log.info("ladder was managing a book the broker no longer has -- releasing",
+                             extra={"event": "ladder_managing_stale", "strategy": self.ID,
+                                    "believed": len(self._ladder.entries)})
+                    self._ladder = None
+                    self._tickets = {}
+                    self._clear_managing_if_flat(worker)
+                    return
+            acts = self._ladder.on_tick(float(bid), float(ask), int(now * 1000))
             for a in acts:
                 if a[0] == "enter":
-                    continue                       # managing-only: never open new risk
+                    # managing-only: never open new risk. The rung must be un-believed
+                    # too, or it occupies a cap slot and the stop chases a phantom.
+                    self._ladder.rollback_entry(a[1])
+                    continue
                 self._do(worker, a)
             self._state = (f"managing {len(self._ladder.entries)} adopted position(s)"
                            if self._ladder.entries else "managing")
-            if not self._ladder.entries:
+            if not self._ladder.entries and not self._flush:
                 self._ladder = None
                 self._clear_managing_if_flat(worker)
             return
@@ -377,55 +610,136 @@ class TrendLadder(StrategyBase):
         if self.trigger <= 0:
             self._state = "waiting: no trigger price set"
             return
-        # A target inside the spread is not a strategy, it is a fee. Refuse.
-        if not self._spread_guard(spread):
+        # A stop or target inside the spread is not a strategy, it is a fee. Refuse.
+        if not self._param_guard(spread):
             return
 
         if self._ladder is None:
+            gate = self._rearm_gate(float(bid), float(ask), now)
+            if gate is not None:
+                self._state = gate
+                return
             self._ladder = LadderState(
-                self.side, self.trigger, self.target, self.retrace,
-                self.max_positions, self.entry_mode, self.entry_step,
-                self.entry_gap_ms)
+                self.side, self.trigger, self.target, self.max_positions,
+                self.max_lots, self.volume, self.entry_mode, self.entry_step,
+                self.entry_gap_ms, self.stop_mode, self.retrace, self.floor_offset)
 
-        acts = self._ladder.on_tick(float(bid), float(ask), int(time.time() * 1000))
+        acts = self._ladder.on_tick(float(bid), float(ask), int(now * 1000))
         for a in acts:
             self._do(worker, a)
 
-        if self._ladder.done:
-            self._ladders_done += 1
-            self._ladder = None
-            self._state = "armed"
+        if self._flush:
+            self._state = f"flushing: {len(self._flush)} left"
+        elif self._ladder.done:
+            self._finish_ladder(now)
         elif self._ladder.armed:
-            self._state = "active" if self._ladder.entries else "armed"
+            self._state = (f"active: {len(self._ladder.entries)} rung(s), "
+                           f"{self._ladder.open_lots:g} lots"
+                           if self._ladder.entries else "armed")
         else:
             self._state = f"armed: waiting for {self.side.upper()} trigger {self.trigger:g}"
 
-    def _spread_guard(self, spread: float) -> bool:
-        if self.target > spread:
-            return True
-        self._disable_with(
-            f"refused: target {self.target:.2f}/oz is inside the live spread "
-            f"{spread:.2f}/oz — a winning trade would still net "
-            f"{self.target - spread:+.2f}/oz. Raise the target above the spread.")
-        return False
+    # ---- re-arm gating (D1) -----------------------------------------------
+    def _rearm_gate(self, bid: float, ask: float, now: float) -> str | None:
+        """May a NEW ladder start? Returns None to allow, else the reason to display.
+
+        Three independent brakes, all absent from the version that turned over 68
+        ladders in 25 minutes:
+
+          * the trigger must be RE-CROSSED. A level price is already sitting past is
+            not a signal; it is just a level. Without this the engine re-enters on the
+            poll immediately after every exit, forever.
+          * `cooldown_s` -- a floor on how often the same idea may be re-tried.
+          * `max_ladders_per_day` -- a hard stop that does not depend on the loss
+            being large enough to trip the daily kill-switch.
+        """
+        self._roll_day()
+        if self.max_ladders_per_day > 0 and self._ladders_today >= self.max_ladders_per_day:
+            return f"done for today: {self._ladders_today}/{self.max_ladders_per_day} ladders"
+        if self.cooldown_s > 0 and self._last_ladder_end:
+            left = self.cooldown_s - (now - self._last_ladder_end)
+            if left > 0:
+                return f"cooldown: {left:.0f}s"
+        if not self._rearm_ok:
+            # Re-arm only once price has traded back through the trigger, measured on
+            # the same entry-side series the trigger arms against.
+            mark = bid if self.side == "sell" else ask
+            back = (mark > self.trigger) if self.side == "sell" else (mark < self.trigger)
+            if not back:
+                return (f"waiting: price must return through {self.trigger:g} before "
+                        f"a new ladder")
+            self._rearm_ok = True
+        return None
+
+    def _roll_day(self) -> None:
+        """Reset the daily ladder count at local midnight -- the same boundary
+        `strategy_daily_realized` and the history endpoint use, so the numbers on
+        screen agree with each other."""
+        today = datetime.date.today()
+        if self._today != today:
+            self._today = today
+            self._ladders_today = 0
+
+    def _finish_ladder(self, now: float) -> None:
+        self._ladders_done += 1
+        self._roll_day()
+        self._ladders_today += 1
+        self._ladder = None
+        self._tickets = {}
+        self._rearm_ok = False          # must re-cross the trigger before the next one
+        self._last_ladder_end = now
+        self._state = "armed"
+
+    # ---- guards -----------------------------------------------------------
+    def _param_guard(self, spread: float) -> bool:
+        """Refuse the impossible; warn about the merely unlikely.
+
+        The distinction matters. `target <= spread` is arithmetic: a winning trade
+        still nets a loss, always, and no amount of skill changes it -- so the engine
+        refuses. "target sits behind a tight trail" is a probability, very low but not
+        zero, so it is a warning in status() rather than a refusal. Refusing a legal
+        configuration the operator may have chosen deliberately would be the engine
+        overruling the human; staying silent about one that cannot win was the bug.
+        """
+        if self.target <= spread:
+            self._disable_with(
+                f"refused: target {self.target:.2f}/oz is inside the live spread "
+                f"{spread:.2f}/oz -- a winning trade would still net "
+                f"{self.target - spread:+.2f}/oz. Raise the target above the spread.")
+            return False
+        if self.stop_mode == "floor" and self.floor_offset <= spread:
+            self._disable_with(
+                f"refused: floor_offset {self.floor_offset:.2f}/oz is inside the live "
+                f"spread {spread:.2f}/oz -- the floor sits where the ladder is already "
+                f"marked the moment it arms, so it would flush on the first tick. "
+                f"Raise it above the spread.")
+            return False
+        if self.stop_mode == "retrace" and self.retrace <= spread:
+            self._disable_with(
+                f"refused: retrace {self.retrace:.2f}/oz is inside the live spread "
+                f"{spread:.2f}/oz -- every rung would stop out for at least "
+                f"{-(self.retrace + spread):.2f}/oz before it could move. "
+                f"Raise the retrace above the spread.")
+            return False
+        return True
 
     # ---- execution --------------------------------------------------------
     def _do(self, worker, act: tuple) -> None:
         kind = act[0]
         if kind == "enter":
-            self._enter(worker, act[1])
+            self._enter(worker, act[1], act[2])
         elif kind == "exit_one":
-            self._exit(worker, act[1], "target", entry=act[2])
+            self._exit_one(worker, act[1], act[2], act[3])
         elif kind == "exit_all":
-            self._exit(worker, act[1], act[2])
+            self._exit_all(worker, act[1], act[2], act[3])
 
-    def _enter(self, worker, price: float) -> None:
+    def _enter(self, worker, rid: int, price: float) -> None:
         if self.paper:
             self._paper_trades += 1
             log.info("ladder PAPER entry",
                      extra={"event": "ladder_paper_entry", "strategy": self.ID,
                             "side": self.side, "fill": round(price, 3),
-                            "n": len(self._ladder.entries)})
+                            "rid": rid, "n": len(self._ladder.entries)})
             return
         sl = self.hard_sl          # broker-side backstop if this process dies
         r = worker.strategy_place(self.MAGIC, self.side, round(self.volume, 2),
@@ -434,58 +748,106 @@ class TrendLadder(StrategyBase):
             # The broker said no, so the ladder must un-believe the entry. Leaving it
             # in place would leave the engine managing a position that does not exist.
             if self._ladder is not None:
-                self._ladder.rollback_entry(price)
+                self._ladder.rollback_entry(rid)
             self._error = f"entry failed: {r.get('error')}"
-            log.warning("ladder entry failed — entry rolled back",
+            log.warning("ladder entry failed -- entry rolled back",
                         extra={"event": "ladder_entry_failed", "strategy": self.ID,
-                               "error": r.get("error"), "rolled_back": round(price, 3)})
+                               "error": r.get("error"), "rid": rid,
+                               "rolled_back": round(price, 3)})
             return
-        # Pair the ticket with the price the LadderState thinks it entered at, so a
-        # single position hitting its target can be closed on its own. Keyed on the
-        # state's price rather than the broker's fill: the state is what emits
-        # exit_one, and matching on a slipped fill price would never find the ticket.
-        self._tickets.append({"entry": float(price), "ticket": int(r["ticket"])})
+        self._tickets[rid] = int(r["ticket"])
+        # Correct the model to the price the broker actually filled at. The snapshot
+        # `price` came from a poll up to ~66 ms old, strategy_place then re-read the
+        # tick, and DEFAULT_DEVIATION allowed it to slip further still -- one live
+        # entry filled BELOW its own trigger. Marking the rung at a price that was
+        # never traded puts both the target and the extreme on a fiction.
+        fill = r.get("price")
+        if fill and self._ladder is not None:
+            self._ladder.entries = [(i, float(fill) if i == rid else p)
+                                    for (i, p) in self._ladder.entries]
         self._error = None
         log.info("ladder entry",
                  extra={"event": "ladder_entry", "strategy": self.ID,
-                        "side": self.side, "ticket": r.get("ticket"),
-                        "requested": round(price, 3), "fill": r.get("price"),
+                        "side": self.side, "ticket": r.get("ticket"), "rid": rid,
+                        "requested": round(price, 3), "fill": fill,
                         "volume": self.volume})
 
-    def _exit(self, worker, price: float, why: str, entry: float | None = None) -> None:
+    def _exit_one(self, worker, rid: int, price: float, entry: float) -> None:
+        """Close the ONE rung that reached its target.
+
+        Keyed on the rung id, never the price. Closing the whole list here (as this
+        once did) meant the first position to reach its target flattened the entire
+        ladder -- silently throwing away every other rung, including ones still
+        running. Matching on price instead was the next bug waiting to happen: at five
+        entries a second, duplicate entry prices are routine.
+        """
         if self.paper:
-            # Realized P&L in $/oz, using the fill we WOULD have got. This number
-            # is the whole point of paper mode: it is what the trigger is worth,
-            # net of the spread, before any money is at stake.
-            legs = [entry] if entry is not None else list(self._ladder.entries)
-            for e in legs:
-                pl = (e - price) if self.side == "sell" else (price - e)
-                self._paper_pl += pl
-                log.info("ladder PAPER exit",
-                         extra={"event": "ladder_paper_exit", "strategy": self.ID,
-                                "why": why, "entry": round(e, 3),
-                                "exit": round(price, 3), "pl_per_oz": round(pl, 3),
-                                "cum_pl_per_oz": round(self._paper_pl, 3)})
+            self._book_paper(rid, entry, price, "target")
             return
+        ticket = self._tickets.pop(rid, None)
+        if ticket is None:
+            return                       # already gone (broker SL/TP beat us)
+        self._close(worker, ticket, "target", rid)
 
-        # exit_one carries the entry price of the ONE position that hit its target, so
-        # close only that one. Closing the whole list here (as this used to) meant the
-        # first position to reach its target flattened the entire ladder -- silently
-        # throwing away every other position, including ones still running.
-        if entry is not None:
-            doomed = [x for x in self._tickets if abs(x["entry"] - entry) < 1e-9]
-            if not doomed:                       # already gone (broker SL/TP beat us)
-                return
-        else:
-            doomed = list(self._tickets)
+    def _exit_all(self, worker, price: float, why: str, rungs: list) -> None:
+        """Condemn the whole book, then close it in BATCHES.
 
-        for x in doomed:
-            r = worker.strategy_close_ticket(self.MAGIC, x["ticket"])
-            ok = bool(r.get("ok"))
-            log.info("ladder exit",
-                     extra={"event": "ladder_exit", "strategy": self.ID,
-                            "why": why, "ticket": x["ticket"],
-                            "entry": round(x["entry"], 3), "ok": ok,
-                            "error": r.get("error")})
-            if ok:
-                self._tickets.remove(x)
+        `order_send` is synchronous and runs on the worker thread inside a ~66 ms poll
+        budget, so closing N positions costs N*2 broker round trips in one cycle. At a
+        handful of rungs that is invisible; at several hundred it freezes the loop for
+        seconds -- and it is the same loop that feeds prices, the P&L guard, the manual
+        order pad and the stop that just fired. So the tickets are queued here and
+        drained `close_batch` per cycle by `_drain`, which keeps every individual cycle
+        inside its budget while the book still empties promptly.
+        """
+        if self.paper:
+            for rid, entry in rungs:
+                self._book_paper(rid, entry, price, why)
+            return
+        self._flush = list(self._tickets.values())
+        self._flush_why = why
+        self._tickets = {}
+        log.warning("ladder stop hit -- flushing %d position(s)", len(self._flush),
+                    extra={"event": "ladder_flush_start", "strategy": self.ID,
+                           "why": why, "count": len(self._flush),
+                           "price": round(price, 3), "batch": self.close_batch})
+        self._drain(worker)
+
+    def _drain(self, worker) -> None:
+        """Close up to `close_batch` condemned tickets, then yield the poll."""
+        for ticket in self._flush[:self.close_batch]:
+            self._close(worker, ticket, self._flush_why, None)
+        if not self._flush:
+            log.info("ladder flush complete",
+                     extra={"event": "ladder_flush_done", "strategy": self.ID,
+                            "why": self._flush_why})
+
+    def _close(self, worker, ticket: int, why: str, rid: int | None) -> None:
+        r = worker.strategy_close_ticket(self.MAGIC, ticket)
+        ok = bool(r.get("ok"))
+        err = r.get("error") or ""
+        # "ticket not found" means the broker has already closed it -- the hard SL
+        # fired, or a previous attempt succeeded and we never saw the answer. Either
+        # way it is DONE, and retrying it forever costs a positions_get IPC per poll
+        # inside the trading budget. Only a genuine failure stays on the queue.
+        gone = ok or "not found" in err.lower()
+        if gone and ticket in self._flush:
+            self._flush.remove(ticket)
+        if not gone:
+            self._error = f"close failed: {err}"
+        log.info("ladder exit",
+                 extra={"event": "ladder_exit", "strategy": self.ID, "why": why,
+                        "ticket": ticket, "rid": rid, "ok": ok, "error": r.get("error"),
+                        "already_closed": (not ok) and gone})
+
+    def _book_paper(self, rid: int, entry: float, price: float, why: str) -> None:
+        """Realized P&L in $/oz, using the fill we WOULD have got. This number is the
+        whole point of paper mode: it is what the trigger is worth, net of the spread,
+        before any money is at stake."""
+        pl = (entry - price) if self.side == "sell" else (price - entry)
+        self._paper_pl += pl
+        log.info("ladder PAPER exit",
+                 extra={"event": "ladder_paper_exit", "strategy": self.ID,
+                        "why": why, "rid": rid, "entry": round(entry, 3),
+                        "exit": round(price, 3), "pl_per_oz": round(pl, 3),
+                        "cum_pl_per_oz": round(self._paper_pl, 3)})

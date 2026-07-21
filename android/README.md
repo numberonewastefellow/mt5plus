@@ -180,8 +180,14 @@ defaulting a bare host to `http://host:8765` and preserving an explicit `https:/
 
 | Target | What you type | Certificate |
 |---|---|---|
-| LAN dev server | `192.168.0.116:8765` (plain HTTP) | **none** |
+| LAN dev server (plain) | `192.168.0.116:8765` (plain HTTP) | **none** — but a REAL account cannot be added over it |
+| LAN dev server (TLS) | `https://192.168.0.116:8443` (mutual TLS) | **same as EC2** — already imported |
 | EC2 box | `https://<elastic-ip>:8443` (mutual TLS) | **required** — uploaded in Settings |
+
+One imported cert set (`ca.crt` + `client.p12`) serves **all** of these: the LAN-TLS box and the EC2
+box share the **same private CA** (the LAN cert is minted with `make_certs.py --server-only`), so
+switching between them is only a change of URL + token, never a re-import. Set the LAN box up with
+*Encrypted LAN (TLS)* in [../XauOrderPad/HOW_TO_RUN.md](../XauOrderPad/HOW_TO_RUN.md).
 
 **The app now does mutual TLS** (`net/Tls.kt`, `data/CertStore.kt`). For the EC2 box:
 
@@ -198,7 +204,8 @@ client live). Certs are **not** baked into the APK.
 
 Having a cert loaded does **not** affect the LAN HTTP path: OkHttp only uses the TLS factory for
 `https://` URLs. The broker password, however, is **blocked** from being sent over plain HTTP
-(`loginWith` refuses when `passwordInClear`) — add accounts over https or on the desktop.
+(`loginWith` refuses when `passwordInClear`) — add accounts over **https (the EC2 box or a LAN-TLS
+server on `:8443`)** or on the desktop.
 
 Do **not** reach the box by opening 8765 on its public IP: that is uvicorn, plain HTTP, and the token
 grants order placement. 8443 (Caddy, mTLS) is the only way in. Set the box up with the
@@ -244,6 +251,39 @@ ACCOUNT form is pre-filled with the default account — it connects with no manu
 
 > `deploy.bat release demo` still works and is now identical to plain `release` (it passes the flag that
 > is already the default).
+
+### Testing a release build on YOUR phone — `-Pxau.debugSign=true` (no data wipe)
+
+**Debug and release are signed with DIFFERENT keys.** Android only updates an installed app in place
+when the new APK carries the **same** signing key, so a normal release APK **cannot** replace the
+debug build you have been testing: `deploy.bat` tells you to `uninstall` first, and that **wipes the
+app's data — saved server list, imported `ca.crt`/`client.p12`, and every UI pref.** On a phone set up
+for the LAN mTLS server that means re-importing certificates by hand.
+
+`-Pxau.debugSign=true` exists exactly for this: it signs the **release variant** with the **debug**
+key, so `adb install -r` updates the installed debug build in place and keeps all of it.
+
+`deploy.bat` has **no sub-command for this** — drive Gradle directly (`exec`, never `run --rm`):
+
+```bat
+cd android
+docker compose exec -T build sh ./gradlew :app:assembleRelease -Pxau.debugSign=true
+docker compose exec -T build cp /workspace/app/build/outputs/apk/release/app-release.apk /out/app-release.apk
+adb install -r E:\temp\mt5_data\app-release.apk
+```
+
+| | `deploy.bat release` | `-Pxau.debugSign=true` |
+|---|---|---|
+| Signing key | real `xau-release.jks` | **debug** key |
+| Installing over a debug build | **fails** → uninstall → **data wiped** | **in place, data kept** |
+| Distributable | yes | **no** — carries the world-known debug signature |
+
+It is still a true release variant (`isMinifyEnabled` config, `lintVital` runs, **not** `debuggable`).
+The give-away that it worked: `adb shell run-as com.xauorderpad` starts failing with *"package not
+debuggable"* — that is the release variant, not a broken install.
+
+> **Do not ship a `debugSign` APK.** It is a personal-convenience build only; anyone can re-sign a
+> modified copy with the same public debug key.
 
 **Secret-free build:** pass `-Pxau.embedSecrets=false`. Then `DEFAULT_BASE_URL` / `DEFAULT_TOKEN` /
 `DEFAULT_P12_PASSWORD` / `DEFAULT_ACCOUNT_PASSWORD` compile to `""`, no `client.p12` is packaged, and the

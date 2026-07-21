@@ -399,9 +399,13 @@ echo   deploy.bat [command]
 echo.
 echo     (none) ^| all      build + install + launch          ^<- the hot loop
 echo     build             build + copy APK to Windows, no install
-echo     release           build the SIGNED, secret-free release APK
-echo     release demo      signed release WITH url/token/cert baked in (for a tester)
+echo     release           signed release APK -- url/token/cert BAKED IN (treat like the token)
+echo     release clean     signed release, SECRET-FREE -- the only form safe to hand out
 echo     install           install the existing APK (does NOT build)
+echo.
+echo   A release CANNOT update an installed debug build (different signing key) -- it needs an
+echo   uninstall, which WIPES saved servers + imported certs. To test a release on your own phone
+echo   in place, build it with -Pxau.debugSign=true; see README "Testing a release build".
 echo.
 echo     pair ^<ip:port^> ^<code^>   wireless only, once
 echo     connect ^<ip:port^>       wireless only

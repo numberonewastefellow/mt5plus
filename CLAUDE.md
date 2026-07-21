@@ -20,6 +20,7 @@ The repo root also holds a standalone PWA (`index.html`, `sw.js`) that is not pa
 | Task | Command | Docs |
 |---|---|---|
 | Run the server locally | `XauOrderPad\run.bat` | [XauOrderPad/HOW_TO_RUN.md](XauOrderPad/HOW_TO_RUN.md) |
+| Serve it to the phone on the LAN | `XauOrderPad\start_server.bat` (plain HTTP) or `…\start_server.bat tls` / `start_tls.bat` (encrypted mTLS on 8443, lets the phone add a real account) | [XauOrderPad/HOW_TO_RUN.md](XauOrderPad/HOW_TO_RUN.md) |
 | Build + install the Android app | `android\deploy.bat` | [android/README.md](android/README.md) |
 | Headless API tests (no MT5 needed) | `docker compose -f testing/docker-compose.yml …` | [XauOrderPad/testing/README.md](XauOrderPad/testing/README.md) |
 | Deploy to EC2 | `XauOrderPad\deploy\bat\*.bat` | [XauOrderPad/deploy/README.md](XauOrderPad/deploy/README.md) |
@@ -83,6 +84,47 @@ whoever holds it can issue themselves a certificate the server accepts. Not on t
 **A bulk close that FAILED returns HTTP 200.** `/close_where` answers `{ok: false, remaining: N}`
 with a 200, because it is a well-formed answer rather than a protocol error. Any client that trusts
 the status code will report a failed emergency close as a success. Check the body.
+
+**`/order` takes `sl`/`tp` as POINT DISTANCES, not prices.** `PlaceReq` carries no `sl_tp_mode`, so
+the worker falls back to `config.SL_TP_MODE = "points"`. Posting an absolute price (e.g. `4006.50`)
+is **accepted, not rejected** — it is read as 4006.5 *points*, silently placing a ~$4 stop where $6
+was intended. This shipped once in the rider's PLACE button. Convert with
+**`abs(entry − sl) / point`** on *both* clients, and **refuse to place** if the point size cannot be
+read: a wrong-unit stop is worse than no trade.
+
+**`digits` is NOT a substitute for `point`.** The obvious-looking `× 10^digits` is a second version
+of the same bug, and it shipped too: XAUUSD here is `point = 0.001` (`digits = 3`), and Android's
+`quote.digits ?: 2` fallback turned a $6 stop into **$0.60** — ten times too tight, silently, on a
+live order. `digits` FORMATS numbers; `point` CONVERTS them. `Snapshot.point` is on the wire already
+(`net/Frames.kt`) — use it, and fail closed when it is null. Note `strategy_place` is different again:
+it takes **$/oz distances** and converts internally, so engine code passes `cfg.sl` straight through.
+
+**One engine can now trade a REAL account: the rider, behind `auto_real`.** Every other engine is
+still absolutely demo-only. The gate in `StrategyBase.evaluate` needs **both** `allows_real` (a class
+attribute — the engine was *built* for it) and `wants_real` (the operator's live toggle); either one
+alone does nothing, so a forged `auto_real` param cannot push ladder or straddle onto real money.
+`auto_real` is in `NEVER_RESTORE`: it is saved but **never restored**, so a crash-restart loop cannot
+resume real-money trading unattended. Both switches are re-read **every poll**, so switching MT5 to
+another account changes what the engine may do immediately. Do not "simplify" this into one flag.
+
+## Standards for every change
+
+**Feature parity: the webapp and the Android app ship the same feature.** They are two clients of one
+server, and a feature that exists on only one is a bug report waiting to happen. When a feature needs
+a shared label or decision, **derive it once SERVER-SIDE and send the answer** rather than
+reimplementing the rule in JS and again in Kotlin — then the clients *cannot* drift. The position
+origin badge is the reference example: `Mt5Worker._origin_of` computes `"R"|"L"|"S"|""` and both
+clients just render the letter.
+
+**Enterprise-grade: low latency, and it must never hang.** The MT5 worker is ONE thread polling at
+`config.POLL_HZ = 15` — a **~66 ms budget** per cycle that already contains ~6 MT5 IPC round-trips,
+the state snapshot, every strategy's `evaluate()`, and the P&L guard. Anything added to that path is
+added to every trade decision's latency. So: **no blocking disk IO, no network calls, no extra MT5
+IPC, and no unbounded loops in the poll path.** Heavy work is throttled (see `_compute_stats`, ~1 Hz)
+or moved off it. Prefer data you already hold: the origin badge costs nothing because `magic` and
+`comment` are already on the `TradePosition` object the poll just fetched. And never persist derived
+state you can read back from the broker — a local ledger is one more thing to corrupt, sync and
+clean up, while magic/comment survive restarts for free.
 
 ## Secrets — never commit these
 

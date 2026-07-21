@@ -67,6 +67,8 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
+import log_context
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -75,6 +77,7 @@ from typing import Any, Optional
 def setup_logging(
     app_name: str = "XauOrderPad",
     *,
+    file_prefix: Optional[str] = None,
     log_dir: Optional[Path] = None,
     backup_days: int = 100,
     console: bool = True,
@@ -113,7 +116,17 @@ def setup_logging(
     if any(isinstance(h, DailyDatedRotatingHandler) for h in root.handlers):
         return root
 
+    # `app_name` is the LOGGER NAMESPACE and must stay "XauOrderPad": every module
+    # does logging.getLogger("XauOrderPad.worker") etc., and those are children of
+    # that exact name. Renaming it per instance would leave the handlers on a logger
+    # nothing writes to -- the server would run with NO audit trail at all, silently.
+    # So the per-instance part is a separate FILENAME prefix.
+    prefix = file_prefix or app_name
+
     # Resolve log directory: default to ~/Documents/<app_name>/ on all platforms.
+    # Deliberately keyed on app_name, not the prefix: every instance's log belongs in
+    # ONE directory, distinguished by filename, so a day's trading across all accounts
+    # loads with a single glob.
     if log_dir is None:
         log_dir = Path.home() / "Documents" / app_name
     log_dir = Path(log_dir)
@@ -122,11 +135,22 @@ def setup_logging(
     # File handler — JSONL, daily rotation, dated filename.
     file_handler = DailyDatedRotatingHandler(
         log_dir=log_dir,
-        app_name=app_name,
+        app_name=prefix,
         backup_count=backup_days,
     )
+    # Stamp instance/account onto every record.
+    #
+    # On the HANDLER, not on the logger. Almost every line in this app is logged via a
+    # CHILD logger (getLogger("XauOrderPad.worker") etc.), and Logger.callHandlers walks
+    # the ancestor chain collecting their HANDLERS while skipping their FILTERS -- only
+    # the logger the record was logged through gets its filters applied. A filter on
+    # "XauOrderPad" would therefore stamp nothing except the handful of lines logged
+    # through that exact logger, and would look like it worked.
+    ctx_filter = log_context.ContextFilter()
+
     file_handler.setFormatter(JsonlFormatter())
     file_handler.setLevel(level)
+    file_handler.addFilter(ctx_filter)
     root.addHandler(file_handler)
 
     # Console handler — plain text, for the operator watching the run.bat window.

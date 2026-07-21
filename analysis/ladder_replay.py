@@ -40,26 +40,29 @@ def replay(bid, ask, ms, i0, **kw):
     tick -- an arbitrary entry, with no directional skill. That is the point: this
     measures the ENGINE's cost structure, not anyone's ability to pick a moment.
 
-    Note the `before` snapshot. LadderState.on_tick() empties `entries` as part of
-    emitting exit_all, so the basket must be read BEFORE the action is applied.
-    Reading it after scores a flat book and reports zero loss -- which would make
-    a losing engine look harmless.
+    Every exit action carries the entry price of what it closes, so the P&L is read
+    straight off the action. This replay used to snapshot `entries` BEFORE each
+    on_tick, because on_tick empties the basket as part of emitting exit_all and
+    reading it afterwards scored a flat book -- i.e. reported a losing engine as
+    harmless. That trap is gone from the interface itself now.
     """
     st = LadderState("sell", trigger=bid[i0] + 0.001, target=kw["target"],
-                     retrace=kw["retrace"], max_positions=kw["max_positions"],
+                     max_positions=kw["max_positions"],
+                     max_lots=kw.get("max_lots", 0.0),
+                     volume=kw.get("volume", 0.01),
                      entry_mode=kw.get("entry_mode", "timer"),
                      entry_step=kw.get("entry_step", 0.30),
-                     entry_gap_ms=kw.get("entry_gap_ms", 200))
+                     entry_gap_ms=kw.get("entry_gap_ms", 200),
+                     stop_mode=kw.get("stop_mode", "retrace"),
+                     retrace=kw["retrace"],
+                     floor_offset=kw.get("floor_offset", 0.0))
     pl = 0.0
     for j in range(i0, len(bid)):
-        before = list(st.entries)               # snapshot BEFORE on_tick mutates
         for act in st.on_tick(float(bid[j]), float(ask[j]), int(ms[j])):
-            if act[0] == "exit_one":
-                pl += act[2] - act[1]
-            elif act[0] == "exit_all":
-                exit_px = act[1]
-                for e in before:
-                    pl += e - exit_px
+            if act[0] == "exit_one":                    # (_, rid, exit_px, entry_px)
+                pl += act[3] - act[2]                   # sell: entry - exit
+            elif act[0] == "exit_all":                  # (_, exit_px, why, rungs)
+                pl += sum(e - act[1] for _, e in act[3])
         if st.done:
             return pl, st.n_taken
     return pl, st.n_taken

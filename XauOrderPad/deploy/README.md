@@ -158,6 +158,24 @@ python mt5_ec2.py caddy
 Then upload the new `ca.crt` + `client.p12` in the app's Settings. `--force` is required precisely
 because a silent regeneration would strand the phone with an identity the server no longer accepts.
 
+### A second cert for a LOCAL LAN box (does not touch this deployment)
+
+`make_certs.py` can mint a **second server cert** — for a laptop running the order pad on the LAN —
+that reuses **this same CA**, so the phone authenticates to both with **one** `client.p12`:
+
+```powershell
+python make_certs.py --ip 192.168.0.116 --server-only --out certs-lan
+```
+
+`--server-only` reuses the existing `ca.crt`/`ca.key`, writes **only** `server.crt`/`server.key`, and
+**never touches** the CA or `client.p12` (the box's material is unchanged). It refuses to write into
+`certs/`, and the output lands in `certs-lan/` — so `ship` (which copies only `deploy/certs/`) can
+never send it to the box. Belt-and-braces: **`ship` now refuses outright if `certs/server.crt`'s SAN
+is a private IP**, so you cannot accidentally hand the box the LAN cert.
+
+The local run flow (mode switch, Caddy on the laptop, phone URL) lives in
+**[../HOW_TO_RUN.md](../HOW_TO_RUN.md)** under *Encrypted LAN (TLS)* — it is not repeated here.
+
 ---
 
 ## Take it down
@@ -328,6 +346,7 @@ what makes the deployment fail closed.
 | HTTP 200 but `bid`/`ask` are `null` | Terminal running but **not logged in** | Log in via the UI. `initialize()` → `(-10005, 'IPC timeout')` is the signature. |
 | SSH / RDP hang | Your home IP changed | `fixfw.bat`, or just `start.bat` (self-heals) |
 | `InvalidInstanceID.NotFound` | `state.json` points at a terminated instance | Delete `state.json`, then `create.bat` |
+| `ship`: *"REFUSING TO SHIP … a PRIVATE address"* | `certs/server.crt` is the **LAN** cert, not the box's | Re-mint the box cert: `make_certs.py --ip <elastic ip>`. The LAN cert belongs in `certs-lan/` (see *A second cert for a LOCAL LAN box*). |
 | Server vanished after you disconnected SSH | It wasn't started as the Scheduled Task | `Start-ScheduledTask -TaskName xauorderpad` |
 | `curl` through the tunnel returns `000` | Raced the SSH forward coming up | Retry |
 | Buy/Sell return 401 | The UI has no token, or a stale one | Reload the pad — it prompts. Or clear it: `localStorage.removeItem('xop.token')`. Check `XAUORDERPAD_TOKEN` on the box matches. **Do not "fix" this by blanking `API_TOKEN`** on a non-loopback bind — that publishes an unauthenticated trading API. |

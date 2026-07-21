@@ -66,6 +66,17 @@ val devAccountPassword = devDefault("xau.defaultAccountPassword", "XAU_DEFAULT_A
 // The signature stops someone RE-signing a modified APK as us; it does NOT hide a baked-in string.
 val embedSecrets = (project.findProperty("xau.embedSecrets") as String?)?.toBoolean() ?: true
 
+// Personal-convenience escape hatch: sign the RELEASE variant with the DEBUG key. Android only
+// updates an installed app IN PLACE when the new APK carries the SAME signing key; a debug build
+// and a real-release build have different keys, so switching between them normally forces an
+// uninstall -- which WIPES app data (saved server list, imported certs, UI prefs). With
+// `-Pxau.debugSign=true` the release is signed with the debug key instead, so `adb install -r`
+// updates the already-installed debug build in place and keeps every bit of that data.
+//
+// OFF by default: a normal `assembleRelease` keeps the real release identity. This is NOT for
+// distribution -- a debug-signed APK carries the world-known debug signature, not ours.
+val debugSign = (project.findProperty("xau.debugSign") as String?)?.toBoolean() ?: false
+
 android {
     namespace = "com.xauorderpad"
     compileSdk = 36
@@ -116,7 +127,10 @@ android {
             // R8 off: ~15 files, nothing meaningful to shrink, and it only adds a way for
             // kotlinx.serialization's generated serializers to get stripped.
             isMinifyEnabled = false
-            if (hasSigning) signingConfig = signingConfigs.getByName("release")
+            // Debug key when -Pxau.debugSign=true (in-place update over an installed debug build,
+            // no data wipe); otherwise the real release key when it is configured.
+            if (debugSign) signingConfig = signingConfigs.getByName("debug")
+            else if (hasSigning) signingConfig = signingConfigs.getByName("release")
 
             // EMPTY unless -Pxau.embedSecrets=true. A signed release APK with a live trading token
             // compiled into it is a secret that cannot be rotated: anyone holding the APK can

@@ -129,7 +129,19 @@ class StrategyBase:
         """
         rec = state.load(self.ID)
         if rec and rec.get("params"):
-            self._apply(rec["params"])        # restore tuning either way
+            saved = dict(rec["params"])
+            # NEVER_RESTORE: real-money switches boot OFF, always. A restart loop that
+            # restored them would resume spending real money with nobody watching --
+            # the same failure the RE-ARM ONLY IF FRESH rule below exists to prevent,
+            # except a stale-state check cannot help here: the danger is not that the
+            # state is old, it is that no human is present to consent to it again.
+            dropped = {k: saved.pop(k) for k in self.NEVER_RESTORE if k in saved}
+            self._apply(saved)                # restore tuning either way
+            if any(dropped.values()):
+                log.warning("strategy %s: %s did NOT resume after restart -- re-arm by hand",
+                            self.ID, ", ".join(sorted(k for k, v in dropped.items() if v)),
+                            extra={"event": "strategy_not_restored", "strategy": self.ID,
+                                   "dropped": dropped})
 
         try:
             positions = self.positions(worker)
@@ -213,11 +225,24 @@ class StrategyBase:
         # Refuse and auto-disable on anything but a demo account. This is the
         # gate that survives a mid-session account switch: it is re-checked on
         # EVERY poll, not once at enable time.
+        #
+        # An engine may opt OUT of this, but only by declaring BOTH `allows_real`
+        # (a property of the engine's code -- it has been built to run real money)
+        # and `wants_real` (a property of the operator's live choice -- they turned
+        # a named toggle on). Two independent conditions, because either one alone
+        # is an accident waiting to happen: shipping `allows_real` should not arm
+        # anything, and a toggle should not be able to arm an engine that was never
+        # written for it. Default is False/False, so ladder and straddle keep the
+        # absolute demo-only behaviour they have always had.
         if not acc.get("is_demo", False):
-            self._disable_with("refused: connected account is NOT a demo account")
-            return
+            if not (self.allows_real and self.wants_real):
+                self._disable_with("refused: connected account is NOT a demo account")
+                return
         if self.needs_hedging and int(acc.get("margin_mode", -1)) != 2:
-            self._disable_with("refused: account is netting — this strategy needs hedging")
+            # ASCII only -- see the note in update(). This refusal is now reachable for
+            # the ladder (needs_hedging went True when rungs stopped being one-at-a-time),
+            # so it is a line an operator will actually read on the console.
+            self._disable_with("refused: account is netting -- this strategy needs hedging")
             return
         if self._killed:
             self._state = "killed"
@@ -232,6 +257,22 @@ class StrategyBase:
 
     # ---- shared safety ----------------------------------------------------
     needs_hedging = False
+
+    # Has this engine been BUILT to run on a real account? A code property, set by
+    # the class, never by a request. False here means the demo gate in evaluate()
+    # is absolute no matter what params arrive.
+    allows_real = False
+
+    # Params that are saved but deliberately NOT restored on (re)start -- see
+    # reconcile(). For anything that spends real money, "off until a human says so"
+    # is the only safe boot state.
+    NEVER_RESTORE: frozenset = frozenset()
+
+    @property
+    def wants_real(self) -> bool:
+        """Has the OPERATOR asked for real-account execution, right now? Engines that
+        offer it override this with their own toggle."""
+        return False
 
     def _disable_with(self, msg: str) -> None:
         if self.enabled or self._managing or self._error != msg:
@@ -253,7 +294,18 @@ class StrategyBase:
     def _check_kill(self, worker) -> bool:
         """Realized + floating below the limit -> flatten this engine's book and
         latch off. Floating is included deliberately: waiting for a loss to be
-        REALIZED before reacting to it is how a kill-switch arrives too late."""
+        REALIZED before reacting to it is how a kill-switch arrives too late.
+
+        Throttled to ~1 Hz. `strategy_daily_realized` pulls the WHOLE day's deal
+        history over MT5 IPC (`history_deals_get`) -- mt5_worker itself labels that
+        "heavy, on-demand only" -- and this ran on every poll, for every enabled
+        engine: 15x/sec each, growing all day as deals accumulate. This is a
+        DAILY-loss guard; the extra 14 checks per second bought nothing but latency
+        on the same thread that has to fill orders. Same idiom, and the same reason,
+        as the account-stats throttle in `Mt5Worker._poll_state`.
+        """
+        if worker.poll_count % max(1, config.POLL_HZ) != 1:
+            return False
         try:
             realized = float(worker.strategy_daily_realized(self.MAGIC))
             floating = sum(float(getattr(p, "profit", 0.0))

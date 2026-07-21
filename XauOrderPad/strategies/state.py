@@ -28,18 +28,22 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
+
+import instance_paths
 
 log = logging.getLogger("XauOrderPad.strategy")
 
 
 def _path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    d = Path(base) / "XauOrderPad"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "strategies.json"
+    # PER-INSTANCE, and this is the one that matters most. `save()` below is a
+    # read-modify-write with no cross-process lock, so a shared file means instance
+    # A's `enabled` flag is read by instance B on boot -- and B then resumes that
+    # engine against ITS OWN account. Inside LADDER_RESUME_MAX_AGE_S that re-arms
+    # new entries, i.e. an engine trading an account nobody aimed it at.
+    # Unset XAUORDERPAD_INSTANCE -> the original shared path, unchanged.
+    return instance_paths.state_dir() / "strategies.json"
 
 
 def load_all() -> dict:

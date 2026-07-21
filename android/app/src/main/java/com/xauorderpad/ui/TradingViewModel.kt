@@ -11,6 +11,7 @@ import com.xauorderpad.net.ApiResult
 import com.xauorderpad.net.HistoryResponse
 import com.xauorderpad.net.Link
 import com.xauorderpad.net.Profile
+import com.xauorderpad.net.RiderCard
 import com.xauorderpad.net.Snapshot
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toImmutableList
@@ -29,6 +30,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import java.math.BigDecimal
 import java.math.RoundingMode
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.round
 
@@ -132,7 +134,7 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
     // and nothing else.
 
     val quote: StateFlow<Quote> = feed
-        .map { Quote(it?.bid, it?.ask, it?.spreadPoints, it?.digits) }
+        .map { Quote(it?.bid, it?.ask, it?.spreadPoints, it?.digits, it?.point) }
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, Quote())
 
@@ -925,8 +927,20 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
                     when {
                         enabled == true && !s.enabled ->
                             say(s.error ?: "$id refused to arm", error = true)
-                        enabled == true ->
-                            say("${s.name} armed" + if (s.paper == true) " (PAPER — no orders)" else " — LIVE ORDERS", error = false)
+                        // Say what arming this engine ACTUALLY did. Deriving it from `paper` alone
+                        // told the rider — which places nothing until an auto switch is on — that
+                        // it had just gone LIVE ORDERS, because it has no `paper` field to read.
+                        // A false safety message in the dangerous direction is worse than none.
+                        enabled == true -> say(
+                            "${s.name} armed" + when {
+                                s.execution == "AUTO-REAL" -> " — AUTO-TRADING WITH REAL MONEY"
+                                s.execution == "auto-demo" -> " — auto-trading on demo"
+                                s.execution == "suggest" -> " (suggestions only — no orders)"
+                                s.paper == true -> " (PAPER — no orders)"
+                                else -> " — LIVE ORDERS"
+                            },
+                            error = false,
+                        )
                         enabled == false -> say("${s.name} disabled", error = false)
                         else -> say("${s.name} updated", error = false)
                     }
@@ -1056,6 +1070,116 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
             }
         } finally {
             // finally, not a trailing assignment: a throw in between must not leak the counter.
+            _inFlight.value -= 1
+        }
+    }
+
+    /**
+     * Place the rider's CURRENT suggestion, as a normal market order.
+     *
+     * ── This is a HUMAN trigger, and only a human trigger ──
+     * The rider engine is `suggestion_only`: it publishes a card and places nothing, ever. This
+     * function is reached from exactly one place -- the confirm dialog behind the PLACE button on
+     * the rider page. There is no auto-fire, no retry-that-replaces, and no background caller.
+     * It goes down the SAME /order path as BUY/SELL, so every server-side guard still applies.
+     *
+     * ── The unit conversion is the whole risk here ──
+     * `Feed.api.order` takes sl/tp as POINT DISTANCES (the server hardcodes sl_tp_mode="points").
+     * The card carries ABSOLUTE PRICES. Posting the price through unconverted is ACCEPTED by the
+     * broker, not rejected: it just attaches a stop miles from the market. The web UI shipped
+     * exactly that bug, which is why the conversion lives here and not at the call site.
+     *
+     * [point] is the broker's own `symbol_info.point`, and this takes it INSTEAD of `digits`
+     * deliberately. The first version divided by `10^digits` with callers defaulting to
+     * `digits = 2` — but this feed is `point = 0.001` (digits 3), so any moment the snapshot
+     * had not arrived, a $6.00 stop went out as 600 points = $0.60. Ten times too tight, silently,
+     * on a real order. There is no safe default for this number: if the broker has not said what
+     * a point is, we do not place. Same rule as the web client.
+     */
+    fun placeRiderCard(card: RiderCard, point: Double?) = viewModelScope.launch {
+        // Only an "enter" card has a side and a lot. A close/flat/hold card is not a trade.
+        if (!card.isActionable) {
+            say("No active trade suggestion right now", error = true)
+            return@launch
+        }
+
+        // Same guards, same order as placeOrder(): staleness first, because `health` is derived
+        // from a snapshot that may itself be frozen and would happily report "healthy".
+        if (!live.value) {
+            say("Feed is stale — price may have moved. Reconnecting…", error = true)
+            return@launch
+        }
+        val h = health.value
+        if (!h.healthy) {
+            say(h.error ?: "Not connected to the broker", error = true)
+            return@launch
+        }
+
+        // Lot: the same snapping the typed form gets. The broker rejects a volume that is not an
+        // exact multiple of volume_step with an opaque INVALID_VOLUME (10014), and the card's lot
+        // is computed server-side from risk, so it is exactly the kind of number that lands
+        // between steps.
+        val l = limits.value
+        val raw = card.lot
+        if (raw == null || raw <= 0.0) { say("Suggestion has no lot size", error = true); return@launch }
+        if (raw < l.volumeMin) {
+            say("Suggested lot ${Fmt.lot(raw)} is below the minimum ${Fmt.lot(l.volumeMin)}", error = true)
+            return@launch
+        }
+        val lot = snapToStep(raw, l)
+
+        // Direction is the one thing that must never be guessed. Anything that is not an explicit
+        // buy/sell aborts rather than defaulting to a side.
+        val side = card.side?.trim()?.lowercase().orEmpty()
+        if (side != "buy" && side != "sell") {
+            say("Suggestion has no usable side — not sent", error = true)
+            return@launch
+        }
+
+        // No entry price => no way to turn the stops into distances. ABORT rather than send an
+        // order with a wrong-unit (or absent) stop attached to it.
+        val entry = card.entry
+        if (entry == null || entry <= 0.0) {
+            say("Suggestion has no entry price — cannot convert its stops. Nothing was sent.", error = true)
+            return@launch
+        }
+
+        // PRICES -> POINTS, using the broker's actual point size. Refuse if we do not have
+        // it: a wrong-unit stop on a live order is worse than no trade, and every wrong
+        // answer here is wrong by a factor of ten.
+        if (point == null || point <= 0.0) {
+            say("Cannot read the symbol's point size — nothing was sent.", error = true)
+            return@launch
+        }
+        // A null/0.0 leg means "no stop", which the server reads as 0.
+        val slPoints = if (card.sl != null && card.sl != 0.0) abs(entry - card.sl) / point else 0.0
+        val tpPoints = if (card.tp != null && card.tp != 0.0) abs(card.tp - entry) / point else 0.0
+
+        _inFlight.value += 1
+        val e = Feed.epoch
+        try {
+            when (val r = Feed.api.order(side, lot, slPoints, tpPoints)) {
+                is ApiResult.Ok -> Unit   // filled -> it shows up in the grid (with an "R" badge)
+                is ApiResult.Unauthorized -> onUnauthorized(e)
+
+                // A timeout is NOT a rejection -- same reasoning as placeOrder. The order may well
+                // have filled while we stopped listening, and "failed" would invite a second tap
+                // that fills too. The grid is the only authority on what exists.
+                is ApiResult.TimedOut -> say(
+                    "TIMED OUT — the ${side.uppercase()} may still have FILLED. " +
+                        "Check the positions grid before retrying.",
+                    error = true,
+                )
+
+                is ApiResult.Failed -> {
+                    val extra = r.comment
+                        ?.takeIf { it.isNotBlank() && !it.equals(r.message, ignoreCase = true) }
+                        ?.let { " — $it" }
+                        .orEmpty()
+                    say("${r.message}$extra", error = true)
+                }
+            }
+        } finally {
             _inFlight.value -= 1
         }
     }

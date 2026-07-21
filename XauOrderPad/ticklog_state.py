@@ -14,18 +14,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
+
+import instance_paths
 
 log = logging.getLogger("XauOrderPad.worker")
 
 
 def _path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
-    d = Path(base) / "XauOrderPad"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "ticklog.json"
+    # Per-instance: this is a persisted DEFAULT that seeds the worker at boot, so a
+    # shared file would let one account's operator silently turn tick logging on (or
+    # off) for every other instance on the machine.
+    return instance_paths.state_dir() / "ticklog.json"
 
 
 def load() -> dict:

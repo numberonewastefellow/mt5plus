@@ -1,8 +1,13 @@
 package com.xauorderpad
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Typeface
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Bundle
@@ -11,6 +16,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -22,6 +33,9 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
@@ -30,6 +44,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xauorderpad.data.Feed
 import com.xauorderpad.net.Link
+import com.xauorderpad.net.RiderCard
 import com.xauorderpad.svc.FeedService
 import com.xauorderpad.ui.AccountsScreen
 import com.xauorderpad.ui.CertsScreen
@@ -44,6 +59,7 @@ import com.xauorderpad.ui.StrategiesScreen
 import com.xauorderpad.ui.StrategyScreen
 import com.xauorderpad.ui.TradeScreen
 import com.xauorderpad.ui.TradingViewModel
+import com.xauorderpad.ui.WelcomeScreen
 import kotlinx.serialization.json.JsonObject
 
 // Upper bound on the system Font-Size multiplier the app will honour. The trade panel is a dense,
@@ -63,6 +79,27 @@ class MainActivity : ComponentActivity() {
         // targetSdk 36 ENFORCES edge-to-edge. Without this (and without handing the Scaffold's
         // insets to every screen below) content renders under the status and navigation bars.
         enableEdgeToEdge()
+
+        // Cross-dissolve the system splash (a gold ring on the Om! dark ground -- see themes.xml)
+        // into the "Om!" welcome that draws immediately behind it, rather than a hard cut. The
+        // splash fades over ~450 ms while the welcome's gold emblem is still scaling in, so a cold
+        // start reads as one continuous gold-on-black brand moment. Platform API (getSplashScreen),
+        // available since API 31; minSdk is 34, so no version guard is needed.
+        splashScreen.setOnExitAnimationListener { splashView: android.window.SplashScreenView ->
+            splashView.animate()
+                .alpha(0f)
+                .setDuration(450L)
+                .withEndAction { splashView.remove() }
+                .start()
+        }
+
+        // Show the "Om!" identity in the Recents / task-switcher card too: a gold ॐ on the app's
+        // dark ground, drawn at runtime (there is no static ॐ drawable). This affects ONLY the
+        // recents card — the home-screen launcher icon (the candlesticks) is left untouched. The
+        // Bitmap constructor is the only form that takes a runtime bitmap; the Builder wants a
+        // drawable resource, which a rendered glyph is not.
+        @Suppress("DEPRECATION")
+        setTaskDescription(ActivityManager.TaskDescription("Om!", omRecentsIcon()))
 
         // Feed.init() builds Secrets, which is now plain SharedPreferences rather than
         // EncryptedSharedPreferences -- a few ms of disk instead of 50-200 ms of Keystore +
@@ -130,12 +167,17 @@ class MainActivity : ComponentActivity() {
 
                 val snackbar = remember { SnackbarHostState() }
 
-                // A trader watching a quote must not have the screen time out mid-trade -- but
-                // there is no reason to hold the screen awake on the Connect or Login screens.
+                // The screen must NEVER time out while the app is open -- on every screen, not just
+                // TRADE. It used to be TRADE-only, which meant the display could lock while you were
+                // reading the history page, tuning a strategy, or part-way through typing broker
+                // credentials on the account screen -- and coming back from a lock costs an unlock
+                // plus a reconnect on a screen whose whole point is to be glanceable.
+                //
+                // This is free in the background: Android only honours FLAG_KEEP_SCREEN_ON while
+                // this window is actually visible, and drops it the instant the app is backgrounded
+                // or the activity is destroyed. It cannot hold the device awake behind your back.
                 DisposableEffect(screen) {
-                    val keepAwake = screen == Screen.TRADE
-                    if (keepAwake) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
                     // FLAG_SECURE on the screens where a secret is typed or shown: the account
                     // screen (broker password, account numbers) and the certificates screen (the
@@ -234,9 +276,21 @@ class MainActivity : ComponentActivity() {
                         val onOpenStrategy: (String) -> Unit = { vm.openStrategy(it) }
                         val onSetStrategy: (String, Boolean?, JsonObject) -> Unit =
                             { id, en, params -> vm.setStrategy(id, en, params) }
+                        // The rider's PLACE tap. It reaches the ViewModel ONLY from the confirm
+                        // dialog on the rider page. The second argument is the broker's POINT
+                        // SIZE (not digits): the card carries absolute prices and /order wants
+                        // point distances, and `point` is the only number that converts between
+                        // them correctly on this symbol. Null => the ViewModel refuses to send.
+                        val onPlaceRiderCard: (RiderCard, Double?) -> Unit =
+                            { card, point -> vm.placeRiderCard(card, point) }
                     }
                 }
 
+                // Shown once per cold launch; rememberSaveable so a config change / recreation
+                // does not replay it. Purely an overlay flag — see the AnimatedVisibility below.
+                var showWelcome by rememberSaveable { mutableStateOf(true) }
+
+                Box(Modifier.fillMaxSize()) {
                 Scaffold(snackbarHost = { SnackbarHost(snackbar) }) { pad ->
                     // EVERY screen gets the insets, not just Trade. Under enforced edge-to-edge
                     // the others would otherwise render beneath the status bar.
@@ -354,7 +408,11 @@ class MainActivity : ComponentActivity() {
                             s = strategy,
                             quote = quote,
                             live = live,
+                            // This page can arm real-money execution, so it has to state which
+                            // account the server is actually on.
+                            health = health,
                             onSet = callbacks.onSetStrategy,
+                            onPlaceCard = callbacks.onPlaceRiderCard,
                             onBack = callbacks.onBackToStrategies,
                             modifier = inset,
                         )
@@ -381,9 +439,47 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
+
+                // The launch/welcome overlay sits ON TOP of the app and fades away once its short
+                // timeline ends (or the user taps to skip). It is purely presentational — no
+                // ViewModel, navigation, or trade state is touched — so it cannot affect trading.
+                AnimatedVisibility(
+                    visible = showWelcome,
+                    enter = EnterTransition.None,
+                    exit = fadeOut(tween(600)),
+                ) {
+                    WelcomeScreen(onFinished = { showWelcome = false })
+                }
+                }
             }
             }
         }
+    }
+
+    /**
+     * A gold ॐ on the app's #101214 ground, for the Recents task-switcher card. Rendered at runtime
+     * because the glyph has no static drawable; the system's font fallback supplies the Devanagari
+     * ॐ just as Compose's Text does on the welcome screen.
+     */
+    private fun omRecentsIcon(): Bitmap {
+        val size = 192
+        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+
+        val ground = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF101214.toInt() }
+        val corner = size * 0.22f
+        canvas.drawRoundRect(0f, 0f, size.toFloat(), size.toFloat(), corner, corner, ground)
+
+        val glyph = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFE7B94D.toInt()          // the same gold as the welcome emblem
+            textAlign = Paint.Align.CENTER
+            textSize = size * 0.6f
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        // Vertically centre on the text's own metrics, not the baseline.
+        val fm = glyph.fontMetrics
+        canvas.drawText("ॐ", size / 2f, size / 2f - (fm.ascent + fm.descent) / 2f, glyph)
+        return bmp
     }
 
     /**

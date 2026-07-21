@@ -46,11 +46,24 @@ All three were found by *running* things.
 ```bash
 cd XauOrderPad
 docker compose -f testing/docker-compose.yml up -d --build
-docker compose -f testing/docker-compose.yml exec tests pytest -v testing/test_endpoints.py
+docker compose -f testing/docker-compose.yml exec tests pytest -v testing/
 ```
 
 The source tree is bind-mounted, so edits to `server.py` or the tests are picked up without
 an image rebuild.
+
+| File | What it is |
+|---|---|
+| `conftest.py` | the shared rig: **one** fake-broker server for the session, plus the per-test reset |
+| `test_endpoints.py` | the HTTP/WS surface — auth, framing, ordering, the close paths |
+| `test_ladder_engine.py` | the Trend-Ladder driven through the real server: guards, caps, the batched flush, the re-arm latch |
+| `test_ladder_state.py` | `LadderState` alone — pure decision logic, no broker, no server |
+
+**Fixtures belong in `conftest.py`, never imported between test modules.** pytest registers a
+fixture per module namespace, so `from test_endpoints import live_server` creates a *second*
+definition with its own cache — a second uvicorn racing the first for the port. Every test
+still passes and each file passes alone; the only symptom is a stray
+`PytestUnhandledThreadException`. It cost an afternoon once already.
 
 ## What it covers
 

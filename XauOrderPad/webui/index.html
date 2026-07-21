@@ -478,6 +478,7 @@
     <div class="strat-tabs">
       <button class="strat-tab on" id="tabStraddle" data-panel="straddlePanel">STRADDLE</button>
       <button class="strat-tab"    id="tabLadder"   data-panel="ladderPanel">LADDER</button>
+      <button class="strat-tab"    id="tabRider"    data-panel="riderPanel">RIDER</button>
     </div>
 
     <div class="modal-body" id="straddlePanel">
@@ -588,13 +589,28 @@
         <input id="ldTarget" type="number" min="0.01" step="0.05" value="1.00">
       </div>
       <div class="set-row">
-        <label>Retrace stop ($/oz from the extreme)</label>
+        <label>Stop type</label>
+        <select id="ldStopMode">
+          <option value="retrace">Trail the extreme (tightens as it runs)</option>
+          <option value="floor">Floor at the trigger (fixed level)</option>
+        </select>
+      </div>
+      <div class="set-row">
+        <label>…retrace ($/oz from the extreme)</label>
         <input id="ldRetrace" type="number" min="0.01" step="0.05" value="0.30">
+      </div>
+      <div class="set-row">
+        <label>…or floor offset ($/oz beyond the trigger) <span class="spread-hint" id="ldFloorHint"></span></label>
+        <input id="ldFloorOffset" type="number" min="0" step="0.05" value="0.00">
       </div>
 
       <div class="set-row">
-        <label>Max positions <span class="spread-hint">(&gt;1 multiplies the spread cost)</span></label>
-        <input id="ldMaxPos" type="number" min="1" max="20" step="1" value="1">
+        <label>Max positions <span class="spread-hint">(0 = uncapped; &gt;1 multiplies the spread cost)</span></label>
+        <input id="ldMaxPos" type="number" min="0" max="2000" step="1" value="1">
+      </div>
+      <div class="set-row">
+        <label>Max total lots <span class="spread-hint">(0 = uncapped — set this before running uncapped)</span></label>
+        <input id="ldMaxLots" type="number" min="0" step="0.01" value="0.00">
       </div>
       <div class="set-row">
         <label>Entry spacing</label>
@@ -620,17 +636,110 @@
         <label>Daily-loss kill-switch (USD)</label>
         <input id="ldMaxLoss" type="number" min="0" step="10" value="200">
       </div>
+      <div class="set-row">
+        <label>Cooldown between ladders (s) <span class="spread-hint">(0 = none)</span></label>
+        <input id="ldCooldown" type="number" min="0" step="5" value="0">
+      </div>
+      <div class="set-row">
+        <label>Max ladders per day <span class="spread-hint">(0 = unlimited)</span></label>
+        <input id="ldMaxLadders" type="number" min="0" step="1" value="0">
+      </div>
 
       <div class="autotest-status" id="ladderStatus">
         <div class="kv"><div class="atk">State</div>          <div class="atv" id="ldState">disabled</div></div>
         <div class="kv"><div class="atk">Open positions</div> <div class="atv" id="ldOpen">0</div></div>
+        <div class="kv"><div class="atk">Open lots</div>      <div class="atv" id="ldOpenLots">0.00</div></div>
         <div class="kv"><div class="atk">Ladders done</div>   <div class="atv" id="ldDone">0</div></div>
+        <div class="kv"><div class="atk">…today</div>         <div class="atv" id="ldToday">0</div></div>
         <div class="kv"><div class="atk">Paper P&amp;L ($/oz)</div><div class="atv" id="ldPaperPl">0.000</div></div>
         <div class="kv"><div class="atk">Paper trades</div>   <div class="atv" id="ldPaperTrades">0</div></div>
         <div class="kv"><div class="atk">Live spread</div>    <div class="atv" id="ldSpread">—</div></div>
+        <!-- What the dialled stop ACTUALLY costs, and where the floor sits. Both are
+             computed SERVER-SIDE so this panel and the Android app cannot disagree. -->
+        <div class="kv"><div class="atk">Effective stop</div> <div class="atv" id="ldEffStop">—</div></div>
+        <div class="kv"><div class="atk">Floor price</div>    <div class="atv" id="ldFloorPx">—</div></div>
       </div>
       <div class="autotest-verdict" id="ldWarn" hidden></div>
       <div class="autotest-verdict" id="ldError" hidden></div>
+    </div>
+
+    <!-- ===================== VOL-REGIME RIDER (paper / suggestion) ===================== -->
+    <div class="modal-body" id="riderPanel" hidden>
+      <div class="set-note" style="margin-bottom:10px">
+        A <b>suggestion engine</b>: when volatility is present (M5 ATR above its median) and a
+        <b>thrust</b> fires (a big candle), it surfaces a <b>TRADE&nbsp;NOW</b> card in the candle's
+        direction with a Kelly-small lot and a trailing-stop plan. <b>It places NO orders</b> — you
+        tap <b>Place</b> to send it through the normal order path.
+        <br><br>
+        <b>Honest status:</b> the edge is <b>marginal</b> (backtested +$0.585/oz over random, but the
+        confidence interval includes zero) and <b>regime-dependent</b> (it needs volatility; a calm
+        market bleeds). The paper P&amp;L below is the <b>forward-test record</b> — watch it before you
+        trust it. <b>Demo only.</b> See <code>analysis/eda/RIDER.md</code>.
+      </div>
+
+      <div class="set-row toggle">
+        <label><b>Enable rider</b> (computes cards + the paper record)</label>
+        <input type="checkbox" id="rdEnabled">
+      </div>
+
+      <!-- EXECUTION. Two switches, one per account class, both OFF by default. With both
+           off the engine only ever publishes the card below and you tap Place. They are
+           separate on purpose: "I trust it on demo" and "I trust it with my money" are
+           different decisions, and folding them into one control makes the second one
+           happen by accident. Re-read on every poll, so switching MT5 to another account
+           changes what this engine may do immediately. -->
+      <div class="set-row toggle">
+        <label><b>Auto-trade on DEMO</b> — places by itself while on a demo account</label>
+        <input type="checkbox" id="rdAutoDemo">
+      </div>
+      <div class="set-row toggle">
+        <label><b style="color:#e0664f">Auto-trade on REAL</b> — places by itself with REAL money.
+          Never resumes on its own after a restart.</label>
+        <input type="checkbox" id="rdAutoReal">
+      </div>
+
+      <!-- The live TRADE-NOW card. Shown only on an actionable 'enter' suggestion. -->
+      <div id="rdCard" hidden
+           style="border:1px solid #2fa572;border-radius:8px;padding:10px;margin:8px 0;background:rgba(47,165,114,.10)">
+        <div style="font-size:15px"><b id="rdCardSide">—</b> <span id="rdCardLot"></span> lot</div>
+        <div style="margin:4px 0 8px;font-size:13px">
+          entry ~<span id="rdCardEntry">—</span> · SL <span id="rdCardSl">—</span> · TP <span id="rdCardTp">—</span>
+          <div id="rdCardReason" style="opacity:.8;margin-top:2px"></div>
+        </div>
+        <button class="btn primary" id="rdPlace">PLACE THIS TRADE</button>
+      </div>
+      <div class="set-note" id="rdCardIdle">No trade signalled right now — waiting for a thrust in a high-vol regime.</div>
+
+      <div class="set-row"><label>Thrust size (× ATR)</label>
+        <input id="rdThrust" type="number" min="0.5" step="0.25" value="1.5"></div>
+      <div class="set-row"><label>Stop ($/oz)</label>
+        <input id="rdSl" type="number" min="1" step="0.5" value="6"></div>
+      <div class="set-row"><label>Trailing ($/oz)</label>
+        <input id="rdTrail" type="number" min="0" step="0.5" value="6"></div>
+      <div class="set-row"><label>Far target ($/oz)</label>
+        <input id="rdTp" type="number" min="1" step="1" value="50"></div>
+      <div class="set-row"><label>Max hold (M5 bars)</label>
+        <input id="rdMaxHold" type="number" min="1" step="1" value="24"></div>
+      <div class="set-row"><label>Regime window (bars, ATR median)</label>
+        <input id="rdAtrWin" type="number" min="20" step="10" value="100"></div>
+      <div class="set-row toggle"><label>NY hours only (13–16 UTC)</label>
+        <input type="checkbox" id="rdNy"></div>
+      <div class="set-row"><label>Risk per trade (fraction of equity)</label>
+        <input id="rdRisk" type="number" min="0.001" max="0.1" step="0.001" value="0.01"></div>
+      <div class="set-row"><label>Daily-loss kill-switch (USD)</label>
+        <input id="rdMaxLoss" type="number" min="0" step="10" value="200"></div>
+
+      <div class="autotest-status" id="riderStatus">
+        <div class="kv"><div class="atk">State</div>             <div class="atv" id="rdState">disabled</div></div>
+        <div class="kv"><div class="atk">Execution</div>         <div class="atv" id="rdExec">suggest</div></div>
+        <div class="kv"><div class="atk">Live ticket</div>       <div class="atv" id="rdLiveTicket">—</div></div>
+        <div class="kv"><div class="atk">Live stop</div>         <div class="atv" id="rdLiveStop">—</div></div>
+        <div class="kv"><div class="atk">In paper position</div> <div class="atv" id="rdInPos">no</div></div>
+        <div class="kv"><div class="atk">Paper P&amp;L ($/oz)</div><div class="atv" id="rdPaperPl">0.00</div></div>
+        <div class="kv"><div class="atk">Paper P&amp;L (USD)</div> <div class="atv" id="rdPaperUsd">0.00</div></div>
+        <div class="kv"><div class="atk">Paper trades</div>      <div class="atv" id="rdPaperTrades">0</div></div>
+      </div>
+      <div class="autotest-verdict" id="rdError" hidden></div>
     </div>
 
     <div class="modal-foot">

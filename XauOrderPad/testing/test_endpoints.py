@@ -13,9 +13,7 @@ Read testing/README.md first. This fakes a broker.
 from __future__ import annotations
 
 import json
-import logging
 import os
-import threading
 import time
 
 import httpx
@@ -27,114 +25,16 @@ import MetaTrader5 as stub          # the fake one, first on PYTHONPATH
 import config
 import server                       # the REAL server module
 
-PORT = 8766                         # never 8765 -- the real server lives there
-BASE = f"http://127.0.0.1:{PORT}"
-TOKEN = "test-token-do-not-use-in-prod"
-
-# The stub self-identifies, so an accidental run against a real broker is impossible to miss.
-assert stub.__version__.endswith("STUB")
-
-
-# ---------------------------------------------------------------- server lifecycle
-
-class _LogCapture(logging.Handler):
-    """Capture uvicorn.access records AFTER filters run, so we can prove the token was
-    redacted on the real logging path rather than by re-implementing the regex here."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.lines: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            self.lines.append(record.getMessage())
-        except Exception:
-            pass
-
-
-ACCESS_LOG = _LogCapture()
-
-
-@pytest.fixture(scope="session", autouse=True)
-def live_server():
-    import uvicorn
-
-    config.LAUNCH_BROWSER = False       # would otherwise hunt for Chrome in the container
-    config.API_TOKEN = ""               # individual tests flip this; _check_token reads it live
-
-    cfg = uvicorn.Config(server.app, host="127.0.0.1", port=PORT,
-                         log_level="info", access_log=True)
-    srv = uvicorn.Server(cfg)
-    t = threading.Thread(target=srv.run, daemon=True)
-    t.start()
-
-    for _ in range(100):                # wait for startup (lifespan starts the worker thread)
-        try:
-            httpx.get(f"{BASE}/api/config", timeout=0.5)
-            break
-        except Exception:
-            time.sleep(0.1)
-    else:
-        raise RuntimeError("stub server never came up")
-
-    # Attach the capture handler AFTER uvicorn has started, not before.
-    #
-    # uvicorn.Server.run() calls logging.config.dictConfig(), which REMOVES existing handlers
-    # from every logger it configures -- including uvicorn.access and uvicorn.error. A handler
-    # added beforehand is silently wiped and captures nothing.
-    #
-    # dictConfig does NOT clear FILTERS, which is why server.py's redaction filter (installed
-    # at import) survives. But that is exactly the sort of thing that must be demonstrated
-    # rather than assumed, which is what test_be3 does.
-    #
-    # BOTH loggers: HTTP requests land on uvicorn.access, but the WebSocket accept line --
-    # the only line that ever carries ?token= -- is emitted on uvicorn.error.
-    for _name in ("uvicorn.access", "uvicorn.error"):
-        lg = logging.getLogger(_name)
-        lg.addHandler(ACCESS_LOG)
-        lg.setLevel(logging.INFO)
-
-    yield
-    srv.should_exit = True
-    t.join(timeout=5)
-
-
-@pytest.fixture(autouse=True)
-def clean():
-    """Fresh book + logged-in session before each test."""
-    stub._reset()
-    config.API_TOKEN = ""
-    _login()
-    yield
-    config.API_TOKEN = ""
-
-
-def _login() -> None:
-    r = httpx.post(f"{BASE}/api/login", timeout=10, json={
-        "login": 999999, "password": "stub", "server": "STUB-NOT-REAL", "save": False,
-    })
-    assert r.status_code == 200, r.text
-    _wait_healthy()
-
-
-def _wait_healthy(timeout: float = 5.0) -> dict:
-    end = time.time() + timeout
-    while time.time() < end:
-        st = httpx.get(f"{BASE}/api/state", timeout=5,
-                       headers=_hdr()).json()
-        if st.get("healthy"):
-            return st
-        time.sleep(0.05)
-    raise AssertionError("worker never became healthy")
-
-
-def _hdr() -> dict:
-    return {"x-token": config.API_TOKEN} if config.API_TOKEN else {}
-
-
-def _ws_url(**params) -> str:
-    q = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"ws://127.0.0.1:{PORT}/ws" + (f"?{q}" if q else "")
+# Helpers only -- NEVER the fixtures.
+#
+# `live_server` and `clean` live in conftest.py and are both autouse, so pytest supplies them
+# to every test here without being asked. Importing them by name would register a SECOND
+# FixtureDef in this module's namespace, with its own cache: a second uvicorn on the same
+# port, and a teardown that closes the socket the surviving server is still using. See the
+# note at the top of conftest.py.
+from conftest import (              # noqa: F401
+    ACCESS_LOG, BASE, PORT, TOKEN, _hdr, _login, _wait_healthy, _ws_url,
+)
 
 
 # ================================================================ the stub is fake, loudly
@@ -443,6 +343,111 @@ async def test_backward_compat_no_token_configured():
     assert httpx.get(f"{BASE}/api/state", timeout=5).status_code == 200      # no token, no 401
     async with websockets.connect(_ws_url()) as ws:                          # tokenless /ws accepted
         assert json.loads(await ws.recv())["symbol"]
+
+
+# ================================================================ MULTI-ACCOUNT SAFETY
+#
+# Two invariants keep N servers from trading each other's accounts. Both fail CLOSED,
+# and both are the kind of fault that is silent when it breaks -- there is no error
+# anywhere, just orders landing on the wrong account. Hence tests.
+
+
+def test_wrong_terminal_blocks_trading():
+    """A server attached to a terminal that is NOT its own must refuse to drive it.
+
+    This is invariant I1. `positions_get()` returns only the ATTACHED account's book,
+    so a mis-binding does not error -- it silently operates on someone else's money.
+    The stub reports path="/stub"; point config at a different terminal and the worker
+    must go unhealthy rather than carry on.
+    """
+    original = config.MT5_PATH
+    try:
+        config.MT5_PATH = "/somewhere/else/terminal64.exe"
+        end = time.time() + 5.0
+        st = {}
+        while time.time() < end:
+            st = httpx.get(f"{BASE}/api/state", timeout=5, headers=_hdr()).json()
+            if st.get("wrong_terminal"):
+                break
+            time.sleep(0.05)
+
+        assert st.get("wrong_terminal"), f"guard never fired; state={st}"
+        assert st["healthy"] is False, "WRONG TERMINAL BUT STILL HEALTHY -- would trade it"
+        assert "WRONG MT5 terminal" in (st.get("error") or "")
+
+        # And the money path must actually be shut, not merely flagged.
+        r = httpx.post(f"{BASE}/order", timeout=10, headers=_hdr(),
+                       json={"side": "buy", "volume": 0.01, "type": "market"})
+        assert r.status_code >= 400 or r.json().get("ok") is False, \
+            "AN ORDER WAS ACCEPTED WHILE ATTACHED TO THE WRONG TERMINAL"
+    finally:
+        config.MT5_PATH = original
+        _wait_healthy()          # prove the guard releases once the path matches again
+
+
+def test_matching_terminal_path_is_accepted():
+    """The guard must not fire on a CORRECT binding -- dirname() of the exe vs ti.path.
+
+    Guards against the obvious off-by-one here: terminal_info().path is the DIRECTORY,
+    so comparing it to the exe path itself would reject every correctly configured
+    instance.
+    """
+    original = config.MT5_PATH
+    try:
+        config.MT5_PATH = "/stub/terminal64.exe"     # stub's terminal_info().path == "/stub"
+        st = _wait_healthy()
+        assert not st.get("wrong_terminal")
+        assert st["healthy"] is True
+    finally:
+        config.MT5_PATH = original
+
+
+def test_duplicate_account_login_is_refused():
+    """Invariant I2: a second server cannot log into an account already being driven.
+
+    Simulated by taking the same account lock the worker takes, from this process,
+    and then asking the server to log in. Two servers on one account would give it two
+    close-all paths and two P&L guards, each blind to the other.
+    """
+    import instance_lock
+
+    # Log the server OUT first, so it releases its own claim. Without this the lock
+    # below conflicts with the SERVER's handle -- uvicorn runs in a thread of this very
+    # process, and byte-range locks are per-handle, so we would be fighting ourselves
+    # rather than testing the cross-server case.
+    assert httpx.post(f"{BASE}/api/logout", timeout=10, headers=_hdr()).status_code == 200
+
+    lock = instance_lock.account_lock(999999, "STUB-NOT-REAL")
+    lock.acquire({"instance": "pretend-other-server", "port": 9999})
+    try:
+        r = httpx.post(f"{BASE}/api/login", timeout=10, json={
+            "login": 999999, "password": "stub", "server": "STUB-NOT-REAL", "save": False,
+        })
+        assert r.status_code == 409, f"duplicate login was NOT refused: {r.status_code} {r.text}"
+        assert "already in use" in r.text
+        assert "pretend-other-server" in r.text, "the rejection must name WHO holds the account"
+    finally:
+        lock.release()
+
+    # Released -> the same login now succeeds. Proves the lock gates rather than bricks.
+    r = httpx.post(f"{BASE}/api/login", timeout=10, json={
+        "login": 999999, "password": "stub", "server": "STUB-NOT-REAL", "save": False,
+    })
+    assert r.status_code == 200, r.text
+
+
+def test_relogin_to_same_account_is_not_self_blocked():
+    """Logging into the account this very server already drives must still work.
+
+    Byte-range locks are per-HANDLE, not per-process: a naive implementation takes a
+    second handle on its own lock file, conflicts with itself, and refuses the user's
+    own account while naming them as the culprit.
+    """
+    for attempt in range(3):
+        r = httpx.post(f"{BASE}/api/login", timeout=10, json={
+            "login": 999999, "password": "stub", "server": "STUB-NOT-REAL", "save": False,
+        })
+        assert r.status_code == 200, f"re-login #{attempt} blocked by our own lock: {r.text}"
 
 
 # ================================================================ THE MONEY PATHS

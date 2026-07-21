@@ -10,10 +10,11 @@ appears in the worker loop, in GET /api/strategies, and in both UIs.
 
 from .base import StrategyBase
 from .ladder import LadderState, TrendLadder
+from .rider import VolRegimeRider
 from .straddle import VolumeSpikeStraddle
 
 # Instantiated once per worker (see Mt5Worker.__init__).
-ENGINES = (VolumeSpikeStraddle, TrendLadder)
+ENGINES = (VolumeSpikeStraddle, TrendLadder, VolRegimeRider)
 
 __all__ = ["StrategyBase", "VolumeSpikeStraddle", "TrendLadder", "LadderState",
            "ENGINES"]

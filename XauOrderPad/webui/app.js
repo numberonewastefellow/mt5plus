@@ -745,6 +745,22 @@ function renderQuote(prevBid){
   renderActionRoles();    // refresh entry price + exit counts each tick
   renderPnlOnly();
 }
+/* Origin badge: 'R' rider-suggested (you tapped Place), 'L' ladder, 'S' straddle,
+   nothing for a plain manual trade. The letter is DERIVED SERVER-SIDE
+   (Mt5Worker._origin_of) so the webapp and the Android app can never label the
+   same row differently.
+
+   Rendered as a <span> INSIDE the existing SIDE cell -- never as a new column,
+   because renderPnlOnly() patches cells BY POSITION (tr.children[3] = CURRENT,
+   tr.children[6] = P&L) and an extra cell would shift those writes onto the
+   wrong columns. It also carries no data-close attribute, so the delegated
+   close handler ignores a click on it. */
+const ORIGIN_TITLE = { R:'Rider-suggested — you tapped Place', L:'Ladder strategy', S:'Straddle strategy' };
+function originBadge(p){
+  const o = String(p.origin||'').toUpperCase();
+  if(!ORIGIN_TITLE[o]) return '';
+  return `<span class="origin-pill" title="${ORIGIN_TITLE[o]}">${o}</span>`;
+}
 function renderPositions(){
   const tb=$('#positionsBody'); tb.innerHTML='';
   const list = state.positions.filter(p=>p.symbol===state.symbol);   // active symbol only
@@ -757,7 +773,7 @@ function renderPositions(){
     const pillCls = p.state==='pending'?'pending':p.side;
     const pillTxt = p.state==='pending'?`${p.side.toUpperCase()} LMT`:p.side.toUpperCase();
     tr.innerHTML=
-      `<td><span class="side-pill ${pillCls}">${pillTxt}</span></td>`+
+      `<td><span class="side-pill ${pillCls}">${pillTxt}</span>${originBadge(p)}</td>`+
       `<td class="r">${p.volume.toFixed(2)}</td>`+
       `<td class="r">${fmt(p.entry)}</td>`+
       `<td class="r">${cur}</td>`+
@@ -1138,6 +1154,10 @@ function mapPos(p, isPending){
     openTime: (p.time||0)*1000,
     liveProfit: isPending ? null : (p.profit!=null ? p.profit : null),
     magic: (p.magic != null) ? p.magic : null,   // for reconcileAutoTest foreign-magic check
+    // Who opened it: 'R' rider-suggested, 'L' ladder, 'S' straddle, '' manual.
+    // DERIVED SERVER-SIDE (Mt5Worker._origin_of) so this and the Android app can
+    // never disagree about a row's label.
+    origin: p.origin || '',
   };
 }
 

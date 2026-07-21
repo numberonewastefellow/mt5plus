@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -82,6 +83,37 @@ val AcctMode.color: Color get() = when (this) {
     AcctMode.REAL -> Red
     AcctMode.DEMO -> Green
     AcctMode.UNKNOWN -> Amber
+}
+
+/**
+ * WHERE a position came from: "R" rider-suggested, "L" ladder, "S" straddle, "" manual.
+ *
+ * The letter is computed on the SERVER (Position.origin) so this phone and the web panel can
+ * never label the same ticket differently. Nothing is rendered for a manual position: the
+ * common case must stay quiet, or the badge stops meaning anything.
+ *
+ * Deliberately tinted with the theme's PRIMARY, never Green/Red/Amber. Those three already
+ * carry meaning in this file -- side, P&L, and "no stop attached" -- and a fourth use of colour
+ * would make a grid that is read at a glance ambiguous.
+ *
+ * Same visual idiom as the account badge above (9sp bold, tinted ground at .18, 3dp corners).
+ */
+@Composable
+private fun OriginBadge(origin: String?, modifier: Modifier = Modifier) {
+    val tag = origin?.trim().orEmpty()
+    if (tag.isEmpty()) return
+    val tint = MaterialTheme.colorScheme.primary
+    Text(
+        tag,
+        modifier
+            .background(tint.copy(alpha = 0.18f), RoundedCornerShape(3.dp))
+            .padding(horizontal = 4.dp, vertical = 1.dp),
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        color = tint,
+        maxLines = 1,
+        softWrap = false,
+    )
 }
 
 /**
@@ -170,13 +202,20 @@ private fun PositionRow(p: Position, digits: Int, onClose: (Long) -> Unit) {
         Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            p.side ?: "?",
-            Modifier.weight(0.85f),
-            color = if (p.isBuy) Green else Red,
-            fontWeight = FontWeight.Bold,
-            fontSize = 13.sp,
-        )
+        // SIDE + origin share ONE cell. The 0.85f weight is matched by the header row above;
+        // adding a column (or changing this weight) shifts every price column out from under
+        // its heading, so the badge goes inside the cell instead.
+        Row(Modifier.weight(0.85f), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                p.side ?: "?",
+                color = if (p.isBuy) Green else Red,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+                maxLines = 1,
+                softWrap = false,
+            )
+            OriginBadge(p.origin, Modifier.padding(start = 4.dp))
+        }
         Mono(Fmt.lot(p.volume), 0.7f)
         Mono(Fmt.price(p.priceOpen, digits), 1.15f)
 
@@ -367,13 +406,19 @@ private fun SplitPositionRow(p: Position, digits: Int, onClose: (Long) -> Unit, 
                     .padding(start = 6.dp, top = 10.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    Fmt.price(p.priceOpen, digits),
-                    Modifier.weight(1f),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 12.sp,
-                )
+                // Origin rides INLINE with the entry price, inside the existing ENTRY cell. This
+                // panel is narrow and CLOSE_COL_WIDTH is fixed, so there is no room for a column
+                // of its own -- and a manual position renders nothing at all.
+                Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        Fmt.price(p.priceOpen, digits),
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        softWrap = false,
+                        fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, fontSize = 12.sp,
+                    )
+                    OriginBadge(p.origin, Modifier.padding(start = 4.dp))
+                }
                 Text(
                     Fmt.signedMoney(pl),
                     Modifier.weight(1f),

@@ -57,31 +57,79 @@
       label: "Ladder",
       panel: "ladderPanel",
       enabledEl: "ldEnabled",
-      needsHedging: false,
+      // Every rung is its own position with its own ticket and target; a netting
+      // account would collapse them into one line and make that map fiction.
+      needsHedging: true,
       fields: {
         side: ["ldSide", str],
         trigger: ["ldTrigger", num],
         volume: ["ldVolume", num],
         target: ["ldTarget", num],
+        stop_mode: ["ldStopMode", str],
         retrace: ["ldRetrace", num],
+        floor_offset: ["ldFloorOffset", num],
         max_positions: ["ldMaxPos", int],
+        max_lots: ["ldMaxLots", num],
         entry_mode: ["ldEntryMode", str],
         entry_step: ["ldStep", num],
         entry_gap_ms: ["ldGapMs", int],
         hard_sl: ["ldHardSl", num],
         max_daily_loss: ["ldMaxLoss", num],
+        cooldown_s: ["ldCooldown", num],
+        max_ladders_per_day: ["ldMaxLadders", int],
         paper: ["ldPaper", bool],
       },
       status: {
         state: ["ldState", (v, s) => v || (s.enabled ? "armed" : "disabled")],
         open_positions: ["ldOpen", (v) => v ?? 0],
+        open_lots: ["ldOpenLots", (v) => (v ?? 0).toFixed(2)],
         ladders_done: ["ldDone", (v) => v ?? 0],
+        ladders_today: ["ldToday", (v) => v ?? 0],
         paper_pl_per_oz: ["ldPaperPl", (v) => (v ?? 0).toFixed(3)],
         paper_trades: ["ldPaperTrades", (v) => v ?? 0],
         spread: ["ldSpread", (v) => (v ? v.toFixed(3) + "/oz" : "—")],
+        // Derived server-side, both of them. The dialled stop is measured on the
+        // entry-side price but realised on the exit side, so the operator gives up
+        // stop + spread -- a difference that showed up live as a 0.30 setting
+        // costing 0.34. Showing the raw dial alone was the misleading part.
+        effective_stop: ["ldEffStop", (v) => (v ? v.toFixed(3) + "/oz" : "—")],
+        floor_price: ["ldFloorPx", (v) => (v ? v.toFixed(3) : "—")],
       },
       errorEl: "ldError",
       warnEl: "ldWarn",
+    },
+    {
+      id: "rider",
+      label: "Rider",
+      panel: "riderPanel",
+      enabledEl: "rdEnabled",
+      needsHedging: false,
+      fields: {
+        thrust_mult: ["rdThrust", num],
+        sl: ["rdSl", num],
+        trail: ["rdTrail", num],
+        tp: ["rdTp", num],
+        max_hold: ["rdMaxHold", int],
+        atr_win: ["rdAtrWin", int],
+        use_ny_hours: ["rdNy", bool],
+        risk_frac: ["rdRisk", num],
+        max_daily_loss: ["rdMaxLoss", num],
+        auto_demo: ["rdAutoDemo", bool],
+        auto_real: ["rdAutoReal", bool],
+      },
+      status: {
+        state: ["rdState", (v, s) => v || (s.enabled ? "active" : "disabled")],
+        execution: ["rdExec", (v) => v || "suggest"],
+        live_ticket: ["rdLiveTicket", (v) => (v ? String(v) : "—")],
+        live_stop: ["rdLiveStop", (v) => (v != null ? Number(v).toFixed(2) : "—")],
+        in_paper_position: ["rdInPos", (v) => (v ? "yes" : "no")],
+        paper_pnl_per_oz: ["rdPaperPl", (v) => (v ?? 0).toFixed(2)],
+        // Accrued at the lot each trade was sized at -- NOT the running $/oz total
+        // rescaled by whatever lot the current card happens to carry.
+        paper_pnl_usd: ["rdPaperUsd", (v) => (v ?? 0).toFixed(2)],
+        paper_trades: ["rdPaperTrades", (v) => v ?? 0],
+      },
+      errorEl: "rdError",
     },
   ];
 
@@ -89,6 +137,10 @@
   let userTouched = false;     // don't stomp inputs the user is mid-edit
   let last = {};               // last /api/strategies payload
   let paperWasOn = {};         // per engine: was PAPER on at last render?
+  // The rider's execution switches as the SERVER last reported them. Confirms fire on
+  // the OFF->ON edge only, so re-saving the panel with auto already on does not
+  // re-prompt (and, more importantly, a prompt cannot be trained into muscle memory).
+  let autoWasOn = { demo: false, real: false };
 
   function toast(msg, kind) {
     const box = document.getElementById("toasts");
@@ -160,8 +212,52 @@
         else w.hidden = true;
       }
     }
-    if (eng.id === "ladder") renderSpreadHint(s);
+    if (eng.id === "ladder") { renderSpreadHint(s); renderStopMode(s); }
+    if (eng.id === "rider") {
+      renderRiderCard(s);
+      autoWasOn = { demo: !!(s.params && s.params.auto_demo),
+                    real: !!(s.params && s.params.auto_real) };
+    }
     paperWasOn[eng.id] = s.params ? !!s.params.paper : true;
+  }
+
+  /* The rider's live TRADE-NOW card. It is a SUGGESTION: shown only on an
+     actionable 'enter' signal while enabled; the operator taps Place to send it
+     through the normal /order path. The engine itself places nothing. */
+  function renderRiderCard(s) {
+    const card = $("rdCard"), idle = $("rdCardIdle");
+    const c = (s && s.card) || {};
+    /* `actionable` is DERIVED SERVER-SIDE (rider._actionable): the card was issued on
+       the newest closed bar, the engine is armed, and it is not already placing for
+       you. Do NOT re-derive it from c.kind here -- the card keeps kind:"enter" for the
+       whole trade (up to ~2 h), so that test would leave this button offering a
+       long-dead entry price, and Android would have to reimplement the same rule and
+       could disagree with it. */
+    const actionable = !!(s && s.actionable);
+    if (card) card.hidden = !actionable;
+    if (idle) idle.hidden = !!actionable;
+    if (actionable) {
+      const side = $("rdCardSide");
+      side.textContent = (c.side || "").toUpperCase();
+      side.style.color = c.side === "buy" ? "#2fa572" : "#e0664f";
+      $("rdCardLot").textContent = c.lot;
+      $("rdCardEntry").textContent = c.entry;
+      $("rdCardSl").textContent = c.sl;
+      $("rdCardTp").textContent = c.tp;
+      $("rdCardReason").textContent = c.reason || "";
+    } else if (idle) {
+      idle.textContent = (s && s.live_ticket)
+        ? `Riding a LIVE position (ticket ${s.live_ticket}, stop ${s.live_stop}). The engine trails it on every tick and exits at market.`
+        : (s && (s.execution === "auto-demo" || s.execution === "AUTO-REAL"))
+        ? `Auto-trading is ON (${s.execution}) — the next signal is placed for you, so there is nothing to tap.`
+        : c.kind === "close"
+        ? `Last exit: ${c.reason} (paper ${c.pnl_oz >= 0 ? "+" : ""}${c.pnl_oz}/oz). Waiting for the next thrust.`
+        : (c.kind === "enter" && c.status)
+          ? "That suggestion has expired (it was only good for its own bar). Waiting for the next thrust."
+        : (s && s.in_paper_position)
+          ? "In a paper position — a CLOSE card will appear on exit."
+          : (c.note || "No trade signalled right now — waiting for a thrust in a high-vol regime.");
+    }
   }
 
   /* Show the live spread beside the Target field, and turn the field red when the
@@ -180,6 +276,32 @@
     tgt.classList.toggle("bad", bad);
     hint.classList.toggle("bad", bad);
     if (bad) hint.textContent += ` → a winner still nets ${(t - spread).toFixed(2)}/oz`;
+  }
+
+  /* Only ONE stop is in play at a time, so only show the field that is. Both being
+     visible invited the reading that they combine -- they do not: `stop_mode` picks
+     one and the other is dead. Also flags a floor inside the spread, which the
+     server refuses for the same reason it refuses a target inside the spread: the
+     ladder is already marked past it the moment it arms, so it would flush on the
+     first tick. */
+  function renderStopMode(s) {
+    const mode = ($("ldStopMode") || {}).value || "retrace";
+    const row = (id) => { const el = $(id); return el && el.closest(".set-row"); };
+    const rRow = row("ldRetrace"), fRow = row("ldFloorOffset");
+    if (rRow) rRow.hidden = mode !== "retrace";
+    if (fRow) fRow.hidden = mode !== "floor";
+
+    const hint = $("ldFloorHint"), off = $("ldFloorOffset");
+    const spread = Number(s.spread || 0);
+    if (!hint || !off) return;
+    if (mode !== "floor" || !spread) { hint.textContent = ""; off.classList.remove("bad"); return; }
+    const v = parseFloat(off.value);
+    const bad = !isNaN(v) && v <= spread;
+    hint.textContent = bad
+      ? `— inside the ${spread.toFixed(2)}/oz spread → would flush on the first tick`
+      : `— live spread ${spread.toFixed(2)}/oz`;
+    off.classList.toggle("bad", bad);
+    hint.classList.toggle("bad", bad);
   }
 
   function renderAll(all) {
@@ -224,8 +346,8 @@
   // ---- apply ------------------------------------------------------------
   function currentEngine() {
     const tab = modal.querySelector(".strat-tab.on");
-    const id = tab && tab.id === "tabLadder" ? "ladder" : "straddle";
-    return ENGINES.find((e) => e.id === id);
+    const panel = tab && tab.dataset.panel;
+    return ENGINES.find((e) => e.panel === panel) || ENGINES[0];
   }
 
   async function apply(eng, enabledOverride) {
@@ -240,21 +362,62 @@
     //    dialog would let a user click through the enable prompt and arm a live
     //    trader without ever being asked about it.
     if (eng.id === "ladder" && body.paper === false && paperWasOn.ladder !== false) {
+      const lots = Number((body.max_lots ?? 0));
+      const uncapped = Number(body.max_positions ?? 1) === 0 && lots <= 0;
       if (!confirm(
         "Turn PAPER MODE OFF?\n\n" +
         "The ladder will place REAL orders on the demo account from the next trigger.\n\n" +
         "Measured on 37,500 real ticks: with no directional edge this loses ~1 spread " +
-        "(0.24/oz) per trade, and the ladder multiplies that cost. Only your trigger " +
-        "can beat it — and paper mode is how you find out whether it does.")) {
+        "per trade, and the ladder multiplies that cost. Only your trigger " +
+        "can beat it — and paper mode is how you find out whether it does.\n\n" +
+        "Measured LIVE on 2026-07-21: 68 ladders and 79 trades in 25 minutes, " +
+        "13.9% win rate, and the target was never once reached." +
+        (uncapped
+          ? "\n\nMax positions AND max lots are both 0 (uncapped). A slow grind adds " +
+            "rungs faster than the target drains them, and the floor closes all of " +
+            "them at once. Set a lot cap first."
+          : ""))) {
         $("ldPaper").checked = true;
         return;
+      }
+    }
+
+    // 1b) The rider's two execution switches. Confirm each ON transition separately,
+    //     for the same reason as (1): "auto-trade on demo" and "auto-trade with real
+    //     money" are different decisions and must be consented to individually.
+    //     Turning either OFF is never confirmed -- never stand between a user and the
+    //     safe direction.
+    if (eng.id === "rider") {
+      if (body.auto_demo === true && !autoWasOn.demo &&
+        !confirm(
+          "Turn ON auto-trading for DEMO accounts?\n\n" +
+          "The rider will place orders BY ITSELF whenever it signals, with no tap. " +
+          "A stop is attached at the broker and the trail runs server-side.\n\n" +
+          "Demo money only — this is how you build the forward-test record.")) {
+        $("rdAutoDemo").checked = false; return;
+      }
+      if (body.auto_real === true && !autoWasOn.real &&
+        !confirm(
+          "Turn ON auto-trading for REAL accounts?\n\n" +
+          "THIS SPENDS REAL MONEY, with no confirmation per trade.\n\n" +
+          "What is actually known: backtested +$0.585/oz over random, with a confidence " +
+          "interval that INCLUDES ZERO, and it is regime-dependent — it needs volatility, " +
+          "and a calm market bleeds. It is not a proven edge.\n\n" +
+          "The only cap is the daily-loss kill-switch (currently " +
+          `$${body.max_daily_loss ?? "?"}). Size follows risk_frac x equity, so a larger ` +
+          "balance means a larger position.\n\n" +
+          "This switch never resumes by itself after a restart.")) {
+        $("rdAutoReal").checked = false; return;
       }
     }
 
     // 2) Enabling at all.
     if (body.enabled) {
       const safe = await refreshSafety();
-      if (!safe.demo) {
+      // The rider is the one engine that may run on a real account -- and only when the
+      // operator has explicitly turned auto_real on (the server re-checks both).
+      const realOk = eng.id === "rider" && body.auto_real === true;
+      if (!safe.demo && !realOk) {
         toast("Blocked: needs a DEMO account", "err");
         $(eng.enabledEl).checked = false; return;
       }
@@ -263,7 +426,17 @@
         $(eng.enabledEl).checked = false; return;
       }
       const live = eng.id === "ladder" && body.paper === false;
-      if (!confirm(`Enable ${eng.label}?` + (live
+      // The rider's wording follows its EXECUTION switches, not a paper flag. Telling a
+      // user "it will place REAL orders when it signals" while both switches are off
+      // would be simply false -- and false safety warnings are how real ones get ignored.
+      const riderNote = body.auto_real
+        ? "\n\nAUTO-TRADE ON REAL IS ON — it will place orders with REAL MONEY, unattended."
+        : body.auto_demo
+          ? "\n\nAuto-trade on DEMO is on — it will place demo orders by itself when it signals."
+          : "\n\nBoth auto-trade switches are OFF — it will only suggest; you tap Place.";
+      if (!confirm(`Enable ${eng.label}?` + (eng.id === "rider"
+        ? riderNote
+        : live
         ? "\n\nPAPER MODE IS OFF — it will place REAL orders on the demo account."
         : eng.id === "ladder"
           ? "\n\nPaper mode is ON — it will log what it would do and place NO orders."
@@ -314,15 +487,54 @@
 
   $("stratApply").addEventListener("click", () => apply(currentEngine()));
 
+  // Rider PLACE: the ONE human tap that turns the current suggestion into a real
+  // demo order, through the SAME /order path the Buy/Sell buttons use. The rider
+  // engine itself never places anything — this handler is the only trigger.
+  const rdPlace = $("rdPlace");
+  if (rdPlace) rdPlace.addEventListener("click", async () => {
+    const s = last.rider || {};
+    const c = s.card || {};
+    // Same server-derived gate the button's visibility uses, re-checked at tap time:
+    // the card can expire between the render and the click.
+    if (!s.actionable) { toast("No active trade suggestion right now", "err"); return; }
+    const safe = await refreshSafety();
+    if (!safe.demo) { toast("Blocked: needs a DEMO account", "err"); return; }
+    // /order takes sl/tp as POINT DISTANCES, not prices: PlaceReq carries no
+    // sl_tp_mode, so the worker falls back to config.SL_TP_MODE = "points".
+    // Posting the card's absolute price here silently placed a ~$4 stop instead
+    // of the intended $6 (and a $4 target instead of $50). Convert -- and refuse
+    // to place at all if the point size is unreadable: a wrong-unit stop on a
+    // live order is worse than no trade.
+    let point = 0;
+    try { point = Number((await jget("/api/state")).point) || 0; } catch (e) { point = 0; }
+    if (!point) { toast("Cannot read symbol point size — not placing", "err"); return; }
+    const slPts = Math.round(Math.abs(c.entry - c.sl) / point);
+    const tpPts = Math.round(Math.abs(c.tp - c.entry) / point);
+    if (!confirm(`Place ${(c.side || "").toUpperCase()} ${c.lot} lot at market?\n\n` +
+      `SL ${(slPts * point).toFixed(2)} away  ·  TP ${(tpPts * point).toFixed(2)} away\n\n` +
+      `Real order on the DEMO account — you are the trigger.`)) return;
+    try {
+      await jpost("/order", { side: c.side, volume: c.lot, type: "market",
+                              sl: slPts, tp: tpPts, origin: "rider" });
+      toast(`Placed ${(c.side || "").toUpperCase()} ${c.lot} @ market`, "ok");
+    } catch (e) { toast("Order failed: " + e.message, "err"); }
+  });
+
   for (const eng of ENGINES) {
     const en = $(eng.enabledEl);
     if (en) en.addEventListener("change", () => apply(eng, en.checked));
     for (const [, [id]] of Object.entries(eng.fields)) {
       const el = $(id);
-      if (el) el.addEventListener("input", () => {
+      if (!el) continue;
+      const touched = () => {
         userTouched = true;
-        if (eng.id === "ladder") renderSpreadHint(last.ladder || {});
-      });
+        if (eng.id === "ladder") { renderSpreadHint(last.ladder || {}); renderStopMode(last.ladder || {}); }
+      };
+      el.addEventListener("input", touched);
+      // A <select> fires "change", not "input", in every browser that matters. Wiring
+      // only "input" left the stop-mode switch showing the wrong field until the next
+      // poll overwrote it -- i.e. the operator picking "floor" still saw "retrace".
+      if (el.tagName === "SELECT") el.addEventListener("change", touched);
     }
   }
 
