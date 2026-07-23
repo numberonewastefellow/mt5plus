@@ -79,6 +79,7 @@ def load(path: Path | None = None) -> list[dict[str, Any]]:
     seen_names: dict[str, int] = {}
     seen_ports: dict[int, str] = {}
     seen_paths: dict[str, str] = {}
+    seen_expect: dict[int, str] = {}
 
     for i, item in enumerate(items):
         if not isinstance(item, dict):
@@ -127,11 +128,44 @@ def load(path: Path | None = None) -> list[dict[str, Any]]:
         seen_ports[port] = name
         seen_paths[key] = name
 
+        # The ACCOUNT this instance is allowed to drive. 0 = unpinned.
+        #
+        # Defaults to the instance name when the name IS an account number, which is why
+        # naming instances `472200942` rather than `a1` is worth doing: the label stops
+        # being a mnemonic and becomes an enforced fact. Without it, nothing prevents
+        # terminal "472200942" being logged into a different account -- and a label that
+        # lies on a trading screen is worse than a neutral one.
+        raw_expect = item.get("expect_login")
+        if raw_expect in (None, "", 0):
+            expect = int(name) if name.isdigit() else 0
+        else:
+            try:
+                expect = int(raw_expect)
+            except (TypeError, ValueError):
+                raise ConfigError(
+                    f"{p}: instances[{i}].expect_login = {raw_expect!r} is not a number."
+                ) from None
+        if expect and name.isdigit() and expect != int(name):
+            raise ConfigError(
+                f"{p}: instance {name!r} declares expect_login={expect}. The name and the "
+                f"pinned account disagree, so one of them is lying about which account this "
+                f"instance drives. Fix whichever is wrong."
+            )
+        if expect in seen_expect:
+            raise ConfigError(
+                f"{p}: {seen_expect[expect]!r} and {name!r} are both pinned to account "
+                f"{expect}. Two servers on one account means two independent close-all "
+                f"paths on one book."
+            )
+        if expect:
+            seen_expect[expect] = name
+
         out.append({
             "name": name,
             "port": port,
             "label": str(item.get("label") or name),
             "mt5_path": mt5_path,
+            "expect_login": expect,
             "token_file": str(item.get("token_file") or f".token.{name}.local"),
         })
 

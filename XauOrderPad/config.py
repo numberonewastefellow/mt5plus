@@ -61,8 +61,16 @@ STRATEGY_MAGICS = {
 # Tunables mirror analysis/eda RiderConfig. See analysis/eda/RIDER.md.
 RIDER_DEFAULTS = {
     "thrust_mult": 1.5,       # |body| > mult*ATR(14) on M5 = a thrust
-    "sl": 6.0,                # $/oz initial stop distance
-    "trail": 6.0,             # $/oz trailing distance
+    # HOW sl/trail below are read (named stop_UNITS, not stop_mode: the LADDER
+    # already owns `stop_mode` on the shared StrategyReq with completely different
+    # values, retrace/floor, and one wire field meaning two things is a trap).
+    # "fixed" = $/oz (validated default). "atr" = multiples
+    # of the bar's ATR(14), so 1.5 means 1.5*ATR. See RiderConfig.stop_units for the
+    # evidence and for why "atr" is NOT the default despite testing better on both
+    # halves of the split -- it needs forward-test proof first.
+    "stop_units": "fixed",
+    "sl": 6.0,                # $/oz initial stop distance   (x ATR when stop_units="atr")
+    "trail": 6.0,             # $/oz trailing distance       (x ATR when stop_units="atr")
     "tp": 50.0,               # $/oz far cap (mostly rides the trail)
     "max_hold": 24,           # M5 bars (~2h) time-stop
     "atr_win": 100,           # rolling window for the ATR-median regime gate
@@ -87,7 +95,12 @@ RIDER_DEFAULTS = {
 # would, in a crash-restart loop, pyramid forever -- which is how an unattended bot
 # does real damage. So new entries resume only if the persisted state is younger
 # than this. Anything older is managed but left disarmed, and says so in the UI.
-LADDER_RESUME_MAX_AGE_S = 600      # 10 minutes
+# NO LONGER USED, and kept only so the history is legible. Engines are never re-armed
+# automatically now: reconcile() adopts and manages an open book but always boots
+# DISABLED, and arming is a deliberate human act. The window did not hold -- a restart
+# 97 s after arming silently re-armed a live engine, and because the daily-loss latch
+# `_killed` was never persisted, the same window also let a killed engine come back armed.
+LADDER_RESUME_MAX_AGE_S = 600      # 10 minutes (unused)
 
 # --- Trend-Ladder (experimental, DEMO-ONLY) -------------------------------
 # Arm a side + trigger price; pyramid into the move; exit on a retrace.
@@ -143,7 +156,20 @@ LADDER_DEFAULTS = {
     "cooldown_s": 0.0,       # min seconds between ladders; 0 = none
     "max_ladders_per_day": 0,  # 0 = unlimited
     "close_batch": 25,       # max positions closed per poll cycle -- see below
-    "paper": True,           # log-only; places NO orders. Default ON.
+    # Paper mode is now OPT-IN, not the default. It was built as a MEASURING tool --
+    # "log the fills the trigger would have got, so its edge can be costed before a cent
+    # is risked" -- and it is still exactly that, reachable from Settings -> Strategies on
+    # both clients. What it is NOT any more is the safety layer standing between ARM and
+    # the broker. Two things already do that job, and they do it better:
+    #   * `allows_real = False` on this engine, re-checked EVERY poll in
+    #     StrategyBase.evaluate -- the ladder auto-disables on anything but a demo
+    #     account, so "live" here can only ever mean demo money.
+    #   * `enabled` is never restored across a restart (base.py), so nothing resumes
+    #     trading unattended regardless of this flag.
+    # With paper defaulting True, ARM silently did nothing on a fresh install and the
+    # operator had to hunt for a toggle to make the engine they just armed actually trade.
+    # An arm that does not arm is worse than an honest one behind a confirmation.
+    "paper": False,          # False = places real orders (demo accounts only). See above.
 }
 
 # Why `max_lots` matters more than `max_positions`, and why the flush is BATCHED.
@@ -166,6 +192,15 @@ LADDER_DEFAULTS = {
 # `close_batch` positions per cycle and resumes on the next one: the book still
 # empties promptly, but every individual cycle stays inside its budget.
 ENTRY_GAP_MS_MIN = 100     # floor on entry_gap_ms: 0 would mean one order_send PER POLL
+
+# Minimum seconds between throttled writes of an engine's per-day counters. `state.save`
+# is a read-modify-write of a JSON file and the ladder reaches it from `_finish_ladder`,
+# on the worker thread, inside the ~66 ms poll budget. A crash can therefore lose up to
+# this many seconds of increments -- a ladder or two off the daily count, which is a far
+# better trade than stalling the loop that also feeds prices and fills orders. The
+# daily-loss LATCH is exempt and written immediately: it fires at most once a day, by
+# which point the book is already flat.
+LADDER_RUNTIME_SAVE_MIN_S = 10
 
 # --- Server ---------------------------------------------------------------
 # HOST: bind address. Two legitimate values, and one that is never legitimate:
@@ -213,6 +248,20 @@ BROWSER_MODE = "app"         # "app" = standalone window (no address bar); "kios
 # launch and every login fails with an IPC timeout that looks like a broker
 # problem. Blank locally = attach to whatever terminal is already running.
 MT5_PATH = os.environ.get("XAUORDERPAD_MT5_PATH", "")   # e.g. r"C:\Program Files\MetaTrader 5\terminal64.exe"
+
+# The ONE account this server is allowed to drive. 0 = unpinned (single-account mode,
+# unchanged behaviour: log in to whatever you like).
+#
+# Set per instance by the launcher from instances.json, where it defaults to the instance
+# NAME when that name is an account number. It turns "instance 472200942" from a label
+# into an enforced fact: a login for any other account is refused, and if the terminal is
+# switched to another account by hand the server goes unhealthy instead of quietly trading
+# it. Without this, the name is a comment -- and a comment that lies on a trading screen is
+# worse than no comment.
+try:
+    EXPECT_LOGIN = int(os.environ.get("XAUORDERPAD_EXPECT_LOGIN", "") or 0)
+except ValueError:
+    EXPECT_LOGIN = 0
 MT5_LOGIN = 0
 MT5_PASSWORD = ""
 MT5_SERVER = ""

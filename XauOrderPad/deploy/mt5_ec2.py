@@ -587,18 +587,42 @@ REMOTE_APP = "C:/app/XauOrderPad"
 REMOTE_CERTS = "C:/app/certs"
 
 # What NOT to send. .venv is Windows-native but rebuilt on the box anyway; certs/ holds ca.key,
-# which must NEVER leave this laptop (it mints trading identities); .token.local is the LAN dev
-# token and has nothing to do with the box.
+# which must NEVER leave this laptop (it mints trading identities).
 SHIP_EXCLUDE_DIRS = {".venv", "__pycache__", "certs", "testing", "deploy", "audit", ".pytest_cache"}
-SHIP_EXCLUDE_FILES = {".token.local"}
+
+# Files excluded by PATTERN, not by exact name. This used to be the single literal
+# ".token.local", with a comment explaining that the LAN dev token has nothing to do with the
+# box -- correct reasoning, but it only matched one filename. The moment multi-account added
+# `.token.a1.local` / `.token.a2.local`, those fell straight through and were shipped: the
+# laptop's live trading tokens ended up on an internet-facing box, verified by identical file
+# hashes on both machines.
+#
+# Same failure for `instances.json`: it names LOCAL terminal paths (D:\mt5\...), which do not
+# exist on the box, so shipping it overwrites the box's own config with the developer's -- the
+# very mistake config.py's comment already records ("a deploy that clobbers the target's config
+# with the developer's is not a deploy step, it is a regression generator"). The BOX's instance
+# list is `deploy/instances.ec2.json`, installed separately below.
+# accounts.md belongs at the repo ROOT (outside this walk) precisely so it cannot be shipped.
+# Listed here anyway as belt and braces: if someone ever moves it under XauOrderPad/, it must
+# not silently hand the box every laptop token.
+SHIP_EXCLUDE_FILES = {"instances.json", "accounts.md"}
+SHIP_EXCLUDE_GLOBS = (".token.*.local", ".token.local")
+
+# The box's OWN instance registry, kept beside the box's certs and shipped INTO place as
+# XauOrderPad/instances.json. Same separation as certs/ (box) vs certs-lan/ (laptop): two
+# machines, two configs, and no path by which one can silently become the other.
+EC2_INSTANCES = os.path.join(HERE, "instances.ec2.json")
 
 
 def _ship_files():
+    import fnmatch
     out = []
     for root, dirs, files in os.walk(APP_DIR):
         dirs[:] = [d for d in dirs if d not in SHIP_EXCLUDE_DIRS and not d.startswith(".")]
         for f in files:
             if f in SHIP_EXCLUDE_FILES or f.endswith((".pyc", ".log")):
+                continue
+            if any(fnmatch.fnmatch(f, g) for g in SHIP_EXCLUDE_GLOBS):
                 continue
             full = os.path.join(root, f)
             out.append((full, os.path.relpath(full, APP_DIR).replace("\\", "/")))
@@ -676,6 +700,18 @@ def cmd_ship(cfg, args):
             if r.returncode != 0:
                 sys.exit(f"scp of {n} failed: {r.stderr.strip()}")
 
+        # The BOX's instance registry, installed as XauOrderPad/instances.json by ship.ps1.
+        # Sent separately because the laptop's own instances.json is excluded from the bundle:
+        # it names D:\ paths that do not exist here, and shipping it would overwrite the box's
+        # config with the developer's. Two machines, two registries, no path between them.
+        if os.path.exists(EC2_INSTANCES):
+            r = subprocess.run(["scp", *opts, EC2_INSTANCES,
+                                f"{target}:C:/app/_instances.ec2.json"],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                sys.exit(f"scp of instances.ec2.json failed: {r.stderr.strip()}")
+            print("Shipping the box instance registry (instances.ec2.json)")
+
         print("Unpacking + rebuilding the venv on the box (this takes a minute) ...")
         _run_ps1_on_box(opts, target, SHIP_PS1_PATH, "ship.ps1", timeout=900)
     finally:
@@ -744,6 +780,24 @@ def cmd_caddy(cfg, args):
 
     ensure_tls_ingress(ec2, cfg)
 
+    # Regenerate the per-account routes from THIS laptop's copy of the box registry, so the
+    # Caddyfile's `import C:/app/routes.caddy` can never resolve to a stale list -- a prefix
+    # pointing at a port that now belongs to a different account is the worst failure here,
+    # and it would look like a working proxy.
+    routes = os.path.join(HERE, "routes.caddy")
+    gen = os.path.join(HERE, "gen_routes.py")
+    if os.path.exists(gen) and os.path.exists(EC2_INSTANCES):
+        r = subprocess.run([sys.executable, gen, "--ec2"], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"gen_routes.py --ec2 failed, refusing to ship possibly-stale routes:\n"
+                     f"{r.stdout}{r.stderr}")
+        print(r.stdout.strip())
+    elif not os.path.exists(routes):
+        # No multi-account config on this laptop: write an empty route file so the import
+        # still resolves and only the catch-all applies. Keeps single-account deploys working.
+        with open(routes, "w", encoding="ascii") as f:
+            f.write("# No instances.ec2.json: single-account box, catch-all only.\n")
+
     tmp = tempfile.mkdtemp(prefix="mt5_caddy_")
     try:
         opts = ssh_opts(cfg, os.path.join(tmp, "known_hosts"))
@@ -752,6 +806,11 @@ def cmd_caddy(cfg, args):
                            capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
             sys.exit(f"scp of Caddyfile failed: {r.stderr.strip()}")
+        # The Caddyfile imports this; ship them together or validate fails on the box.
+        r = subprocess.run(["scp", *opts, routes, f"{target}:C:/app/routes.caddy"],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            sys.exit(f"scp of routes.caddy failed: {r.stderr.strip()}")
         _run_ps1_on_box(opts, target, CADDY_PS1_PATH, "caddy_setup.ps1", timeout=600)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

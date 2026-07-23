@@ -41,10 +41,34 @@
 		}
 	}
 
-	reverse_proxy 127.0.0.1:8765 {
-		header_up X-Client-Cert-CN {http.request.tls.client.subject}
-		# The /ws quote feed is a long-lived response; do not buffer it.
-		flush_interval -1
+	# ---- per-instance routes, GENERATED from instances.json --------------------------------
+	# One `handle_path /<name>/*` per extra account (deploy/gen_routes.py writes it;
+	# caddy_local.ps1 regenerates it before validating, so it cannot go stale).
+	#
+	# ONE Caddy fronts every account, not one per port. The certificate's SAN is an IP
+	# (192.168.0.116) with no port and no DNS name, so it already covers every port -- N
+	# proxies would mean N processes and N copies of the same private key for no benefit,
+	# and every extra TLS port is another firewall hole to open and keep in sync. The phone
+	# distinguishes accounts by PATH: https://192.168.0.116:8443/a1
+	#
+	# If this file is missing, `caddy validate` fails and caddy_local.ps1 refuses to start --
+	# fail closed, like every other gate here.
+	import ./routes-lan.caddy
+
+	# ---- the DEFAULT (single-account) server: everything not matched above -----------------
+	# MUST STAY LAST. `handle`/`handle_path` are mutually exclusive and evaluated in the order
+	# written, so a catch-all placed before the import would swallow /a1 and /a2 and quietly
+	# send every account's traffic to 8765.
+	#
+	# Keeping the default at `/` is what makes this backward compatible: the phone profile and
+	# client certificate that already work against https://192.168.0.116:8443 keep working
+	# untouched, and new accounts are purely additive.
+	handle {
+		reverse_proxy 127.0.0.1:8765 {
+			header_up X-Client-Cert-CN {http.request.tls.client.subject}
+			# The /ws quote feed is a long-lived response; do not buffer it.
+			flush_interval -1
+		}
 	}
 
 	# Per-site access log with the token query param redacted (the browser web UI still uses

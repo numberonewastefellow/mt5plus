@@ -37,6 +37,28 @@ foreach ($n in @("certs-lan\server.crt", "certs-lan\server.key", "certs\ca.crt")
 if (-not (Test-Path $CFG)) { throw "$CFG is missing." }
 New-Item -ItemType Directory -Force -Path (Join-Path $DEPLOY "logs") | Out-Null
 
+# --- 0b. regenerate the per-instance routes ----------------------------------
+# $Caddyfile imports ./routes-lan.caddy, which is derived from instances.json. Regenerate
+# it HERE rather than trusting whatever is on disk: a route file left over from a previous
+# instances.json would point a prefix at a port now belonging to a DIFFERENT account, and
+# the proxy would serve it without complaint. Cheap to redo, expensive to get wrong.
+#
+# No instances.json (plain single-account setup) -> write an empty route file so the
+# import still resolves and only the catch-all applies. That keeps this script working
+# unchanged for anyone who never adopted multi-account.
+$PY = Join-Path (Split-Path -Parent $DEPLOY) ".venv\Scripts\python.exe"
+$GEN = Join-Path $DEPLOY "gen_routes.py"
+$ROUTES = Join-Path $DEPLOY "routes-lan.caddy"
+if ((Test-Path $PY) -and (Test-Path $GEN) -and (Test-Path (Join-Path (Split-Path -Parent $DEPLOY) "instances.json"))) {
+    Step "Regenerating routes-lan.caddy from instances.json"
+    & $PY $GEN
+    if ($LASTEXITCODE -ne 0) { throw "gen_routes.py failed - refusing to start with routes that may be stale." }
+} elseif (-not (Test-Path $ROUTES)) {
+    Step "No instances.json - writing an empty routes-lan.caddy (catch-all only)"
+    "# No instances.json on this machine: single-account setup, catch-all only.`n" |
+        Set-Content -Path $ROUTES -Encoding ascii
+}
+
 # --- 1. caddy.exe (download once) --------------------------------------------
 if (Test-Path $CADDY) {
     Step "caddy.exe already present"

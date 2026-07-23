@@ -95,6 +95,83 @@ matter.
 
 ---
 
+## Multiple accounts on one box
+
+One account per **MT5 terminal**, one terminal per **server**, all behind the **same** Caddy on
+8443. The terminal is the isolation boundary: `positions_get()` only ever returns the attached
+account's book, so a close-all physically cannot reach another account.
+
+**The instance is NAMED after the account, and the name is enforced.** Because the name is numeric
+it becomes `expect_login`: the server refuses to log in any other account, and if its terminal is
+switched to one by hand it goes unhealthy and the order path shuts. So the URL you are looking at
+cannot drift from the account you are trading — a label on a screen with a CLOSE ALL button has to
+be a fact, not a mnemonic.
+
+| Path | Port | Terminal | Task | Pinned to |
+|---|---|---|---|---|
+| `/` | 8765 | `C:\Program Files\MetaTrader 5` | `xauorderpad` | *(unpinned — legacy single-account)* |
+| `/472200942` | 8766 | `C:\mt5\472200942` (`/portable`) | `xauorderpad-472200942` | 472200942 |
+| `/472103079` | 8767 | `C:\mt5\472103079` | `xauorderpad-472103079` | 472103079 |
+| `/472104398` | 8768 | `C:\mt5\472104398` | `xauorderpad-472104398` | 472104398 |
+
+Renaming an instance retires its old task automatically — otherwise the previous, *unpinned* server
+would keep holding the same port and quietly serve the account you thought was now guarded.
+
+**One TLS port, not one per account.** The server certificate's SAN is the Elastic *IP* — no port,
+no DNS name — so it already covers every port. N proxies would mean N copies of the same private
+key, and every extra TLS port is another security-group rule to open and audit on an
+internet-facing box. Accounts are selected by **path**, so adding one touches no firewall at all.
+
+### Configure
+
+`deploy/instances.ec2.json` is the box's registry — **not** `XauOrderPad/instances.json`, which is
+the laptop's and is deliberately excluded from the ship bundle. Same separation as `certs/` (box)
+vs `certs-lan/` (laptop): two machines, two configs, and no path by which one silently becomes the
+other. Edit it, then:
+
+```powershell
+python mt5_ec2.py ship     # installs the registry + one scheduled task per instance
+python mt5_ec2.py caddy    # regenerates routes.caddy and reloads the front door
+```
+
+`ship` mints a `.token.<name>.local` per instance if absent. **Each instance gets its own token** —
+it is the only credential the trade endpoints check, so a shared one would let a phone profile
+saved for one account drive every other. Add one Android *Switch server* profile per account:
+`https://<eip>:8443/a1` with a1's token. No app rebuild — the client concatenates the path.
+
+### First run of each portable terminal needs RDP — once
+
+A freshly copied `/portable` terminal has never initialised. It starts, but never creates its
+`logs\`, `MQL5\` or `Tester\` folders, and `mt5.initialize()` dies with **`-10005 IPC timeout`**.
+That is not a credential problem and retrying does not help: MT5's first-run initialisation needs
+an interactive desktop, and the box's autologon session is normally *disconnected*.
+
+So, once per new terminal:
+
+1. `python mt5_ec2.py password` → RDP to `<eip>:3389` as `Administrator`.
+2. Launch `C:\mt5\a1\terminal64.exe /portable` (repeat for a2, a3), complete the first-run prompts,
+   log the account in with **Save password**, enable **AutoTrading** (Ctrl+E), and confirm `XAUUSD`
+   is in Market Watch.
+3. **Disconnect** RDP — do *not* log off, which kills every terminal.
+
+After that the API drives them normally and restarts need no RDP.
+
+### Check it
+
+```powershell
+python mt5_ec2.py caddy     # its self-test proves a certificate-less client is still rejected
+```
+
+Prove the routing rather than assume it: because every instance has a *distinct* token, dialling
+`/aN` with token N must return 200 and with any other token must return 401. A full diagonal of
+200s is the proof that each prefix reaches exactly one backend.
+
+> **The account lock does not span machines.** `instance_lock` is a local OS file lock, so it stops
+> two servers *on this box* driving one account — it cannot see your laptop. If the same account is
+> logged in both places, both have an independent close-all path and neither knows about the other.
+
+---
+
 ## Reach it from the Android app (mutual TLS)
 
 The phone reaches the box over the public internet on **8443**, guarded by **mutual TLS**: it must

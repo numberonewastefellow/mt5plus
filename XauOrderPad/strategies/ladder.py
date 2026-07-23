@@ -25,9 +25,12 @@ that shaped the guards in this file:
 
   3. The only component that can beat the spread is the operator's discretionary
      trigger -- and that CANNOT be backtested, because only they supply it.
-     => `paper` defaults to True. The engine logs the fills it WOULD have got and
-        places nothing, so the trigger's edge can be measured before a cent is
-        risked. This is the whole point of the engine's first life.
+     => `paper` mode exists: the engine logs the fills it WOULD have got and places
+        nothing, so the trigger's edge can be measured before a cent is risked. That
+        was the whole point of the engine's first life, and it is still how you cost
+        a new trigger. It is no longer the DEFAULT, though -- see config.py. The
+        thing that keeps this engine off real money is `allows_real = False`, which
+        base.py re-checks on every poll; paper mode was never that guard.
 
 ── And one finding this file learned the hard way, in production ──
 
@@ -67,6 +70,7 @@ import logging
 import time
 
 import config
+from . import state
 from .base import StrategyBase
 
 log = logging.getLogger("XauOrderPad.strategy")
@@ -274,6 +278,20 @@ class TrendLadder(StrategyBase):
     # max_positions was 1; it is fatal once the pyramid is uncapped.
     needs_hedging = True
 
+    # `paper` used to live here, so that a restart always came back SIMULATING. That was
+    # right while `config.LADDER_DEFAULTS["paper"]` was True: NEVER_RESTORE means "ignore
+    # what was saved and fall back to the constructor default", so the fallback WAS the
+    # safe side. The default is now False (see the note in config.py), which silently
+    # inverts it -- an operator who deliberately switched paper ON to measure a trigger
+    # would have found the engine placing orders again after the next restart, having
+    # changed nothing. A restart must not be able to overrule a deliberate choice in the
+    # dangerous direction, so the saved value is honoured.
+    #
+    # What actually stops a crash-restart loop from trading unattended is `enabled`, which
+    # base.py refuses to restore under any circumstance ("was enabled before the restart --
+    # NOT re-armed"). Arming stays a human act; this flag only decides what arming means.
+    NEVER_RESTORE = frozenset()
+
     def __init__(self) -> None:
         super().__init__()
         p = dict(config.LADDER_DEFAULTS)
@@ -312,6 +330,7 @@ class TrendLadder(StrategyBase):
         self._ladders_today = 0
         self._today = None
         self._managing_check = 0.0      # last broker re-check while managing (~1 Hz)
+        self._runtime_saved = 0.0       # last throttled persist of the daily counters
         self._adopt_basis: str | None = None     # how the extreme was reconstructed
         self._adopt_extreme: float | None = None
 
@@ -680,6 +699,56 @@ class TrendLadder(StrategyBase):
             self._today = today
             self._ladders_today = 0
 
+    # ---- per-day state that must survive a restart ------------------------
+    def _runtime(self) -> dict:
+        """`max_ladders_per_day` and `cooldown_s` are only worth the name if they
+        outlive the process. Both counters used to be memory-only, so a restart reset
+        them -- and this box restarts on its own (scheduled task, autostop/autostart),
+        which made the 'daily' cap really a 'per-process' cap."""
+        rt = super()._runtime()
+        rt.update({
+            "day": self._today.isoformat() if self._today else None,
+            "ladders_today": int(self._ladders_today),
+            "last_ladder_end": float(self._last_ladder_end),
+        })
+        return rt
+
+    def _restore_runtime(self, rt: dict) -> None:
+        super()._restore_runtime(rt)
+        if not rt:
+            return
+        today = datetime.date.today()
+        # Only TODAY's count survives. Restoring yesterday's would carry a spent daily
+        # budget into a fresh day; the date check is what makes it a daily cap and not
+        # a running total.
+        if rt.get("day") == today.isoformat():
+            self._today = today
+            self._ladders_today = int(rt.get("ladders_today") or 0)
+            # A cooldown is a wall-clock deadline, so it is meaningful across a restart
+            # in a way the count is not: if it has already elapsed, it simply does not bite.
+            self._last_ladder_end = float(rt.get("last_ladder_end") or 0.0)
+            if self._ladders_today:
+                log.info("ladder restored today's counters after a restart",
+                         extra={"event": "ladder_runtime_restored", "strategy": self.ID,
+                                "ladders_today": self._ladders_today,
+                                "day": rt.get("day")})
+
+    def _save_runtime(self, now: float) -> None:
+        """Persist the counters, THROTTLED.
+
+        `state.save` is a read-modify-write of a JSON file and this is reached from
+        `_finish_ladder`, on the worker thread, inside the ~66 ms poll budget that also
+        has to fill orders -- CLAUDE.md forbids blocking disk IO there. So it writes at
+        most once every `LADDER_RUNTIME_SAVE_MIN_S`. The trade-off is explicit: a crash
+        can lose a few seconds of increments (a ladder or two off the daily count),
+        which is worth far more than stalling the loop that feeds prices, the P&L guard
+        and the manual order pad.
+        """
+        if now - self._runtime_saved < float(config.LADDER_RUNTIME_SAVE_MIN_S):
+            return
+        self._runtime_saved = now
+        state.save(self.ID, self.enabled, self._params(), self._runtime())
+
     def _finish_ladder(self, now: float) -> None:
         self._ladders_done += 1
         self._roll_day()
@@ -689,8 +758,38 @@ class TrendLadder(StrategyBase):
         self._rearm_ok = False          # must re-cross the trigger before the next one
         self._last_ladder_end = now
         self._state = "armed"
+        self._save_runtime(now)
 
     # ---- guards -----------------------------------------------------------
+    def _guard_check(self, spread: float) -> tuple[bool, str | None]:
+        """Would the current params be REFUSED at this spread? Pure -- mutates nothing.
+
+        Split out of `_param_guard` so the exact same verdict can be handed to the UI
+        BEFORE an arm attempt, rather than only surfacing as an `error` string after the
+        server has already refused. One source of truth: the panel greys out ARM using
+        the sentence the engine would itself have raised, so the two cannot drift.
+
+        Returns (ok, reason). `reason` is None when ok, else the operator-facing line.
+        """
+        if self.target <= spread:
+            return False, (
+                f"refused: target {self.target:.2f}/oz is inside the live spread "
+                f"{spread:.2f}/oz -- a winning trade would still net "
+                f"{self.target - spread:+.2f}/oz. Raise the target above the spread.")
+        if self.stop_mode == "floor" and self.floor_offset <= spread:
+            return False, (
+                f"refused: floor_offset {self.floor_offset:.2f}/oz is inside the live "
+                f"spread {spread:.2f}/oz -- the floor sits where the ladder is already "
+                f"marked the moment it arms, so it would flush on the first tick. "
+                f"Raise it above the spread.")
+        if self.stop_mode == "retrace" and self.retrace <= spread:
+            return False, (
+                f"refused: retrace {self.retrace:.2f}/oz is inside the live spread "
+                f"{spread:.2f}/oz -- every rung would stop out for at least "
+                f"{-(self.retrace + spread):.2f}/oz before it could move. "
+                f"Raise the retrace above the spread.")
+        return True, None
+
     def _param_guard(self, spread: float) -> bool:
         """Refuse the impossible; warn about the merely unlikely.
 
@@ -700,28 +799,16 @@ class TrendLadder(StrategyBase):
         zero, so it is a warning in status() rather than a refusal. Refusing a legal
         configuration the operator may have chosen deliberately would be the engine
         overruling the human; staying silent about one that cannot win was the bug.
+
+        The comparisons live in `_guard_check`; this method is the side-effecting half
+        -- it disables and records the reason. Kept re-checked EVERY poll on purpose: a
+        spread that widens past a dialled stop must disarm a RUNNING ladder, not only
+        block a fresh arm.
         """
-        if self.target <= spread:
-            self._disable_with(
-                f"refused: target {self.target:.2f}/oz is inside the live spread "
-                f"{spread:.2f}/oz -- a winning trade would still net "
-                f"{self.target - spread:+.2f}/oz. Raise the target above the spread.")
-            return False
-        if self.stop_mode == "floor" and self.floor_offset <= spread:
-            self._disable_with(
-                f"refused: floor_offset {self.floor_offset:.2f}/oz is inside the live "
-                f"spread {spread:.2f}/oz -- the floor sits where the ladder is already "
-                f"marked the moment it arms, so it would flush on the first tick. "
-                f"Raise it above the spread.")
-            return False
-        if self.stop_mode == "retrace" and self.retrace <= spread:
-            self._disable_with(
-                f"refused: retrace {self.retrace:.2f}/oz is inside the live spread "
-                f"{spread:.2f}/oz -- every rung would stop out for at least "
-                f"{-(self.retrace + spread):.2f}/oz before it could move. "
-                f"Raise the retrace above the spread.")
-            return False
-        return True
+        ok, reason = self._guard_check(spread)
+        if not ok:
+            self._disable_with(reason)
+        return ok
 
     # ---- execution --------------------------------------------------------
     def _do(self, worker, act: tuple) -> None:

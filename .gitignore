@@ -79,8 +79,34 @@ XauOrderPad/deploy/logs/
 # the banner echoes the LAN URL, so keep it out of the repo.
 XauOrderPad/.server.*.log
 
+# The operator's connection sheet: every account's URL *and its API token*, for both the
+# laptop and the box. A token grants order placement on whatever account that server holds,
+# so this is as sensitive as .token.*.local -- it just happens to be readable.
+#
+# It lives at the REPO ROOT, deliberately NOT under XauOrderPad/: `mt5_ec2.py ship` walks
+# that directory and would bundle it straight onto the box, handing the box every laptop
+# token. Same trap that shipped .token.a1.local before the exclusion was made a pattern.
+accounts.md
+
+# The multi-account instance registry. Names real broker accounts and local terminal
+# paths, so it is machine-specific and not ours to publish. instances.json.example IS
+# tracked and carries the documentation.
+XauOrderPad/instances.json
+
+# Same class as instances.json above, but for the EC2 BOX: names the box's real broker
+# accounts and its C:\mt5\<account> terminal paths. Machine-specific, not ours to publish.
+XauOrderPad/deploy/instances.ec2.json
+
+# Caddy routes GENERATED from instances.json (deploy/gen_routes.py). Derived from an
+# ignored file, so committing it would leak exactly the instance list instances.json
+# is ignored to protect -- and a stale committed copy would silently disagree with
+# the config Caddy is actually serving.
+XauOrderPad/deploy/routes-lan.caddy
+XauOrderPad/deploy/routes.caddy
+
 # Android build output
 android/.gradle/
+android/.kotlin/
 android/build/
 android/app/build/
 android/local.properties

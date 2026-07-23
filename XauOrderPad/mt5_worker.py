@@ -71,6 +71,8 @@ class Mt5Worker:
         # Set by _verify_terminal when we land on a terminal that is not ours, so the
         # UI can report a config fault instead of a bogus "broker disconnected".
         self._wrong_terminal = None
+        # Set by _verify_account when the terminal is ours but holds the wrong account.
+        self._wrong_account = None
         self._poll_count = 0
         # Bar cache for the strategy engines: {key: (wall_clock_bucket, count, array)}.
         # See recent_bars(). Cleared on login/symbol change -- bars from the previous
@@ -204,11 +206,12 @@ class Mt5Worker:
         if self._initialized:
             ti = mt5.terminal_info()
             if ti is not None and ti.connected:
-                # Re-assert the binding on EVERY poll, not just at connect time. It is
-                # free -- `ti` is already in hand -- and it turns "we were on the right
-                # terminal when we attached" into "we are on it now", which is the
-                # claim the close-all path actually depends on.
-                return self._verify_terminal(ti)
+                # Re-assert the bindings on EVERY poll, not just at connect time. Both are
+                # cheap -- `ti` is already in hand -- and they turn "this was right when we
+                # attached" into "this is right now", which is the claim the close-all path
+                # actually depends on. The account check matters just as much as the
+                # terminal one: someone can switch account inside the MT5 GUI at any moment.
+                return self._verify_terminal(ti) and self._verify_account()
             # lost connection -> drop and re-init below
             self._initialized = False
             log.warning(
@@ -232,6 +235,8 @@ class Mt5Worker:
             return False
         # INVARIANT: we are attached to OUR terminal, or we are attached to nothing.
         if not self._verify_terminal():
+            return False
+        if not self._verify_account():
             return False
         self._initialized = True
         self._resolve_symbol()
@@ -310,6 +315,44 @@ class Mt5Worker:
         self._wrong_terminal = {"expected": want, "actual": got}
         return False
 
+    def _verify_account(self) -> bool:
+        """Prove the terminal holds the ONE account this instance is pinned to.
+
+        The terminal guard answers "am I driving my own terminal". This answers the
+        question that actually matters to a close-all: "is my terminal on the account
+        I think it is". They are different failures -- the terminal can be correct
+        while a human switches its account in the MT5 GUI, or logs it into the wrong
+        one from the phone -- and `positions_get()` reports the new account's book
+        without a word of complaint.
+
+        Unpinned (EXPECT_LOGIN == 0) is the single-account default and always passes.
+
+        Not logged in yet is NOT a mismatch: account_info() is None before login, and
+        treating that as a fault would make a freshly booted server unhealthy forever.
+        """
+        if not config.EXPECT_LOGIN:
+            self._wrong_account = None
+            return True
+        acc = mt5.account_info()
+        if acc is None:
+            return True                      # logged out; nothing to contradict
+        actual = int(getattr(acc, "login", 0) or 0)
+        if actual == int(config.EXPECT_LOGIN):
+            self._wrong_account = None
+            return True
+
+        log.error("terminal is on the WRONG ACCOUNT -- refusing to drive it",
+                  extra={"event": "wrong_account_attached",
+                         "expected_login": int(config.EXPECT_LOGIN),
+                         "actual_login": actual,
+                         "actual_server": getattr(acc, "server", None)})
+        # Deliberately NOT calling mt5.shutdown(): the terminal is ours and correct, only
+        # its account is wrong. Keeping the connection lets the next poll notice the moment
+        # it is put back, instead of needing a restart. Returning False is what closes the
+        # trade path -- every order helper goes through _ensure_connected.
+        self._wrong_account = {"expected": int(config.EXPECT_LOGIN), "actual": actual}
+        return False
+
     def _resolve_symbol(self) -> None:
         si = mt5.symbol_info(config.SYMBOL)
         if si is None and config.AUTO_RESOLVE_SYMBOL:
@@ -328,6 +371,14 @@ class Mt5Worker:
                 if not self._session_active:
                     st.update(connected=False, healthy=False,
                               logged_out=True, error="logged out")
+                elif self._wrong_account:
+                    st.update(connected=False, healthy=False,
+                              wrong_account=self._wrong_account,
+                              error=(f"terminal is on account "
+                                     f"{self._wrong_account['actual']}, but this instance "
+                                     f"is pinned to {self._wrong_account['expected']}. "
+                                     f"Trading is blocked. Log it back into "
+                                     f"{self._wrong_account['expected']}."))
                 elif self._wrong_terminal:
                     # A configuration fault, not a broker one. Say which terminal we
                     # got so the fix is obvious from the banner alone.
@@ -904,6 +955,23 @@ class Mt5Worker:
         path = cmd.get("path") or config.MT5_PATH or None
         if not (login and password and server):
             return {"ok": False, "error": "login, password and server are required"}
+
+        # ---- the instance is PINNED to one account ----------------------------
+        # Checked first, before the lock and before MT5 is touched, so a wrong-account
+        # attempt changes precisely nothing -- no half-switch, no lock taken, no terminal
+        # relogged. This is the guard that makes an instance NAMED after an account
+        # trustworthy: without it the name is a comment, and this is a screen people
+        # press CLOSE ALL on.
+        if config.EXPECT_LOGIN and int(login) != int(config.EXPECT_LOGIN):
+            log.warning("login refused: wrong account for this instance",
+                        extra={"event": "account_login_refused_pinned",
+                               "requested_login": int(login),
+                               "expected_login": int(config.EXPECT_LOGIN),
+                               "instance": instance_paths.instance_name()})
+            return {"ok": False, "wrong_account": True,
+                    "error": (f"this server only drives account "
+                              f"{config.EXPECT_LOGIN}; refusing to log in {login}. "
+                              f"Use the instance for that account.")}
 
         prev_open = self._open_position_count()    # outgoing account's open trades
 

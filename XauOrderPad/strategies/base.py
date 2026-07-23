@@ -21,6 +21,7 @@ Subclasses implement:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import threading
 
@@ -28,6 +29,16 @@ import config
 from . import state
 
 log = logging.getLogger("XauOrderPad.strategy")
+
+
+def _today() -> str:
+    """The day the per-strategy limits are counted over.
+
+    LOCAL midnight, deliberately: it is the same boundary `strategy_daily_realized`
+    and `/api/history` already use, so the kill-switch and the numbers on screen can
+    never disagree about which day it is.
+    """
+    return datetime.date.today().isoformat()
 
 
 class StrategyBase:
@@ -41,6 +52,11 @@ class StrategyBase:
         self._state = "disabled"          # disabled|armed|active|managing|killed|waiting:…
         self._error: str | None = None
         self._killed = False              # daily-loss kill-switch, latched
+        # WHICH DAY the latch belongs to. A daily limit that forgets the day is not a
+        # daily limit: `_killed` lived only in memory, so a restart cleared it and the
+        # engine could breach the same day's limit again, and again. Persisted with the
+        # latch and restored only when it is still that day -- see `_runtime`.
+        self._killed_day: str | None = None
         # Adopted positions but NOT re-armed: manage the exits, open nothing new.
         # Without this flag `evaluate()` returns early on `not enabled` and the
         # adopted book would sit unmanaged -- which is the exact bug reconcile()
@@ -89,20 +105,51 @@ class StrategyBase:
                             extra={"event": "strategy_live_orders_enabled",
                                    "strategy": self.ID, "params": after})
 
+            # Raising the limit is the ONE deliberate act that reopens a killed day.
+            #
+            # The latch has to be escapable or a single bad morning disables the engine
+            # until midnight with no way back. But the escape must be an explicit
+            # decision about RISK -- "I accept losing more than X today" -- not a side
+            # effect of toggling a switch. So the limit going UP clears it, and nothing
+            # else does.
+            if (self._killed and self._killed_day == _today()
+                    and float(after.get("max_daily_loss") or 0) >
+                    float(before.get("max_daily_loss") or 0)):
+                log.warning("strategy %s: daily-loss limit raised %.0f -> %.0f, "
+                            "clearing today's kill latch", self.ID,
+                            float(before.get("max_daily_loss") or 0),
+                            float(after.get("max_daily_loss") or 0),
+                            extra={"event": "strategy_kill_latch_cleared",
+                                   "strategy": self.ID, "day": self._killed_day})
+                self._killed = False
+                self._killed_day = None
+
             if enabled is not None:
+                # A same-day kill SURVIVES a re-arm. This used to clear the latch
+                # unconditionally, so the daily limit was really a per-toggle limit:
+                # trip at -200, flick the switch, lose another 200. The engine may be
+                # armed, but `evaluate()` keeps it parked in `killed` until the day
+                # rolls over or the operator raises the limit above.
                 self.enabled = bool(enabled)
                 if self.enabled:
-                    self._killed = False      # re-arming clears a prior kill
-                    self._error = None
-                    self._state = "armed"
+                    if self._killed and self._killed_day == _today():
+                        self._state = "killed"
+                        self._error = (
+                            f"daily-loss limit {self.max_daily_loss:.0f} already breached "
+                            f"today -- raise the limit to resume, or wait for tomorrow")
+                    else:
+                        self._killed = False
+                        self._killed_day = None
+                        self._error = None
+                        self._state = "armed"
                 else:
                     self._state = "disabled"
                 log.info("strategy %s %s", self.ID,
                          "enabled" if self.enabled else "disabled",
                          extra={"event": "strategy_toggle", "strategy": self.ID,
                                 "enabled": self.enabled, "paper": after.get("paper"),
-                                "params": after})
-        state.save(self.ID, self.enabled, self._params())
+                                "killed_today": self._killed, "params": after})
+        state.save(self.ID, self.enabled, self._params(), self._runtime())
         return self.status()
 
     # ---- crash recovery ---------------------------------------------------
@@ -121,13 +168,32 @@ class StrategyBase:
             never needs a human to authorise it. A position nobody is managing is
             the whole problem this method exists to solve.
 
-          * RE-ARM ONLY IF FRESH. Taking NEW risk unattended is a different matter. A
-            crash-restart loop that re-armed on every boot would pyramid forever --
-            that is how an unattended bot does real damage. So new entries resume
-            only when the saved state is recent (config.LADDER_RESUME_MAX_AGE_S);
-            anything older is managed but disarmed, and says so.
+          * NEVER RE-ARM. Taking NEW risk unattended is a different matter, and no
+            time window makes it safe. This used to resume any engine whose saved
+            state was younger than config.LADDER_RESUME_MAX_AGE_S -- and on
+            2026-07-21T23:28 it did exactly that: a restart 97 s after the operator
+            last touched the panel silently re-armed the rider while it held a 1.0-lot
+            position. The window was also the last thing standing between a tripped
+            daily-loss kill-switch and a re-armed engine, because `_killed` lives only
+            in memory and `state.save` is called solely from `update()`: kill at
+            T+4 min, restart at T+8 min, and the engine that had just breached its loss
+            limit came back armed with the latch cleared.
+
+            So: arming is now ALWAYS a deliberate human act. An engine boots disabled,
+            works the exits of whatever it adopted, and opens nothing until somebody
+            enables it. Restarts are cheap; an unattended bot taking fresh risk is not.
         """
         rec = state.load(self.ID)
+        # The day's own bookkeeping comes back FIRST, before anything can act on it: the
+        # kill latch decides whether this engine may trade at all today, so restoring it
+        # after `_apply` would leave a window where it looked clear.
+        if rec:
+            try:
+                self._restore_runtime(rec.get("runtime") or {})
+            except Exception:
+                log.exception("could not restore runtime state",
+                              extra={"event": "strategy_runtime_restore_failed",
+                                     "strategy": self.ID})
         if rec and rec.get("params"):
             saved = dict(rec["params"])
             # NEVER_RESTORE: real-money switches boot OFF, always. A restart loop that
@@ -152,6 +218,14 @@ class StrategyBase:
             return
 
         adopted = 0
+        if not positions:
+            # The BROKER says this engine holds nothing, and the broker is the authority.
+            # `_adopt` runs only when there ARE positions, so without this an engine-local
+            # handle left over from before the restart survives a reconcile that just
+            # PROVED the position is gone -- the rider was reporting `live_ticket` for a
+            # trade closed eight hours earlier, and would have refused to open a new one
+            # until something cleared it.
+            self._on_flat()
         if positions:
             try:
                 adopted = int(self._adopt(worker, positions) or 0)
@@ -162,32 +236,43 @@ class StrategyBase:
 
         age = state.age_s(rec)
         was_on = bool(rec and rec.get("enabled"))
-        fresh = age <= float(config.LADDER_RESUME_MAX_AGE_S)
-        rearmed = was_on and fresh
 
-        if rearmed:
-            self.enabled = True
-            self._managing = False
-            self._error = None
-            self._state = "armed"
-        else:
-            self.enabled = False
-            self._managing = bool(adopted)   # keep working the exits, open nothing new
-            self._state = "managing" if adopted else "disabled"
-            if adopted and was_on:
-                # Loud, and in the UI -- not just the log. Somebody has to know that
-                # the book is being babysat but nothing new will be opened.
-                self._error = (
-                    f"resumed management of {adopted} open position(s) after a restart "
-                    f"({int(age)}s old state) — re-enable to take new entries")
-            elif adopted:
-                self._error = (f"adopted {adopted} orphaned position(s) from the broker "
-                               f"— managing exits only")
+        # Disabled, always. Adopted positions are still managed -- that reduces risk --
+        # but nothing new is opened until a human arms it.
+        self.enabled = False
+        self._managing = bool(adopted)       # keep working the exits, open nothing new
+        self._state = "managing" if adopted else "disabled"
+        if adopted and was_on:
+            # Loud, and in the UI -- not just the log. Somebody has to know that the
+            # book is being babysat but nothing new will be opened.
+            self._error = (
+                f"resumed management of {adopted} open position(s) after a restart "
+                f"— re-enable to take new entries")
+        elif adopted:
+            self._error = (f"adopted {adopted} orphaned position(s) from the broker "
+                           f"— managing exits only")
+        elif was_on:
+            # It was running when the process died and it is NOT running now. With a flat
+            # book nothing else would say so, and an operator who believes an engine is
+            # armed when it is not is exactly as badly informed as the reverse.
+            self._error = "was enabled before the restart — NOT re-armed; enable it by hand"
+
+        # A live kill latch OUTRANKS everything above. Both are true -- the engine is
+        # disabled AND it breached its limit today -- but only one of them explains why
+        # re-enabling will not stick, and it is not "disabled". `_restore_runtime` sets
+        # this before `_apply`, and the generic status assignment above would otherwise
+        # paint straight over the single most important thing on the panel.
+        if self._killed and self._killed_day == _today():
+            self._state = "killed"
+            self._error = (f"daily-loss limit {self.max_daily_loss:.0f} was breached "
+                           f"earlier today -- raise the limit to resume"
+                           + (f"; still managing {adopted} open position(s)"
+                              if adopted else ""))
 
         log.info("strategy %s reconciled", self.ID,
                  extra={"event": "strategy_reconciled", "strategy": self.ID,
                         "adopted": adopted, "state_age_s": None if age == float("inf") else int(age),
-                        "was_enabled": was_on, "rearmed": rearmed,
+                        "was_enabled": was_on, "rearmed": False,
                         "detail": self._adopt_detail()})
 
     def status(self) -> dict:
@@ -245,6 +330,20 @@ class StrategyBase:
             self._disable_with("refused: account is netting -- this strategy needs hedging")
             return
         if self._killed:
+            # A latch belongs to ONE day. Without this it would only ever clear on a
+            # restart or a re-arm, so an engine killed on Monday would still be dead on
+            # Tuesday -- and the operator would be waiting on a limit that had already
+            # reset everywhere else (`strategy_daily_realized` counts from local
+            # midnight). It stays disabled either way; arming is still a human act.
+            if self._killed_day and self._killed_day != _today():
+                log.info("strategy %s: daily-loss latch expired with the day", self.ID,
+                         extra={"event": "strategy_kill_latch_expired",
+                                "strategy": self.ID, "was_day": self._killed_day})
+                self._killed = False
+                self._killed_day = None
+                self._error = None
+                self._state = "disabled"
+                return
             self._state = "killed"
             return
         if not st.get("healthy"):
@@ -275,17 +374,26 @@ class StrategyBase:
         return False
 
     def _disable_with(self, msg: str) -> None:
+        was_managing = self._managing
         if self.enabled or self._managing or self._error != msg:
             log.warning("strategy %s auto-disabled: %s", self.ID, msg,
                         extra={"event": "strategy_auto_disabled",
-                               "strategy": self.ID, "reason": msg})
+                               "strategy": self.ID, "reason": msg,
+                               "abandoned_book": was_managing})
         self.enabled = False
         # Managing must stop too. These gates fire on "this is not the demo account"
         # and "this account cannot hedge" -- i.e. we are looking at a DIFFERENT book
         # than the one we adopted. Continuing to "manage" positions on it would mean
         # sending closes against someone else's trades.
         self._managing = False
-        self._error = msg
+        # ...but say so. Dropping management is silent otherwise: the operator sees only
+        # "refused: connected account is NOT a demo account" and has no way to know that
+        # a position they believe is being trailed now has nothing but its broker-side
+        # stop behind it. The engine cannot safely close it (wrong account) -- a human
+        # has to decide -- so the least it can do is state the situation plainly.
+        self._error = (msg + " — WARNING: open position(s) are no longer being managed; "
+                             "their broker-side stop is the only protection left"
+                       ) if was_managing else msg
         self._state = "disabled"
 
     def positions(self, worker) -> list:
@@ -321,12 +429,50 @@ class StrategyBase:
                 worker.strategy_close_ticket(self.MAGIC, int(p.ticket))
             self._on_killed()
             self._killed = True
+            self._killed_day = _today()
             self.enabled = False
             self._state = "killed"
             self._error = (f"daily loss {realized + floating:.2f} <= "
-                           f"-{self.max_daily_loss:.0f} — auto-disabled")
+                           f"-{self.max_daily_loss:.0f} -- auto-disabled for today")
+            # Persist IMMEDIATELY. This is the one moment the latch is worth anything,
+            # and the process may not survive to the next control change -- that is
+            # exactly how it was lost before. One small write, once a day at most, and
+            # never on the hot path: by here the book is already flat.
+            state.save(self.ID, self.enabled, self._params(), self._runtime())
             return True
         return False
+
+    # ---- per-day runtime state (persisted; see strategies/state.py) --------
+    def _runtime(self) -> dict:
+        """Bookkeeping that must OUTLIVE the process but cannot be read back from the
+        broker. Subclasses extend it; they must call super() and merge.
+
+        The test for belonging here is simple: could `positions_get` or
+        `history_deals_get` reconstruct it? Realized P&L can, so it is not here.
+        "This engine already breached its limit today" cannot -- nothing at the broker
+        records it -- so it is.
+        """
+        return {"killed": bool(self._killed), "killed_day": self._killed_day}
+
+    def _restore_runtime(self, rt: dict) -> None:
+        """Restore only what still applies TODAY.
+
+        A latch from yesterday is not a latch; letting it survive the date boundary
+        would disable an engine forever after one bad session. So the day is stored
+        with it and checked here, and anything older is simply dropped.
+        """
+        if not rt:
+            return
+        day = rt.get("killed_day")
+        if rt.get("killed") and day == _today():
+            self._killed = True
+            self._killed_day = day
+            self._state = "killed"
+            self._error = (f"daily-loss limit {self.max_daily_loss:.0f} was breached "
+                           f"earlier today -- raise the limit to resume")
+            log.warning("strategy %s restored TODAY's daily-loss kill latch", self.ID,
+                        extra={"event": "strategy_kill_latch_restored",
+                               "strategy": self.ID, "day": day})
 
     # ---- subclass hooks ---------------------------------------------------
     def _defaults(self) -> dict:
@@ -346,6 +492,14 @@ class StrategyBase:
 
     def _on_killed(self) -> None:
         """Drop engine-local bookkeeping after the kill-switch flattened us."""
+
+    def _on_flat(self) -> None:
+        """The broker reports NO positions for this engine. Drop any local handle.
+
+        The counterpart to `_adopt`: that one runs only when positions exist, so an
+        engine that caches a ticket needs somewhere to hear "you hold nothing" too.
+        Default is a no-op -- ladder and straddle rebuild their book from `positions`
+        every reconcile anyway and have nothing to forget."""
 
     def _adopt(self, worker, positions: list) -> int:
         """Rebuild engine-local state from the broker's OPEN POSITIONS.

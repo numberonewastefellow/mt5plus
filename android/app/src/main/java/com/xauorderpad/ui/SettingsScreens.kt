@@ -1075,6 +1075,23 @@ private fun RiderExecution(
             fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Amber,
         )
     }
+
+    // The exit geometry, in the units the server is ACTUALLY using. Tuning stays in the web
+    // panel, but the phone must not leave the operator guessing what "6" means before they
+    // arm auto-trading from here: $6.00, or 6 x ATR (~$27 at a typical M5 ATR).
+    val units = s.params?.stopUnits
+    if (units != null) {
+        Spacer(Modifier.height(12.dp))
+        val atr = units.equals("atr", ignoreCase = true)
+        val fmt = { v: Double? ->
+            if (v == null) "—" else if (atr) "${Fmt.price(v, 2)}x ATR" else "$${Fmt.price(v, 2)}"
+        }
+        Text(
+            "Exit: stop ${fmt(s.params.sl)}, trail ${fmt(s.params.trail)}" +
+                if (atr) "  — scales with volatility" else "  — fixed dollars",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 /**

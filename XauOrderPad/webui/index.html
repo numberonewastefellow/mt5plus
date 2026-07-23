@@ -712,9 +712,26 @@
 
       <div class="set-row"><label>Thrust size (× ATR)</label>
         <input id="rdThrust" type="number" min="0.5" step="0.25" value="1.5"></div>
-      <div class="set-row"><label>Stop ($/oz)</label>
-        <input id="rdSl" type="number" min="1" step="0.5" value="6"></div>
-      <div class="set-row"><label>Trailing ($/oz)</label>
+
+      <!-- How Stop/Trailing below are READ. Changing this changes the UNITS of the two
+           fields under it, which is why the labels re-write themselves in strategy.js. -->
+      <div class="set-row"><label>Stop/trail units</label>
+        <select id="rdStopUnits">
+          <option value="fixed">Fixed $/oz (validated default)</option>
+          <option value="atr">× ATR — scales with volatility</option>
+        </select></div>
+      <div class="set-note" id="rdStopUnitsNote" style="margin:-4px 0 8px">
+        <b>Fixed</b> pins the stop to a dollar figure. On an active session that $6 trail sits
+        <i>below</i> the market's own noise (median pullback $6.45), so trades exit on the first
+        retrace — 6 of 6 on 22&nbsp;Jul. <b>× ATR</b> scales it instead: over 6.5&nbsp;months it
+        beat fixed on <i>both</i> halves of a train/holdout split (+1.33 vs +0.81 mean on holdout)
+        and stood <b>3.2σ</b> above a random-direction control versus fixed's 1.0σ.
+        Still unproven forward — <b>test on demo before trusting it</b>.
+      </div>
+
+      <div class="set-row"><label id="rdSlLabel">Stop ($/oz)</label>
+        <input id="rdSl" type="number" min="0.1" step="0.5" value="6"></div>
+      <div class="set-row"><label id="rdTrailLabel">Trailing ($/oz)</label>
         <input id="rdTrail" type="number" min="0" step="0.5" value="6"></div>
       <div class="set-row"><label>Far target ($/oz)</label>
         <input id="rdTp" type="number" min="1" step="1" value="50"></div>

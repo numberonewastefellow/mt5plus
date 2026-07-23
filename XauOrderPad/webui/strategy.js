@@ -106,6 +106,7 @@
       needsHedging: false,
       fields: {
         thrust_mult: ["rdThrust", num],
+        stop_units: ["rdStopUnits", str],
         sl: ["rdSl", num],
         trail: ["rdTrail", num],
         tp: ["rdTp", num],
@@ -215,11 +216,34 @@
     if (eng.id === "ladder") { renderSpreadHint(s); renderStopMode(s); }
     if (eng.id === "rider") {
       renderRiderCard(s);
+      renderStopUnits();
       autoWasOn = { demo: !!(s.params && s.params.auto_demo),
                     real: !!(s.params && s.params.auto_real) };
     }
     paperWasOn[eng.id] = s.params ? !!s.params.paper : true;
   }
+
+  /* Rewrite the Stop/Trailing labels to match the selected UNITS.
+     The two fields do not change, but what "6" MEANS in them does: $6.00 in fixed
+     mode, 6 x ATR in atr mode -- and at a typical M5 ATR of ~$4.50 that is a $27
+     stop, four times wider. A static "$/oz" label next to a multiplier is exactly
+     the kind of unit mismatch that put a 10x-wrong stop on a live order once already. */
+  function renderStopUnits() {
+    const sel = $("rdStopUnits");
+    if (!sel) return;
+    const atr = sel.value === "atr";
+    const sl = $("rdSlLabel"), tr = $("rdTrailLabel");
+    if (sl) sl.textContent = atr ? "Stop (× ATR)" : "Stop ($/oz)";
+    if (tr) tr.textContent = atr ? "Trailing (× ATR)" : "Trailing ($/oz)";
+    // Sane bounds per mode: a 6 left over from $/oz means 6xATR here, so nudge the
+    // step/max to make the multiplier reading obvious rather than silently accepted.
+    for (const el of [$("rdSl"), $("rdTrail")]) {
+      if (!el) continue;
+      el.step = atr ? "0.25" : "0.5";
+      el.max = atr ? "10" : "";
+    }
+  }
+  { const el = $("rdStopUnits"); if (el) el.addEventListener("change", renderStopUnits); }
 
   /* The rider's live TRADE-NOW card. It is a SUGGESTION: shown only on an
      actionable 'enter' signal while enabled; the operator taps Place to send it

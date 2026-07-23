@@ -61,7 +61,15 @@ function spreadPts(s){ return s==='XAUUSD'?20 : s==='BTCUSD'?40 : s==='US30'?30 
    Every method returns a Promise. The UI only talks to this object.
    ========================================================================== */
 const API = {
-  base:'',          // same origin — served by the FastAPI backend
+  // Same origin, but NOT necessarily the root. On the multi-account box each server is
+  // published behind a path prefix (https://<ip>:8443/472104398/), so a request to a
+  // root-absolute '/api/state' does not reach THIS account's server at all -- it falls
+  // through Caddy's catch-all to the DEFAULT one, and the symptom is a bewildering
+  // "token rejected" on a token that is perfectly correct for the page you are looking at.
+  //
+  // Derive the prefix from where this page was actually served. Serving at the root
+  // yields '' , so the single-account desktop flow is byte-for-byte unchanged.
+  base: location.pathname.replace(/\/index\.html$/, '').replace(/\/+$/, ''),
   demo:false,       // LIVE: wired to the XauOrderPad backend
 
   // Shared secret for the backend's _check_token. Blank when the server runs on
@@ -1262,7 +1270,10 @@ function promptForToken(msg){
 async function ensureToken(){
   let cfg = null;
   try {
-    cfg = await (await fetch('/api/config', {cache:'no-store'})).json();
+    // API.base, not a root-absolute path: behind an account prefix this would otherwise
+    // ask the DEFAULT server whether a token is required, and then validate the answer
+    // against a different account's server.
+    cfg = await (await fetch(API.base + '/api/config', {cache:'no-store'})).json();
   } catch(e){
     return;                             // server down; the ws retry loop handles it
   }
@@ -1295,7 +1306,10 @@ function connectLive(){
   // set handshake headers. chart.js taps this same socket by substring-matching
   // '/ws', so the query params do not disturb it.
   const qs = API.token ? `?token=${encodeURIComponent(API.token)}` : '';
-  const ws = new WebSocket(`${proto}://${location.host}/ws${qs}`);
+  // API.base carries the account prefix when this page is served behind one; without it
+  // the socket would connect to the DEFAULT server and stream another account's prices
+  // into this page.
+  const ws = new WebSocket(`${proto}://${location.host}${API.base}/ws${qs}`);
   liveWs = ws;
 
   ws.onmessage = ev=>{ try{ onState(JSON.parse(ev.data)); }catch(e){} };

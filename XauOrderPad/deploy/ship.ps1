@@ -38,6 +38,14 @@ if (-not (Test-Path "C:\app\app.tar")) { throw "C:\app\app.tar is missing - did 
 # Stop the server BEFORE overwriting its files, or Windows locks the .py files it has mapped and
 # tar silently fails to replace them -- leaving a half-updated tree that starts and misbehaves.
 try { Stop-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue } catch { }
+# ...and every per-instance task, for the same reason: a running server keeps its .py files
+# mapped, tar silently fails to replace them, and the box ends up on a half-updated tree that
+# starts and misbehaves. Stopping only the default task would leave N servers holding the
+# very files being replaced.
+foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue |
+                Where-Object { $_.TaskName -like "$TASK-*" })) {
+    try { Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue } catch { }
+}
 Start-Sleep -Seconds 2
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
@@ -63,6 +71,21 @@ icacls $CertDir /inheritance:r /grant "Administrators:(OI)(CI)F" /grant "SYSTEM:
 
 # NOTE: ca.key is deliberately NOT here and must never be. It mints client identities; it lives
 # on the laptop only. This box has no business being able to issue new trading credentials.
+
+# --- 2b. the BOX's instance registry ------------------------------------------
+# Installed from a SEPARATE file (deploy/instances.ec2.json), not from the app bundle. The
+# laptop's own instances.json is excluded from the bundle on purpose: it names D:\ paths that do
+# not exist here, so shipping it would replace this box's config with the developer's -- the same
+# class of mistake config.py's comment records about MT5_PATH and LAUNCH_BROWSER.
+#
+# Absent (single-account box) -> leave whatever is here alone and carry on.
+$IncomingInstances = "C:\app\_instances.ec2.json"
+if (Test-Path $IncomingInstances) {
+    Step "Installing the box instance registry"
+    Move-Item -Path $IncomingInstances -Destination (Join-Path $AppDir "instances.json") -Force
+    Get-Content (Join-Path $AppDir "instances.json") |
+        Select-String -Pattern '"name"|"port"|"mt5_path"' | ForEach-Object { "    $($_.Line.Trim())" }
+}
 
 # --- 3. venv ------------------------------------------------------------------
 # Rebuild rather than reuse: requirements.txt gained numpy, which used to arrive only as a
@@ -178,6 +201,113 @@ if (-not (Get-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue)) {
 }
 
 try { Start-ScheduledTask -TaskName $TASK -ErrorAction SilentlyContinue } catch {}
+
+# --- 4b. one task per EXTRA account -------------------------------------------
+# The task above is the DEFAULT (single-account) server on $Port, unchanged. Each entry in
+# instances.json gets its own task, its own port, its own terminal and its own token file.
+#
+# Same principal as the default: Interactive / AtLogOn. MT5 cannot complete a broker login in
+# session 0 -- that is why the default moved off S4U, and an extra account is no different.
+#
+# MT5_PATH is passed per instance and is MANDATORY here: with several terminals running, a
+# pathless mt5.initialize() attaches to the machine's registry default, i.e. possibly another
+# account's terminal. server.py refuses to start without it when INSTANCE is set.
+$InstFile = Join-Path $AppDir "instances.json"
+if (Test-Path $InstFile) {
+    Step "Registering a task per instance from instances.json"
+    $insts = (Get-Content $InstFile -Raw | ConvertFrom-Json).instances
+    foreach ($inst in $insts) {
+        $iname = $inst.name
+        $itask = "xauorderpad-$iname"
+        $iwrap = "C:\app\run_$iname.ps1"
+
+        # The account this instance may drive. Explicit expect_login wins; otherwise the
+        # NAME is used when it is an account number. Mirrors instances.py so the box and
+        # the laptop pin identically -- a guardrail that only holds on one machine is not
+        # a guardrail.
+        $iexpect = 0
+        if ($inst.PSObject.Properties.Name -contains "expect_login" -and $inst.expect_login) {
+            $iexpect = [int]$inst.expect_login
+        } elseif ($iname -match '^\d+$') {
+            $iexpect = [int]$iname
+        }
+
+        # Each instance needs its OWN token, or one saved phone profile drives every account.
+        # Generated here when absent, exactly like the default token above.
+        $itokFile = Join-Path $AppDir ".token.$iname.local"
+        if ((Test-Path $itokFile) -and ((Get-Content $itokFile -Raw).Trim())) {
+            $itok = (Get-Content $itokFile -Raw).Trim()
+        } else {
+            $bytes = New-Object byte[] 24
+            $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+            try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+            $itok = [Convert]::ToBase64String($bytes).Replace('+','-').Replace('/','_').TrimEnd('=')
+            [System.IO.File]::WriteAllText($itokFile, $itok, (New-Object System.Text.ASCIIEncoding))
+            Write-Host "    minted .token.$iname.local"
+        }
+
+        $ibody = @"
+# GENERATED by deploy/ship.ps1 for instance '$iname'. Do not hand-edit; re-run the shipper.
+# Loopback only: Caddy on 8443 routes /$iname/* here. Keeping uvicorn off the network is what
+# makes the deployment fail CLOSED if the proxy stops.
+`$env:XAUORDERPAD_HOST     = '127.0.0.1'
+`$env:XAUORDERPAD_PORT     = '$($inst.port)'
+`$env:XAUORDERPAD_TOKEN    = '$itok'
+`$env:XAUORDERPAD_INSTANCE = '$iname'
+`$env:XAUORDERPAD_MT5_PATH = '$($inst.mt5_path)'
+`$env:XAUORDERPAD_LAUNCH_BROWSER = '0'
+# PINNED ACCOUNT. This server refuses to log in any other account, and goes unhealthy
+# (blocking the order path) if its terminal is switched to one by hand. 0 = unpinned.
+`$env:XAUORDERPAD_EXPECT_LOGIN = '$iexpect'
+
+Set-Location '$AppDir'
+& '$PY' '$AppDir\server.py'
+"@
+        [System.IO.File]::WriteAllText($iwrap, $ibody, (New-Object System.Text.ASCIIEncoding))
+
+        $iact = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$iwrap`""
+        Register-ScheduledTask -TaskName $itask -Action $iact -Trigger $trg `
+            -Principal $prn -Settings $set -Force | Out-Null
+        if (-not (Get-ScheduledTask -TaskName $itask -ErrorAction SilentlyContinue)) {
+            throw "FATAL: the '$itask' task was not created."
+        }
+        Write-Host "    $itask -> port $($inst.port), terminal $($inst.mt5_path)"
+
+        if (-not (Test-Path $inst.mt5_path)) {
+            Write-Host "    WARNING: $($inst.mt5_path) does not exist yet. The server will start and" -ForegroundColor Yellow
+            Write-Host "             refuse to log in until that /portable copy is created." -ForegroundColor Yellow
+        }
+        try { Start-ScheduledTask -TaskName $itask -ErrorAction SilentlyContinue } catch {}
+    }
+
+    # Retire tasks for instances that are no longer in the registry.
+    #
+    # Renaming an instance (say a1 -> 472200942) otherwise leaves the OLD task registered and
+    # RUNNING on the very same port, so the new one cannot bind and dies -- leaving an account
+    # you believe is supervised by the new pinned server actually served by the old unpinned
+    # one. Same reasoning as the duplicate-port check in instances.py, one layer out.
+    $keep = @($insts | ForEach-Object { "$TASK-$($_.name)" })
+    foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue |
+                    Where-Object { $_.TaskName -like "$TASK-*" -and $_.TaskName -ne "$TASK-caddy" })) {
+        if ($keep -notcontains $t.TaskName) {
+            Write-Host "    retiring stale task $($t.TaskName) (no longer in instances.json)"
+            try { Stop-ScheduledTask -TaskName $t.TaskName -ErrorAction SilentlyContinue } catch {}
+            # Its server may still hold the port after the task stops; free it explicitly.
+            $stale = $t.TaskName -replace "^$TASK-", ""
+            $wrap = "C:\app\run_$stale.ps1"
+            if (Test-Path $wrap) {
+                $oldPort = (Select-String -Path $wrap -Pattern "XAUORDERPAD_PORT\s*=\s*'(\d+)'").Matches.Groups[1].Value
+                if ($oldPort) {
+                    $c = Get-NetTCPConnection -LocalPort ([int]$oldPort) -State Listen -ErrorAction SilentlyContinue
+                    foreach ($conn in $c) { try { Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }
+                }
+                Remove-Item $wrap -Force -ErrorAction SilentlyContinue
+            }
+            Unregister-ScheduledTask -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 # --- 5. Prove it is listening -- on LOOPBACK, and nowhere else ----------------
 # The task now runs at Administrator LOGON in the interactive desktop session (Interactive principal

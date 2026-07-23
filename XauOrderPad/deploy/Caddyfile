@@ -56,15 +56,36 @@
         }
     }
 
+    # ---- per-account routes, GENERATED from deploy/instances.ec2.json --------------------
+    # `mt5_ec2.py caddy` runs gen_routes.py --ec2 and scp's the result next to this file.
+    #
+    # ONE Caddy fronts every account, not one per port. The certificate's SAN is the Elastic IP
+    # with no port and no DNS name, so it already covers every port -- and every extra TLS port
+    # would be another SECURITY-GROUP rule to open, audit and keep in sync on an
+    # internet-facing box. The phone selects an account by PATH:
+    #     https://<eip>:8443/a1
+    #
+    # Missing file -> `caddy validate` fails -> caddy_setup.ps1 refuses to start. Fail closed.
+    import C:/app/routes.caddy
+
+    # ---- the DEFAULT account: everything not matched above -------------------------------
+    # MUST STAY LAST. handle/handle_path are mutually exclusive and matched in written order, so
+    # a catch-all above the import would swallow /a1 and quietly serve every account from 8765.
+    #
+    # Keeping the default at `/` is what makes this backward compatible: the phone profile and
+    # client certificate already pointing at https://<eip>:8443 keep working untouched.
+    #
     # Tell the app WHICH device is trading. With one client cert today this is dull; the moment
     # there are two phones it is the only way to attribute an order after the fact.
-    reverse_proxy 127.0.0.1:8765 {
-        header_up X-Client-Cert-CN {http.request.tls.client.subject}
+    handle {
+        reverse_proxy 127.0.0.1:8765 {
+            header_up X-Client-Cert-CN {http.request.tls.client.subject}
 
-        # The feed is a WebSocket held open for the whole session. Caddy proxies Upgrade natively;
-        # what it does NOT do by default is wait forever for a response, and the quote stream is a
-        # long-lived response by definition.
-        flush_interval -1
+            # The feed is a WebSocket held open for the whole session. Caddy proxies Upgrade
+            # natively; what it does NOT do by default is wait forever for a response, and the
+            # quote stream is a long-lived response by definition.
+            flush_interval -1
+        }
     }
 
     # Per-site access log WITH the query string redacted. There IS an audit trail (which client

@@ -65,13 +65,28 @@ def load(sid: str) -> dict | None:
     return load_all().get(sid)
 
 
-def save(sid: str, enabled: bool, params: dict) -> None:
+def save(sid: str, enabled: bool, params: dict, runtime: dict | None = None) -> None:
     """Best-effort. A failure to persist must never break a live toggle: the engine
     is already running with the new setting in memory, and refusing the toggle over
-    a disk error would be the worse outcome."""
+    a disk error would be the worse outcome.
+
+    `runtime` is the engine's own PER-DAY bookkeeping -- the daily-loss latch and the
+    day it was set, the ladder's completed-ladder count, the last ladder's end time.
+
+    That is a different thing from the tickets this file still refuses to store, and
+    the distinction is the point. A ticket can be rebuilt from the broker, so keeping
+    one here could only ever go stale. A daily counter cannot: nothing at the broker
+    records "this engine already breached its loss limit today", so a restart wiped it
+    and the limit silently became per-process rather than per-day. On 2026-07-21 the
+    rider tripped its kill-switch and was armed again minutes later with the latch
+    cleared and the day's loss forgotten.
+    """
     try:
         all_ = load_all()
-        all_[sid] = {"enabled": bool(enabled), "params": params, "ts": time.time()}
+        rec = {"enabled": bool(enabled), "params": params, "ts": time.time()}
+        if runtime:
+            rec["runtime"] = runtime
+        all_[sid] = rec
         _path().write_text(json.dumps(all_, indent=2), "utf-8")
     except Exception:
         log.exception("could not persist strategy state",

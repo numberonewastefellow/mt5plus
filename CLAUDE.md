@@ -107,6 +107,23 @@ alone does nothing, so a forged `auto_real` param cannot push ladder or straddle
 resume real-money trading unattended. Both switches are re-read **every poll**, so switching MT5 to
 another account changes what the engine may do immediately. Do not "simplify" this into one flag.
 
+**The ladder's `paper` now defaults to FALSE — ARM means it places orders.** It used to default
+True, so a fresh install armed into a simulator and the operator had to find a toggle two screens
+away to make the engine they had just armed actually trade. An arm that does not arm is worse than
+an honest one behind a confirmation. Paper mode still exists — it is how you cost a new trigger
+before risking anything — but it is opt-in, in Settings → Strategies, on both clients. What keeps
+this engine off real money is **not** that flag: it is `allows_real = False`, which
+`StrategyBase.evaluate` re-checks on **every poll** and which auto-disables the ladder the instant
+MT5 is on anything but a demo. `paper` was also removed from the ladder's `NEVER_RESTORE` when the
+default flipped — with the default now on the *dangerous* side, "ignore what was saved" would have
+silently undone a deliberate choice to simulate. A restart still cannot resume trading: `enabled` is
+never restored, for any engine.
+
+**`SET LEVEL` never arms — but on an ALREADY-ARMED engine it can still buy.** `_apply()` drops the
+running `LadderState` and resets `_rearm_ok`, so the next poll builds a fresh ladder that fires
+immediately if the new level is behind price. Both clients must confirm that specific case; the
+quick panel does. DISARM first if you only meant to change a number.
+
 ## Standards for every change
 
 **Feature parity: the webapp and the Android app ship the same feature.** They are two clients of one

@@ -232,6 +232,15 @@ data class StrategyParams(
     @SerialName("stop_mode") val stopMode: String? = null,
     val retrace: Double? = null,
     @SerialName("floor_offset") val floorOffset: Double? = null,
+    /**
+     * Ladder only: the BROKER-side stop, in $/oz, attached to every rung at fill time
+     * (`strategy_place(..., sl_dist=hard_sl, ...)`). It is a backstop for the process
+     * DYING, not the working stop -- [retrace] is what actually exits the ladder, and it
+     * is an order of magnitude tighter. The webapp has exposed this since day one
+     * (`ldHardSl`); Android could not read it at all, which is why a 3.00 default sat
+     * unnoticed behind a 0.30 trail.
+     */
+    @SerialName("hard_sl") val hardSl: Double? = null,
     val volume: Double? = null,
     /** 0 means UNCAPPED for both of these -- they are ceilings, not counts. */
     @SerialName("max_positions") val maxPositions: Int? = null,
@@ -245,6 +254,14 @@ data class StrategyParams(
     @SerialName("auto_demo") val autoDemo: Boolean? = null,
     @SerialName("auto_real") val autoReal: Boolean? = null,
     @SerialName("max_daily_loss") val maxDailyLoss: Double? = null,
+    /**
+     * Rider only: how [sl] and [trail] are READ — `"fixed"` = $/oz, `"atr"` = multiples of
+     * ATR(14). NOT the ladder's `stop_mode` (retrace|floor); they are deliberately different
+     * wire fields because one name meaning two things is how a 6 becomes $6 or $27.
+     */
+    @SerialName("stop_units") val stopUnits: String? = null,
+    val sl: Double? = null,
+    val trail: Double? = null,
 )
 
 /**

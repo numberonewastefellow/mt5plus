@@ -26,6 +26,28 @@ exit /b 1
 set PORT=8765
 set TLS_PORT=8443
 
+REM --- Read the API token from .token.local (gitignored). Both modes want it. -----------------
+REM `for /f` (not `set /p ... <file`): the redirect form does not evaluate reliably inside a
+REM parenthesized if-block and silently leaves the token empty.
+REM
+REM Read BEFORE the port-kill below, because the bypass guard needs it: whether we would bind
+REM 0.0.0.0 depends on whether a token exists, and that decision has to be made while the
+REM current server is still ALIVE.
+set "XAUORDERPAD_TOKEN="
+if exist ".token.local" for /f "usebackq delims=" %%T in (".token.local") do set "XAUORDERPAD_TOKEN=%%T"
+
+REM --- mTLS bypass guard: refuse BEFORE touching anything ------------------------------------
+REM Deliberately ahead of the port-kill. Refusing after it would leave the operator with a
+REM stopped server AND no new one -- a guard that takes the system down is worse than the hole
+REM it closes. Nothing has been killed at this point, so the refusal is a genuine no-op.
+REM
+REM Only in plain mode (tls mode frees %TLS_PORT% itself and re-starts Caddy), and only when a
+REM token exists -- without one we stay on 127.0.0.1, which is not reachable off this machine
+REM and therefore not a bypass. See :bypass_refused for the full reasoning.
+set "TLS_LISTENER="
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%TLS_PORT% .*LISTENING"') do set "TLS_LISTENER=%%P"
+if /I not "%MODE%"=="tls" if defined XAUORDERPAD_TOKEN if defined TLS_LISTENER goto :bypass_refused
+
 echo [port] checking for existing process on port %PORT%...
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%PORT% .*LISTENING"') do (
   echo [port] killing PID %%P listening on port %PORT%
@@ -42,17 +64,13 @@ if not exist ".venv\Scripts\activate.bat" (
   call ".venv\Scripts\activate.bat"
 )
 
-REM --- Read the API token from .token.local (gitignored). Both modes want it. -----------------
-REM `for /f` (not `set /p ... <file`): the redirect form does not evaluate reliably inside a
-REM parenthesized if-block and silently leaves the token empty.
-set "XAUORDERPAD_TOKEN="
-if exist ".token.local" for /f "usebackq delims=" %%T in (".token.local") do set "XAUORDERPAD_TOKEN=%%T"
-
 if /I "%MODE%"=="tls" goto run_tls
 
 REM ============================ PLAIN mode (plain HTTP over the LAN) ============================
 REM WHY 0.0.0.0 + token together: a bare `python server.py` binds 127.0.0.1 (loopback), which a
 REM phone cannot reach; and the server REFUSES a network bind without a token (fail-closed).
+REM
+REM (The mTLS bypass guard already ran near the top, BEFORE the port-kill -- see there.)
 if defined XAUORDERPAD_TOKEN (
   set "XAUORDERPAD_HOST=0.0.0.0"
   echo [net] PLAIN HTTP -- LAN-reachable on port %PORT% ^(token from .token.local^).
@@ -66,6 +84,26 @@ echo [run] starting XAU Order Pad (plain)...
 python server.py
 pause
 exit /b 0
+
+:bypass_refused
+REM Reached only when a token exists (so we WOULD bind 0.0.0.0) AND something already holds the
+REM TLS port. Fail closed, exactly like the server's own refusal to bind the network with no token.
+echo.
+echo [REFUSING TO START] Port %TLS_PORT% is already in use (PID %TLS_LISTENER%) -- almost certainly
+echo                     the Caddy mTLS front door.
+echo.
+echo   Starting PLAIN mode now would bind uvicorn to 0.0.0.0:%PORT% in CLEARTEXT while that
+echo   encrypted door is still open: ONE trading API behind TWO doors, one of them unencrypted
+echo   and guarded by nothing but a bearer token. The phone would still show https and still
+echo   work, so nothing would look wrong.
+echo.
+echo   Pick the one you actually want:
+echo     * keep TLS (recommended):  start_server.bat tls
+echo     * go plain:                stop Caddy first, then re-run this --
+echo                                taskkill /F /PID %TLS_LISTENER%
+echo.
+pause
+exit /b 1
 
 :run_tls
 REM ============================ TLS mode (loopback uvicorn + Caddy mTLS) ========================

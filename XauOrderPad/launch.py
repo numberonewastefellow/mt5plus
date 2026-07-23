@@ -114,6 +114,10 @@ def env_for(inst: dict, token: str) -> dict:
         XAUORDERPAD_MT5_PATH=inst["mt5_path"],
         XAUORDERPAD_TOKEN=token,
         XAUORDERPAD_HOST="127.0.0.1",
+        # The account this instance may drive; 0 = unpinned. Derived from the instance
+        # name when that name is an account number, so naming instances after accounts
+        # is what turns the label into an enforced guarantee.
+        XAUORDERPAD_EXPECT_LOGIN=str(inst.get("expect_login") or 0),
     )
     return env
 
@@ -199,6 +203,27 @@ def cmd_stop_all() -> int:
     return 0
 
 
+def cmd_tokens() -> int:
+    """Mint any missing per-instance token, starting nothing.
+
+    Exists because a token is only created as a side effect of starting an instance,
+    so an instance launched by hand (env vars, no launcher) silently keeps falling
+    back to the shared `.token.local` -- and a shared token means a phone profile
+    saved for one account is accepted by every other instance on the box. That is
+    the isolation this file is supposed to provide, quietly absent.
+    """
+    items = instances.load()
+    for inst in items:
+        own = HERE / inst["token_file"]
+        had = own.exists() and own.read_text("utf-8").strip()
+        ensure_token(inst)
+        if had:
+            print(f"[token] {inst['name']}: already had {inst['token_file']}")
+    print("\nEach instance now has its own token. Instances already running were "
+          "started with whatever token they had -- restart them to pick these up.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Start/stop XauOrderPad instances.")
     g = ap.add_mutually_exclusive_group(required=True)
@@ -206,9 +231,13 @@ def main() -> int:
     g.add_argument("--all", action="store_true", help="start every instance + the monitor")
     g.add_argument("--stop", action="store_true", help="stop every configured instance")
     g.add_argument("--list", action="store_true", help="show the configured instances")
+    g.add_argument("--tokens", action="store_true",
+                   help="create any missing per-instance token file, start nothing")
     args = ap.parse_args()
 
     try:
+        if args.tokens:
+            return cmd_tokens()
         if args.list:
             for i in instances.load():
                 exists = "ok" if Path(i["mt5_path"]).is_file() else "MISSING"

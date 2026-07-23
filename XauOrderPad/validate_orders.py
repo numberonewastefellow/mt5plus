@@ -72,8 +72,16 @@ def main():
     # --- safety gates ---------------------------------------------------
     if not s.get("connected"):
         print("  ABORT: terminal not connected."); return 2
-    if acc.get("is_demo") is False:
-        print("  ABORT: NOT a demo account — refusing to place test orders."); return 2
+    # `is not True`, NOT `is False`. This script's FIRST action is /close_all -- and with
+    # config.RESTRICT_CLOSE_TO_MAGIC = False that flattens the entire XAUUSD book, manual
+    # positions included -- before it places anything. `is_demo` is ABSENT from a degraded
+    # state frame (mt5_worker only fills st["account"] when account_info() returns), so
+    # `.get()` yields None, `None is False` is False, and the old gate let an UNKNOWN
+    # account straight through. Unknown must fail closed, the same way mt5_worker refuses
+    # an unknown trade_mode and deploy/mt5_ec2.py checks `is True`.
+    if acc.get("is_demo") is not True:
+        print("  ABORT: account is not confirmed DEMO (is_demo="
+              f"{acc.get('is_demo')!r}) — refusing to place test orders."); return 2
     if not s.get("healthy"):
         print(f"  ABORT: not healthy — {s.get('error')}.")
         print("  (enable AutoTrading in MT5 with Ctrl+E, then re-run)"); return 2

@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>XauOrderPad — Quick Strategy Panel (design prototype)</title>
+<style>
+  /* ---------------------------------------------------------------------------
+     Palette lifted from the app so this reads like the real thing:
+       Green  #1FA97A   Red #E0544E   Amber #D9A441     (ui/PositionsGrid.kt:41-43)
+       Ground #101214                                    (MainActivity omRecentsIcon)
+     Everything is self-contained: no fonts, no images, no CDN.
+  --------------------------------------------------------------------------- */
+  :root{
+    --green:#1FA97A; --red:#E0544E; --amber:#D9A441;
+    --ground:#0E1013; --card:#191D21; --card2:#23272C; --line:#2A2F35;
+    --ink:#E8EAED; --dim:#9AA3AC; --primary:#9DB2FF;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#0a0b0d;color:var(--ink);
+       font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  a{color:var(--primary)}
+  .wrap{display:flex;gap:28px;align-items:flex-start;padding:22px;flex-wrap:wrap}
+  .stage{position:sticky;top:22px}
+
+  /* ---- phone shell ---- */
+  .phone{width:380px;height:824px;background:var(--ground);border-radius:26px;
+         border:1px solid #333;overflow:hidden;position:relative;
+         display:flex;flex-direction:column;box-shadow:0 18px 50px rgba(0,0,0,.6)}
+  .statusbar{display:flex;justify-content:space-between;padding:7px 14px;font-size:11px;color:var(--dim)}
+  .body{flex:1;display:flex;flex-direction:column;padding:0 10px 8px;min-height:0;position:relative}
+
+  /* ---- server bar ---- */
+  .serverbar{display:flex;align-items:center;gap:8px;height:28px;flex:0 0 auto}
+  .url{flex:1;font-family:var(--mono);font-size:11px;color:var(--dim)}
+  .chip{font-size:10px;font-weight:700;color:var(--primary);letter-spacing:.3px}
+  .om{color:var(--amber);font-size:15px}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+
+  /* ---- account badge + sessions ---- */
+  .badge{background:rgba(31,169,122,.14);border-radius:6px;padding:7px 10px;
+         font-weight:700;font-size:12px;color:var(--green);margin-top:4px}
+  .badge.real{background:rgba(224,84,78,.14);color:var(--red)}
+  .sessions{display:flex;gap:12px;font-size:9px;padding:4px 2px;color:var(--dim)}
+  .sessions b{font-family:var(--mono);font-weight:700}
+
+  /* ---- quote ---- */
+  .quotes{display:flex;gap:6px;margin-top:4px}
+  .q{flex:1;border-radius:10px;padding:8px;text-align:center;font-weight:700}
+  .q.bid{background:rgba(224,84,78,.14);color:var(--red)}
+  .q.spd{background:var(--card2);color:var(--ink);flex:0 0 62px}
+  .q.ask{background:rgba(31,169,122,.14);color:var(--green)}
+  .q .lbl{font-size:8px;opacity:.75;display:block}
+  .q .val{font-family:var(--mono);font-size:16px}
+  .q.seedable{outline:1px dashed var(--amber);cursor:pointer}
+
+  /* ---- form ---- */
+  .row{display:flex;gap:6px;margin-top:6px;align-items:center}
+  .fld{flex:1;background:transparent;border:1px solid var(--line);border-radius:8px;
+       padding:8px;color:var(--ink);font-family:var(--mono);font-size:14px;min-width:0}
+  .lab{font-size:11px;color:var(--dim);width:26px}
+  .btn{border:0;border-radius:22px;padding:12px;font-weight:800;font-size:15px;cursor:pointer;flex:1}
+  .buy{background:var(--green);color:#05231a}
+  .sell{background:var(--red);color:#2a0a09}
+  .ghost{background:transparent;border:1px solid var(--line);border-radius:22px;
+         padding:9px;font-weight:700;font-size:12px;cursor:pointer;flex:1}
+  .ghost.blue{color:var(--primary)} .ghost.red{color:var(--red)} .ghost.green{color:var(--green)}
+
+  /* ---- positions ---- */
+  .grid{flex:1;margin-top:8px;background:#141719;border-radius:8px;overflow:hidden;min-height:0}
+  .ghead{display:flex;justify-content:space-between;padding:7px 10px;background:var(--card2);
+         font-size:10px;color:var(--dim);font-weight:700}
+  .grow{display:flex;justify-content:space-between;padding:7px 10px;border-bottom:1px solid #1e2225;
+        font-family:var(--mono);font-size:12px;border-left:3px solid var(--red)}
+  .grow.up{border-left-color:var(--green)}
+  .neg{color:var(--red)} .pos{color:var(--green)}
+
+  /* =========================================================================
+     THE NEW BITS
+     ========================================================================= */
+
+  /* 1. the entry point: ONE icon in the top bar, next to the ॐ. No rail row at all,
+        so the positions grid loses exactly zero pixels. */
+  .quick{display:flex;align-items:center;gap:3px;cursor:pointer;padding:2px 5px;
+         border-radius:7px;background:#20252a;font-size:13px;line-height:1}
+  .quick.on{background:rgba(217,164,65,.18)}
+  .quick.live{background:rgba(224,84,78,.20)}
+  .quick .qd{width:6px;height:6px;border-radius:50%;background:#5c656d}
+  .quick.on .qd{background:var(--amber)} .quick.live .qd{background:var(--red)}
+  .quick .qn{font-family:var(--mono);font-size:9px;font-weight:700}
+
+  /* 2. overlay panel -- sits OVER the positions grid, never displaces the buttons */
+  .panel{position:absolute;left:0;right:0;bottom:0;background:var(--card);
+         border-top:1px solid var(--line);border-radius:14px 14px 0 0;padding:10px 12px 14px;
+         box-shadow:0 -14px 40px rgba(0,0,0,.6);transform:translateY(102%);
+         transition:transform .22s ease;z-index:5}
+  .panel.open{transform:translateY(0)}
+  .phead{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+  .phead h4{margin:0;font-size:12px;letter-spacing:.4px}
+  /* engine tabs -- one icon serves every engine, and this is how the straddle gets added later */
+  .tab{font-size:10px;font-weight:800;padding:3px 8px;border-radius:6px;cursor:pointer;
+       background:#20252a;color:var(--dim)}
+  .tab.sel{background:rgba(157,178,255,.16);color:var(--primary)}
+  .tab .td{display:inline-block;width:5px;height:5px;border-radius:50%;margin-left:4px}
+  .grab{width:34px;height:4px;border-radius:3px;background:#3b4249;margin:0 auto 8px}
+  .chev{cursor:pointer;color:var(--dim);font-size:12px;padding:2px 5px}
+  .pin{margin-left:auto;font-size:11px;color:var(--dim);cursor:pointer;
+       border:1px solid var(--line);border-radius:6px;padding:2px 7px}
+  .pin.on{color:var(--amber);border-color:var(--amber)}
+  .x{cursor:pointer;color:var(--dim);padding:2px 6px}
+
+  .seg{display:flex;gap:5px}
+  .seg button{flex:1;background:#20252a;border:1px solid var(--line);color:var(--dim);
+              border-radius:8px;padding:7px;font-weight:800;font-size:12px;cursor:pointer}
+  .seg button.sel.buy{background:rgba(31,169,122,.2);color:var(--green);border-color:var(--green)}
+  .seg button.sel.sell{background:rgba(224,84,78,.2);color:var(--red);border-color:var(--red)}
+  .step{background:#20252a;border:1px solid var(--line);color:var(--ink);border-radius:8px;
+        padding:7px 0;font-family:var(--mono);font-size:12px;cursor:pointer;flex:1}
+  .seed{background:rgba(217,164,65,.16);border:1px solid var(--amber);color:var(--amber);
+        border-radius:8px;padding:7px 0;font-size:11px;font-weight:800;cursor:pointer;flex:1}
+  .mini{font-size:10px;color:var(--dim);margin-top:5px}
+  .dist-big{font-family:var(--mono);font-size:13px;font-weight:800}
+  .act{display:flex;gap:7px;margin-top:9px}
+  .set{background:#20252a;border:1px solid var(--primary);color:var(--primary);
+       border-radius:10px;padding:11px;font-weight:800;cursor:pointer;flex:1}
+  .arm{background:var(--amber);border:0;color:#241a04;border-radius:10px;padding:11px;
+       font-weight:900;cursor:pointer;flex:1}
+  .arm.off{background:#3a2b2b;color:var(--red);border:1px solid var(--red)}
+  .toggle{display:flex;align-items:center;gap:7px;margin-top:9px;font-size:11px}
+  .sw{width:38px;height:20px;border-radius:12px;background:#33383e;position:relative;cursor:pointer}
+  .sw i{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+        background:#8b939b;transition:.15s}
+  .sw.on{background:rgba(224,84,78,.35)} .sw.on i{left:20px;background:var(--red)}
+
+  /* rider card */
+  .rcard{background:#15191c;border:1px solid var(--line);border-radius:10px;padding:9px}
+  .kv{display:flex;justify-content:space-between;font-size:11px;padding:2px 0}
+  .kv span:last-child{font-family:var(--mono)}
+  .place{background:var(--green);color:#05231a;border:0;border-radius:10px;padding:12px;
+         font-weight:900;width:100%;margin-top:9px;cursor:pointer;font-size:14px}
+
+  /* dialog + toast */
+  .dlg{position:absolute;inset:0;background:rgba(0,0,0,.62);display:none;
+       align-items:center;justify-content:center;z-index:9;padding:18px}
+  .dlg.show{display:flex}
+  .dlgbox{background:#1c2126;border-radius:14px;padding:15px;max-width:300px}
+  .dlgbox h5{margin:0 0 7px;font-size:13px}
+  .dlgbox p{margin:0 0 11px;font-size:12px;color:#c7ced4}
+  .dlgbox .warn{color:var(--red);font-weight:700}
+  .dlgrow{display:flex;gap:8px;justify-content:flex-end}
+  .dlgrow button{background:transparent;border:0;color:var(--primary);font-weight:800;
+                 padding:7px 10px;cursor:pointer;font-size:12px}
+  .dlgrow .go{color:var(--amber)}
+  .toast{position:absolute;left:12px;right:12px;bottom:12px;background:#252b31;border-radius:8px;
+         padding:9px 11px;font-size:11px;z-index:12;opacity:0;transition:.2s;pointer-events:none}
+  .toast.show{opacity:1}
+
+  /* ---- notes column ---- */
+  .notes{max-width:520px;min-width:340px;flex:1}
+  .notes h1{font-size:19px;margin:0 0 4px}
+  .notes h2{font-size:13px;margin:20px 0 7px;color:var(--amber);letter-spacing:.4px;text-transform:uppercase}
+  .notes p,.notes li{font-size:13px;color:#c3cad1}
+  .ctl{background:#14181b;border:1px solid var(--line);border-radius:10px;padding:11px;margin-bottom:14px}
+  .ctl label{display:flex;align-items:center;gap:8px;font-size:12px;margin:5px 0;cursor:pointer}
+  .why{border-left:3px solid var(--amber);padding:6px 0 6px 11px;margin:9px 0;font-size:12.5px;color:#c3cad1}
+  .bad{border-left-color:var(--red)}
+  code{background:#1b1f23;padding:1px 5px;border-radius:4px;font-family:var(--mono);font-size:12px}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px}
+  td,th{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+  th{color:var(--dim);font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ==================== PHONE ==================== -->
+  <div class="stage">
+    <div class="phone">
+      <div class="statusbar"><span id="clock">23:41</span><span>▮ 79</span></div>
+      <div class="body">
+
+        <div class="serverbar">
+          <div class="url">192.168.0.116:8443</div>
+          <span>📊</span><span class="chip">SPLIT</span>
+          <!-- NEW: the quick-strategy icon, next to the ॐ -->
+          <span class="quick" id="quickBtn" onclick="openBest()"><span>⚡</span><span class="qd"></span><span class="qn" id="qn"></span></span>
+          <span class="om">ॐ</span><span class="dot" style="background:var(--green)"></span>
+        </div>
+
+        <div class="badge" id="badge">DEMO ExS6 472200942</div>
+
+        <div class="sessions">
+          <span>ASIA <b>O 4h35</b></span><span>UK <b>O 11h35</b></span>
+          <span>US <b style="color:var(--green)">C 1h35</b></span>
+        </div>
+
+        <div class="quotes">
+          <div class="q bid" id="bidBox" onclick="seedFrom('bid')">
+            <span class="lbl">BID</span><span class="val" id="bid">4084.71</span></div>
+          <div class="q spd"><span class="lbl">SPD</span><span class="val">40</span></div>
+          <div class="q ask" id="askBox" onclick="seedFrom('ask')">
+            <span class="lbl">ASK</span><span class="val" id="ask">4084.75</span></div>
+        </div>
+
+        <div class="row"><span class="lab">LOT</span><input class="fld" value="0.01">
+          <span class="lab">SL</span><input class="fld" value="0"></div>
+        <div class="row"><button class="btn buy">BUY</button><button class="btn sell">SELL</button></div>
+        <div class="row">
+          <button class="ghost blue">CLOSE ALL</button>
+          <button class="ghost red">CLOSE LOSING</button>
+        </div>
+
+        <div class="grid">
+          <div class="ghead"><span>ENTRY</span><span>P&amp;L</span></div>
+          <div class="grow"><span>4067.290</span><span class="neg">−17.43</span></div>
+          <div class="grow"><span>4067.290</span><span class="neg">−17.43</span></div>
+          <div class="grow"><span>4067.230</span><span class="neg">−17.48</span></div>
+          <div class="grow up"><span>4084.535</span><span class="pos">+0.14</span></div>
+        </div>
+
+        <!-- (2) THE PANEL — overlays the grid; BUY/SELL + closes never move -->
+        <div class="panel" id="panel">
+          <div class="grab" onclick="toggleExpand()"></div>
+          <div class="phead">
+            <span class="tab" id="tabLadder" onclick="openPanel('ladder')">LADDER<span class="td"></span></span>
+            <span class="tab" id="tabRider" onclick="openPanel('rider')">RIDER<span class="td"></span></span>
+            <span class="chev" id="chev" onclick="toggleExpand()">⌃</span>
+            <span class="pin" id="pinBtn" onclick="togglePin()">📌</span>
+            <span class="x" onclick="closePanel()">✕</span>
+          </div>
+          <div id="pbody"></div>
+        </div>
+
+        <div class="dlg" id="dlg"><div class="dlgbox">
+          <h5 id="dh"></h5><p id="dp"></p>
+          <div class="dlgrow"><button onclick="hideDlg()" id="dno">Cancel</button>
+            <button class="go" onclick="dlgGo()" id="dyes">OK</button></div>
+        </div></div>
+
+        <div class="toast" id="toast"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== NOTES ==================== -->
+  <div class="notes">
+    <h1>Quick Strategy Panel — design prototype</h1>
+    <p>Clickable mock of the proposed fast path. Nothing here talks to a server; the price is a
+       simulated random walk so the <em>distance-to-trigger</em> moves like it would in a real session.
+       Edit this file, reload, review — <strong>before</strong> any Kotlin is written.</p>
+
+    <div class="ctl">
+      <strong style="font-size:12px">Simulate state</strong>
+      <label><input type="checkbox" id="cbRider" checked onchange="sync()"> Rider has an actionable card</label>
+      <label><input type="checkbox" id="cbArmed" onchange="sync()"> Ladder is armed</label>
+      <label><input type="checkbox" id="cbReal" onchange="sync()"> REAL account (badge turns red)</label>
+      <label><input type="checkbox" id="cbTick" checked onchange="sync()"> Price ticking</label>
+      <p class="mini" style="margin-top:8px">Tap the rail chips, the BID/ASK blocks, the steppers,
+         SET, ARM and PLACE — they all behave as proposed.</p>
+    </div>
+
+    <h2>The problem being solved</h2>
+    <table>
+      <tr><th>Today</th><th>Taps</th></tr>
+      <tr><td>Ladder: ॐ → Strategies → ladder → edit → APPLY → arm → confirm → back ×2</td><td>~10</td></tr>
+      <tr><td><strong>Rider: ॐ → Strategies → rider → scroll → PLACE → confirm</strong></td><td>~6</td></tr>
+    </table>
+    <div class="why">The rider is the stronger case: its suggestion <strong>expires with its M5 bar</strong>
+      — the app already force-closes the confirm dialog when the card changes underneath you. Six taps
+      to reach a perishable suggestion is the bug.</div>
+    <div class="why">Worse than the tap count: <strong>Settings hides the price.</strong> You set a
+      trigger blind, then return to find the market moved. Everything below exists to keep price and
+      trigger on screen together.</div>
+
+    <h2>1 · One icon, no rail <small style="color:var(--green)">— decided</small></h2>
+    <p>The entry point is a single <strong>⚡ icon in the top bar, next to the ॐ</strong>. There is no
+       rail row at all, so the positions grid loses <strong>zero</strong> pixels.</p>
+    <div class="why">This matters more than it looks: in the stacked layouts the positions grid is the
+      <strong>only</strong> <code>weight(1f)</code> child, so any fixed row inserted steals height
+      directly from it — and that chrome was already trimmed once to feed the grid.</div>
+    <p>The icon still has to carry state, or you would have to open the panel to learn anything:</p>
+    <ul>
+      <li><strong>dot colour</strong> — grey idle · amber armed (paper) · red armed (LIVE) · green rider card waiting</li>
+      <li><strong>when armed it shows the distance inline</strong> (<code>⚡ ● −8.45</code>) — the number
+          you are otherwise computing in your head</li>
+    </ul>
+    <div class="why">One icon must serve several engines, so the panel carries <strong>tabs</strong>
+      (LADDER · RIDER), each with its own state dot. That is also how the straddle is added later —
+      one more tab, no new chrome. Tapping ⚡ opens whichever engine is most urgent: a perishable
+      rider card outranks an armed ladder.</div>
+
+    <h2>2 · Overlay, not insert</h2>
+    <p>The panel slides <em>over</em> the positions grid. Price, BUY/SELL and the CLOSE row never move.</p>
+    <div class="why">Button position carries the function here; muscle memory on
+      <code>CLOSE ALL</code> matters more than the panel does. A layout that shifts under a moving
+      market is a hazard, not a feature.</div>
+
+    <h2>3 · Why not swipe-from-the-edge</h2>
+    <div class="why bad"><strong>Two hard collisions.</strong>
+      <br>① <code>SwipeToDismissBox</code> in the positions list already owns horizontal swipe
+      (<em>EndToStart closes a position</em>) — a panel gesture would sit on top of a destructive action.
+      <br>② The screen edges belong to the system back gesture (portrait-locked, no exclusion rects).
+      <br>So: keep the panel, drop the gesture. Tap targets only.</div>
+
+    <h2>4 · Stop typing prices</h2>
+    <p>Typing <code>4138</code> while the market moves is the real bottleneck. Instead:
+       <strong>@BID / @ASK</strong> seed the trigger in one tap (the BID/ASK blocks themselves are
+       tappable while the panel is open — dashed outline), then <code>±0.1 / ±1</code> nudges.
+       The live <strong>distance-to-trigger</strong> is shown, because that is the number you are
+       currently computing in your head.</p>
+
+    <h2>5 · SET and ARM stay separate</h2>
+    <div class="why">The existing APPLY deliberately sends <code>enabled = null</code> —
+      <em>“setting a level can never ARM the engine as a side effect.”</em> Merging them into one
+      fast button would destroy that invariant, so the panel keeps two.
+      ARM routes through the <strong>existing</strong> confirm dialog, which reads the
+      <em>applied server</em> trigger and warns when it is already crossed (try arming a BUY with a
+      trigger below price).</div>
+
+    <h2>6 · Reuse, don't reinvent</h2>
+    <ul>
+      <li><code>setStrategy(id, enabled, params)</code> — one request; <code>enabled=null</code> tunes only.</li>
+      <li><code>placeRiderCard()</code> — already converts absolute prices → point distances (the unit trap that shipped a bug once).</li>
+      <li><code>GuardBar</code>'s draft-state + resync pattern — mandatory, or a 5 Hz snapshot wipes the trigger field mid-type.</li>
+      <li>Existing <code>AlertDialog</code>s for arm / paper-off / place.</li>
+    </ul>
+
+    <h2>7 · Two-stage: peek, then expand <small style="color:var(--green)">— decided</small></h2>
+    <p>The panel opens as a <strong>peek</strong> carrying only what is needed to act:</p>
+    <table>
+      <tr><th></th><th>Peek</th><th>Expanded (tap ⌃)</th></tr>
+      <tr><td>Ladder</td><td>side · trigger · @BID/@ASK · steppers · distance · SET/ARM</td>
+          <td>+ lot, target, retrace, max, paper/live</td></tr>
+      <tr><td>Rider</td><td>side · lot · entry · PLACE</td>
+          <td>+ SL, TP, reason, paper record</td></tr>
+    </table>
+    <div class="why">Peek keeps the positions grid mostly visible, which matters because the grid is
+      what tells you whether the last rung actually filled. Expanding is one tap and is only needed
+      when you are changing the <em>setup</em> rather than acting on it.</div>
+
+    <h2>Decisions taken</h2>
+    <table>
+      <tr><th>Question</th><th>Decision</th></tr>
+      <tr><td>Entry point</td><td>One ⚡ icon beside the ॐ — no rail row</td></tr>
+      <tr><td><code>PAPER → LIVE</code> from the panel</td>
+          <td><strong>Yes</strong>, but always behind the existing confirm dialog</td></tr>
+      <tr><td>Panel height</td><td>Two-stage peek → expand (no drag gesture)</td></tr>
+    </table>
+
+    <h2>Still open</h2>
+    <ol>
+      <li>Should the ⚡ icon appear at all when nothing is armed and no card is waiting, or only when
+          something is live? (Currently always present, dot grey.)</li>
+      <li>When pinned, should the panel survive leaving and returning to the trade screen?</li>
+      <li>SPLIT mode: overlay like the stacked layouts, or appended into the already-scrollable
+          left column?</li>
+    </ol>
+  </div>
+</div>
+
+<script>
+const S={price:4084.73,trigger:4138,side:'buy',lot:0.01,paper:true,armed:false,
+         rider:true,panel:null,pinned:false,real:false,tick:true,pending:null,
+         expanded:false};   // two-stage: false = peek, true = full
+
+const $=id=>document.getElementById(id);
+const f2=n=>n.toFixed(2);
+
+function sync(){
+  S.rider=$('cbRider').checked; S.armed=$('cbArmed').checked;
+  S.real=$('cbReal').checked;   S.tick=$('cbTick').checked;
+  render();
+}
+
+function render(){
+  // account badge
+  $('badge').className='badge'+(S.real?' real':'');
+  $('badge').textContent=S.real?'● REAL ExS5 256730772':'DEMO ExS6 472200942';
+
+  // ---- the ONE top-bar icon (no rail row: the grid loses zero pixels) ----
+  const d=S.trigger-S.price;
+  const busy=S.armed||S.rider;
+  $('quickBtn').className='quick'+(S.armed&&!S.paper?' live':(busy?' on':''));
+  // When armed, the icon itself carries the distance -- the number you'd otherwise
+  // compute in your head. Otherwise it is just a dot.
+  $('qn').textContent=S.armed?((d>=0?'+':'−')+f2(Math.abs(d))):'';
+
+  // seedable outline only while the ladder panel is open
+  const seed=S.panel==='ladder';
+  $('bidBox').className='q bid'+(seed?' seedable':'');
+  $('askBox').className='q ask'+(seed?' seedable':'');
+
+  // ---- panel ----
+  $('panel').className='panel'+(S.panel?' open':'');
+  $('pinBtn').className='pin'+(S.pinned?' on':'');
+  $('chev').textContent=S.expanded?'⌄':'⌃';
+  $('tabLadder').className='tab'+(S.panel==='ladder'?' sel':'');
+  $('tabRider').className='tab'+(S.panel==='rider'?' sel':'');
+  $('tabLadder').querySelector('.td').style.background=
+      S.armed?(S.paper?'var(--amber)':'var(--red)'):'transparent';
+  $('tabRider').querySelector('.td').style.background=
+      S.rider?'var(--green)':'transparent';
+  if(S.panel==='ladder') renderLadder();
+  if(S.panel==='rider')  renderRider();
+}
+
+/* One icon, many engines: open whichever is most urgent. A perishable rider card
+   outranks an armed ladder, which outranks "nothing happening". */
+function openBest(){
+  if(S.panel){ closePanel(); return; }
+  openPanel(S.rider?'rider':'ladder');
+}
+function toggleExpand(){ S.expanded=!S.expanded; render(); }
+
+function renderLadder(){
+  const d=S.trigger-S.price;
+  const crossed=(S.side==='buy'&&S.price>=S.trigger)||(S.side==='sell'&&S.price<=S.trigger);
+
+  // ---- PEEK: only what is needed to act. side, level, distance, ARM. ----
+  let html=`
+    <div class="seg">
+      <button class="${S.side==='buy'?'sel buy':''}" onclick="setSide('buy')">BUY</button>
+      <button class="${S.side==='sell'?'sel sell':''}" onclick="setSide('sell')">SELL</button>
+    </div>
+    <div class="row"><span class="lab">TRG</span>
+      <input class="fld" id="trg" value="${f2(S.trigger)}" onchange="S.trigger=parseFloat(this.value)||0;render()">
+      <button class="seed" onclick="seedFrom('bid')">@BID</button>
+      <button class="seed" onclick="seedFrom('ask')">@ASK</button></div>
+    <div class="row">
+      <button class="step" onclick="bump(-1)">−1</button>
+      <button class="step" onclick="bump(-0.1)">−0.1</button>
+      <button class="step" onclick="bump(0.1)">+0.1</button>
+      <button class="step" onclick="bump(1)">+1</button>
+    </div>
+    <div class="mini">distance to trigger
+      <span class="dist-big" style="color:${crossed?'var(--red)':'var(--amber)'}">
+        ${d>=0?'+':'−'}${f2(Math.abs(d))}</span>
+      ${crossed?'<span style="color:var(--red);font-weight:700"> · ALREADY CROSSED</span>':''}
+      ${S.paper?'':'<span style="color:var(--red);font-weight:700"> · LIVE</span>'}
+    </div>
+    <div class="act">
+      <button class="set" onclick="doSet()">SET LEVEL</button>
+      <button class="arm ${S.armed?'off':''}" onclick="doArm()">${S.armed?'DISARM':'ARM'}</button>
+    </div>`;
+
+  // ---- EXPANDED: the rest. Rarely changed mid-move, so it stays behind one tap. ----
+  if(S.expanded){
+    html+=`
+      <div style="border-top:1px solid var(--line);margin-top:10px;padding-top:9px">
+        <div class="row"><span class="lab">LOT</span><input class="fld" value="${S.lot}">
+          <span class="lab">TGT</span><input class="fld" value="1.00"></div>
+        <div class="row"><span class="lab">RTR</span><input class="fld" value="0.30">
+          <span class="lab">MAX</span><input class="fld" value="1"></div>
+        <div class="toggle"><div class="sw ${S.paper?'':'on'}" onclick="togglePaper()"><i></i></div>
+          <span>${S.paper?'PAPER — logs only, places nothing'
+                         :'<b style="color:var(--red)">LIVE — will place real orders</b>'}</span></div>
+        <div class="mini" style="margin-top:8px">
+          Everything else (hard SL, entry step, daily loss…) stays in
+          <b>Settings → Strategies</b> — unchanged.</div>
+      </div>`;
+  }
+  html+=`<div class="mini">SET never arms — ARM never changes the level. Two actions, on purpose.
+         ${S.expanded?'':'<br>Tap the handle ⌃ for lot, target, retrace and paper/live.'}</div>`;
+  $('pbody').innerHTML=html;
+}
+
+function renderRider(){
+  // PEEK: the decision — side, size, and the one button. Nothing else is needed to act.
+  let html=`
+    <div class="rcard">
+      <div class="kv"><span>SIDE</span><span style="color:var(--green);font-weight:800">BUY</span></div>
+      <div class="kv"><span>LOT</span><span>0.02</span></div>
+      <div class="kv"><span>ENTRY ~</span><span>${f2(S.price)}</span></div>
+    </div>
+    <button class="place" onclick="doPlace()">PLACE THIS TRADE</button>`;
+
+  if(S.expanded){
+    html+=`
+      <div class="rcard" style="margin-top:9px">
+        <div class="kv"><span>SL</span><span>${f2(S.price-3)} (−3.00)</span></div>
+        <div class="kv"><span>TP</span><span>${f2(S.price+6)} (+6.00)</span></div>
+        <div class="kv"><span>REASON</span><span style="font-family:inherit">thrust &gt; 1.8× ATR</span></div>
+        <div class="kv"><span>PAPER P&amp;L</span><span>+2.40 /oz · 6 trades</span></div>
+      </div>`;
+  }
+  html+=`<div class="mini">Expires with its M5 bar — if the card changes underneath, this closes itself.
+         ${S.expanded?'':'<br>Tap ⌃ for SL/TP, reason and the paper record.'}</div>`;
+  $('pbody').innerHTML=html;
+}
+
+// Opening from closed always starts at PEEK; switching tabs keeps whatever stage you were in.
+function openPanel(w){ if(!S.panel) S.expanded=false; S.panel=w; render(); }
+function closePanel(){ if(!S.pinned){ S.panel=null; render(); } else toast('Pinned — unpin to close'); }
+function togglePin(){ S.pinned=!S.pinned; render(); }
+function setSide(s){ S.side=s; render(); }
+function bump(n){ S.trigger=Math.round((S.trigger+n)*100)/100; render(); }
+function seedFrom(w){
+  if(S.panel!=='ladder') return;
+  S.trigger=w==='bid'?S.price-0.02:S.price+0.02;
+  S.trigger=Math.round(S.trigger*100)/100; render(); toast('Trigger seeded from '+w.toUpperCase());
+}
+function togglePaper(){
+  if(S.paper){ showDlg('Go LIVE?','This engine will place REAL orders on '+
+      (S.real?'a REAL-MONEY account':'the demo account')+'. Paper mode only logs what it would do.',
+      'Keep paper','GO LIVE',()=>{S.paper=false;render();toast('LIVE — orders will be placed');}); }
+  else { S.paper=true; render(); toast('Back to paper'); }
+}
+function doSet(){ toast('Level set to '+f2(S.trigger)+' — NOT armed'); }
+function doArm(){
+  if(S.armed){ S.armed=false; $('cbArmed').checked=false; render(); toast('Disarmed'); return; }
+  const crossed=(S.side==='buy'&&S.price>=S.trigger)||(S.side==='sell'&&S.price<=S.trigger);
+  showDlg('Arm the ladder?',
+    (crossed?'<span class="warn">The trigger is ALREADY CROSSED — this will ENTER IMMEDIATELY.</span><br><br>':'')+
+    'Side <b>'+S.side.toUpperCase()+'</b>, trigger <b>'+f2(S.trigger)+'</b>, '+
+    (S.paper?'paper (logs only).':'<span class="warn">LIVE — real orders.</span>'),
+    'Cancel','ARM',()=>{S.armed=true;$('cbArmed').checked=true;render();toast('Armed');});
+}
+function doPlace(){
+  showDlg('Place this trade?','BUY 0.02 at ~'+f2(S.price)+', SL −3.00, TP +6.00'+
+    (S.real?'<br><br><span class="warn">This is a REAL-MONEY account.</span>':' on the demo account.'),
+    'Cancel','PLACE',()=>{toast('Order sent (mock)');});
+}
+function showDlg(h,p,no,yes,go){ $('dh').textContent=h; $('dp').innerHTML=p;
+  $('dno').textContent=no; $('dyes').textContent=yes; S.pending=go; $('dlg').className='dlg show'; }
+function hideDlg(){ $('dlg').className='dlg'; S.pending=null; }
+function dlgGo(){ const g=S.pending; hideDlg(); if(g) g(); }
+let tt; function toast(m){ $('toast').textContent=m; $('toast').className='toast show';
+  clearTimeout(tt); tt=setTimeout(()=>$('toast').className='toast',1900); }
+
+setInterval(()=>{
+  if(S.tick){ S.price=Math.round((S.price+(Math.random()-0.5)*0.6)*100)/100;
+    $('bid').textContent=f2(S.price-0.02); $('ask').textContent=f2(S.price+0.02); render(); }
+  const n=new Date(); $('clock').textContent=String(n.getHours()).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0');
+},700);
+
+sync();
+</script>
+</body>
+</html>

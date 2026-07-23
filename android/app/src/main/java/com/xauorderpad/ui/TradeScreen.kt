@@ -63,7 +63,9 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xauorderpad.net.Link
+import com.xauorderpad.net.RiderCard
 import kotlinx.coroutines.delay
+import kotlinx.serialization.json.JsonObject
 import kotlin.math.ceil
 
 /**
@@ -118,6 +120,13 @@ fun TradeScreen(
     /** Server-enforced account P&L guard (auto-close-all at a target). */
     guard: GuardUi = GuardUi(),
     onSetGuard: (Boolean?, Double?, String?) -> Unit = { _, _, _ -> },
+    /**
+     * Quick-panel writes — the SAME callbacks the Strategies page uses, so there is exactly one
+     * path to the server and no second set of rules to keep in sync. Defaulted so a caller that
+     * has not adopted the panel still compiles.
+     */
+    onSetStrategy: (String, Boolean?, JsonObject) -> Unit = { _, _, _ -> },
+    onPlaceCard: (RiderCard, Double?) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
     closing: Boolean = false,
 ) {
@@ -126,6 +135,27 @@ fun TradeScreen(
     // Every bulk close is confirmed: they are irreversible and a single tap can flatten the
     // whole book. `confirm` holds the pending filter, or null.
     var confirm by remember { mutableStateOf<String?>(null) }
+
+    // Quick-strategy panel state. Plain `remember`: this is ephemeral UI, and the activity is
+    // portrait-locked so there is no rotation to survive.
+    var quickOpen by remember { mutableStateOf(false) }
+    var quickTab by remember { mutableStateOf(QuickTab.LADDER) }
+    var quickExpanded by remember { mutableStateOf(false) }
+    var quickPinned by remember { mutableStateOf(false) }
+
+    // One icon, several engines: open whichever is most urgent. A rider card expires with its bar,
+    // so it outranks an armed ladder. Opening always starts at PEEK.
+    val toggleQuick: () -> Unit = {
+        if (quickOpen) {
+            if (!quickPinned) quickOpen = false
+        } else {
+            quickExpanded = false
+            val hot = riderOf(strategies)?.let { it.actionable == true && it.card?.isActionable == true } == true
+            quickTab = if (hot) QuickTab.RIDER else QuickTab.LADDER
+            quickOpen = true
+        }
+    }
+    val quickSlot: @Composable () -> Unit = { QuickIcon(strategies, quote, toggleQuick) }
     // Shared by every layout's bulk-close controls: confirm first (unless the user turned confirm
     // off), else fire straight through. Same AlertDialog handles all of them.
     val onBulkClose: (String) -> Unit = { filter ->
@@ -158,7 +188,7 @@ fun TradeScreen(
 
     if (mode == LayoutMode.SPLIT) {
         SplitBody(
-            serverUrl = serverUrl, strategies = strategies, mode = mode,
+            serverUrl = serverUrl, strategies = strategies, mode = mode, quick = quickSlot,
             onCycleLayout = onCycleLayout, onSettings = onSettings, onHistory = onHistory,
             health = health, link = link, onLogin = onLogin, live = live,
             quote = quote,
@@ -180,6 +210,7 @@ fun TradeScreen(
             onHistory = onHistory,
             onCycleLayout = onCycleLayout,
             onSettings = onSettings,
+            quick = quickSlot,
         )
         Spacer(Modifier.height(d.gap))
 
@@ -255,6 +286,33 @@ fun TradeScreen(
         )
     }
     }
+
+    // ---- quick strategy panel -------------------------------------------------------------
+    // An OVERLAY, deliberately: it floats over the positions grid instead of being inserted into
+    // the Column. The grid is the only weight(1f) child, so an inserted row would steal height
+    // straight from it -- and, worse, the quote / BUY / SELL / CLOSE rows would shift under a
+    // moving market. Position carries the function on this screen; nothing above may move.
+    if (quickOpen) {
+        QuickPanel(
+            strategies = strategies,
+            quote = quote,
+            health = health,
+            live = live,
+            tab = quickTab,
+            expanded = quickExpanded,
+            pinned = quickPinned,
+            onTab = { quickTab = it },
+            onToggleExpand = { quickExpanded = !quickExpanded },
+            onTogglePin = { quickPinned = !quickPinned },
+            // ✕ ALWAYS closes, pinned or not. Pin's job is to stop a stray ⚡ tap dismissing the
+            // panel mid-setup -- not to trap it open. Gating this on `pinned` too left the panel
+            // with no way out at all.
+            onClose = { quickOpen = false; quickPinned = false },
+            onSet = onSetStrategy,
+            onPlaceCard = onPlaceCard,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
+    }
     }
 
     confirm?.let { filter ->
@@ -306,6 +364,12 @@ private fun ServerBar(
     onHistory: () -> Unit,
     onCycleLayout: () -> Unit,
     onSettings: () -> Unit,
+    /**
+     * The quick-strategy entry point, sitting next to the ॐ. A SLOT rather than a pile of
+     * parameters: this bar is rendered from two call sites and has no business knowing what a
+     * strategy is. Empty by default, so nothing changes for a caller that does not pass one.
+     */
+    quick: @Composable () -> Unit = {},
 ) {
     Row(
         Modifier.fillMaxWidth().height(28.dp),
@@ -347,6 +411,9 @@ private fun ServerBar(
                 color = MaterialTheme.colorScheme.primary,
             )
         }
+
+        // Quick-strategy icon, immediately before the ॐ.
+        quick()
 
         TextButton(
             onClick = onSettings,
@@ -1276,6 +1343,8 @@ private fun SplitBody(
     serverUrl: String,
     strategies: StrategiesUi,
     mode: LayoutMode,
+    /** Forwarded straight to [ServerBar]; SPLIT gets the same quick icon as every other layout. */
+    quick: @Composable () -> Unit,
     onCycleLayout: () -> Unit,
     onSettings: () -> Unit,
     onHistory: () -> Unit,
@@ -1312,12 +1381,22 @@ private fun SplitBody(
             onHistory = onHistory,
             onCycleLayout = onCycleLayout,
             onSettings = onSettings,
+            quick = quick,
         )
         Spacer(Modifier.height(d.gap))
         StatusBanner(health, link, onLogin)
         // Same market clocks as the stacked layouts -- this is the other of the only two call sites,
         // so covering both puts the bar on all four layout modes.
         SessionBar()
+        Spacer(Modifier.height(d.gap))
+
+        // PRICE SPANS THE FULL WIDTH, above the split -- like the identity banner.
+        //
+        // It used to live inside the 0.55f left column, where it had roughly 190dp for three boxes.
+        // At that width XAUUSD's "4133.137" was clipped to "4133" and the BID/ASK captions were
+        // overrun by the digits: the quote block was showing everything EXCEPT the part that moves.
+        // Full width also pushes the positions grid down, which is the trade this buys.
+        QuoteBlock(quote, live, d, compact = true)
         Spacer(Modifier.height(d.gap))
 
         Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1327,7 +1406,6 @@ private fun SplitBody(
                 Modifier.weight(0.55f).fillMaxHeight().verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(d.gap),
             ) {
-                QuoteBlock(quote, live, d, compact = true)
                 CompactLotRow(form, d, onLot, onStepLot, fillField = true)
                 CompactSlTpRow(form, quote.point, d, onSl, onTp)
                 SplitEntryButtons(quote, digits, canTrade, d, onBuy = { onPlace("buy") }, onSell = { onPlace("sell") })

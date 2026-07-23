@@ -62,6 +62,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from datetime import date, datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -227,6 +228,21 @@ class JsonlFormatter(logging.Formatter):
 # Daily-dated rotating file handler
 # ---------------------------------------------------------------------------
 
+def _rollover_record(path: str) -> logging.LogRecord:
+    """A stand-in record for `handleError`, which needs one to report against.
+
+    The real record that triggered the rollover is still on its way to the file and must
+    not be consumed here; this exists only so the FAILURE has somewhere to be described.
+    `handleError` honours `logging.raiseExceptions`, so this prints a traceback to stderr
+    in development and stays silent in production rather than throwing from a log call.
+    """
+    return logging.LogRecord(
+        name="XauOrderPad.logging", level=logging.ERROR, pathname=__file__, lineno=0,
+        msg="log rollover failed for %s -- logging continues, rotation retried tomorrow",
+        args=(path,), exc_info=None,
+    )
+
+
 class DailyDatedRotatingHandler(TimedRotatingFileHandler):
     """Like TimedRotatingFileHandler but the live file always has TODAY's
     date in the filename (not yesterday's). Restart-safe (append mode).
@@ -262,32 +278,91 @@ class DailyDatedRotatingHandler(TimedRotatingFileHandler):
     def _path_for_today(self) -> Path:
         return self.log_dir / f"{self.app_name}-{date.today().isoformat()}.log"
 
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: D401
+        """Report a logging failure somewhere that SURVIVES.
+
+        The default writes a traceback to `sys.stderr`, and on the EC2 box stderr belongs
+        to a scheduled task that discards it. That is why a wedged file handler went
+        unnoticed for two days: the one component that could have reported the outage was
+        the component that had failed, and its only outlet went to /dev/null.
+
+        So the complaint also goes to a small sibling file, opened fresh each time and
+        closed immediately -- it must not hold a handle, because a handle is what the
+        rollover is trying to move. Wrapped in its own except: an error path that can
+        raise is not an error path.
+        """
+        super().handleError(record)
+        try:
+            with open(self.log_dir / f"{self.app_name}-logging-errors.log",
+                      "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now().isoformat()} "
+                         f"{record.getMessage()}\n{traceback.format_exc()}\n")
+        except Exception:
+            pass        # nothing left to try; never raise out of a log call
+
     def doRollover(self) -> None:  # noqa: D401
         """At midnight: close current stream, point to <app>-<today>.log,
         prune anything older than `backupCount` days, re-open in append mode.
+
+        ── Why every line of this is wrapped, and why `rolloverAt` moves in a `finally` ──
+
+        A rollover that raises used to SILENCE THE APPLICATION PERMANENTLY. The path:
+
+            BaseRotatingHandler.emit:
+                if self.shouldRollover(record): self.doRollover()
+                logging.FileHandler.emit(self, record)      # never reached
+              except Exception: self.handleError(record)    # swallowed
+
+        `shouldRollover` is just `now >= self.rolloverAt`, and `rolloverAt` used to be
+        assigned on the LAST line here. So one exception anywhere above it left the
+        deadline in the past -- and then EVERY subsequent record re-entered doRollover,
+        raised again, and was dropped by handleError. Not degraded: silent, total, and
+        lasting until someone restarted the process.
+
+        It happened twice on the EC2 box. 2026-07-18: a 0-byte file at 00:01:53, then no
+        log at all for the 19th -- two days of a live trading server with no audit trail.
+        2026-07-22: same signature at 00:01:41, dead until a redeploy fifteen hours later.
+
+        So the contract here is: this method may fail to ROTATE, but it must never fail to
+        LEAVE LOGGING WORKING. `rolloverAt` always advances (a broken rollover is retried
+        tomorrow, not on every record), the stream is always reopened if it can be, and the
+        failure is reported through `handleError` so it reaches stderr instead of vanishing.
         """
-        if self.stream:
-            self.stream.close()
-            self.stream = None  # type: ignore[assignment]
+        try:
+            if self.stream:
+                self.stream.close()
+                self.stream = None  # type: ignore[assignment]
 
-        # Switch the live file pointer to today's (new) date.
-        self.baseFilename = str(self._path_for_today())
+            # Switch the live file pointer to today's (new) date.
+            self.baseFilename = str(self._path_for_today())
 
-        # Best-effort prune of files older than the retention window.
-        self._prune_old_files()
+            # Best-effort prune of files older than the retention window.
+            self._prune_old_files()
+        except Exception:
+            # Rotation is a housekeeping nicety; logging is not. Keep going and let the
+            # reopen below put a working stream back, even if the rename/prune failed.
+            self.handleError(_rollover_record(self.baseFilename))
+        finally:
+            # ALWAYS reopen, and ALWAYS advance the deadline -- in that order, and outside
+            # the try above, so neither can be skipped by an earlier failure.
+            try:
+                if not self.delay and self.stream is None:
+                    self.stream = self._open()
+            except Exception:
+                # Could not open today's file. Leave the stream None: FileHandler.emit
+                # reopens lazily on the next record, so this self-heals as soon as
+                # whatever held the file lets go -- and it does not wedge the deadline.
+                self.handleError(_rollover_record(self.baseFilename))
 
-        # Re-open in append mode so any pre-existing content is preserved
-        # (e.g. if the file already exists because the server restarted today).
-        if not self.delay:
-            self.stream = self._open()
-
-        # Recompute the next midnight rollover (mirrors the parent class logic).
-        current_time = int(time.time())
-        new_rollover_at = self.computeRollover(current_time)
-        # Avoid scheduling a rollover that's already in the past (clock skew).
-        while new_rollover_at <= current_time:
-            new_rollover_at = new_rollover_at + self.interval
-        self.rolloverAt = new_rollover_at
+            # Recompute the next midnight rollover (mirrors the parent class logic).
+            current_time = int(time.time())
+            new_rollover_at = self.computeRollover(current_time)
+            # Avoid scheduling a rollover that's already in the past (clock skew) -- and,
+            # now, a rollover that FAILED. Without this the failed attempt repeats on every
+            # single record forever, which is the bug described above.
+            while new_rollover_at <= current_time:
+                new_rollover_at = new_rollover_at + self.interval
+            self.rolloverAt = new_rollover_at
 
     def _prune_old_files(self) -> None:
         """Delete log files older than `backupCount` days.

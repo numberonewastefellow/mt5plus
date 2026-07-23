@@ -41,10 +41,22 @@ from .rider_core import RiderConfig, RiderState, kelly_lot
 
 log = logging.getLogger("XauOrderPad.strategy")
 
-_STRUCT = ("thrust_mult", "sl", "trail", "tp", "max_hold", "atr_win", "use_ny_hours")
+_STRUCT = ("thrust_mult", "sl", "trail", "tp", "max_hold", "atr_win", "use_ny_hours",
+           "stop_units")
+
+def _stop_units(v) -> str:
+    """Whitelist. An unrecognised mode silently falling through to ATR-scaling would
+    read `sl=6.0` as 6 x ATR -- a stop six times too wide. Anything unknown is "fixed",
+    which is the validated behaviour and the conservative one."""
+    return "atr" if str(v).strip().lower() == "atr" else "fixed"
+
 
 _M5 = 300           # seconds per M5 bar — the time-stop counts these, not polls
 _CONTRACT = 100.0   # oz per lot (XAUUSD) — turns $/oz into account dollars
+# ATR period. Named once because THREE things must agree on it: the series itself, how
+# many bars of warm-up to fetch, and the first index that may be scored. When the last
+# two were implicit, the gate ran on a half-built median and nothing said so.
+_ATR_N = 14
 
 
 class VolRegimeRider(StrategyBase):
@@ -58,13 +70,18 @@ class VolRegimeRider(StrategyBase):
     # StrategyBase.evaluate, which requires BOTH.
     allows_real = True
 
-    # Saved, never restored. A crash-restart must not resume real-money trading.
-    NEVER_RESTORE = frozenset({"auto_real"})
+    # Saved, never restored. BOTH execution switches, not just the real-money one: after a
+    # restart this engine comes back in SUGGEST mode -- watching and publishing cards, placing
+    # nothing -- and the operator turns auto-trading back on when they are actually at the
+    # screen. On 2026-07-21 a restart 97 s after arming re-armed it while it held a 1.0-lot
+    # position; that particular hole is closed in reconcile(), and this closes the rest.
+    NEVER_RESTORE = frozenset({"auto_demo", "auto_real"})
 
     def __init__(self) -> None:
         super().__init__()
         p = dict(config.RIDER_DEFAULTS)
         self.thrust_mult = float(p["thrust_mult"])
+        self.stop_units = str(p["stop_units"])
         self.sl = float(p["sl"])
         self.trail = float(p["trail"])
         self.tp = float(p["tp"])
@@ -91,7 +108,8 @@ class VolRegimeRider(StrategyBase):
 
     # ---- config plumbing --------------------------------------------------
     def _cfg(self) -> RiderConfig:
-        return RiderConfig(thrust_mult=self.thrust_mult, sl=self.sl, trail=self.trail,
+        return RiderConfig(thrust_mult=self.thrust_mult, stop_units=self.stop_units,
+                           sl=self.sl, trail=self.trail,
                            tp=self.tp, max_hold=self.max_hold, atr_win=self.atr_win,
                            use_ny_hours=self.use_ny_hours, risk_frac=self.risk_frac)
 
@@ -128,7 +146,8 @@ class VolRegimeRider(StrategyBase):
         return dict(config.RIDER_DEFAULTS)
 
     def _params(self) -> dict:
-        return {"thrust_mult": self.thrust_mult, "sl": self.sl, "trail": self.trail,
+        return {"thrust_mult": self.thrust_mult, "stop_units": self.stop_units,
+                "sl": self.sl, "trail": self.trail,
                 "tp": self.tp, "max_hold": self.max_hold, "atr_win": self.atr_win,
                 "use_ny_hours": self.use_ny_hours, "risk_frac": self.risk_frac,
                 "max_daily_loss": self.max_daily_loss,
@@ -136,7 +155,8 @@ class VolRegimeRider(StrategyBase):
 
     def _apply(self, params: dict) -> None:
         before = {k: getattr(self, k) for k in _STRUCT}
-        for k, cast in (("thrust_mult", float), ("sl", float), ("trail", float),
+        for k, cast in (("thrust_mult", float), ("stop_units", _stop_units),
+                        ("sl", float), ("trail", float),
                         ("tp", float), ("max_hold", int), ("atr_win", int),
                         ("use_ny_hours", bool), ("risk_frac", float),
                         ("max_daily_loss", float),
@@ -157,7 +177,7 @@ class VolRegimeRider(StrategyBase):
 
     # ---- indicators over the recent M5 window (numpy-only) ----------------
     @staticmethod
-    def _atr_series(h, l, c, n=14):
+    def _atr_series(h, l, c, n=_ATR_N):
         prevc = np.concatenate(([c[0]], c[:-1]))
         tr = np.maximum.reduce([h - l, np.abs(h - prevc), np.abs(prevc - l)])
         atr = np.full(len(c), np.nan)
@@ -182,7 +202,22 @@ class VolRegimeRider(StrategyBase):
 
         # 2) SIGNAL, only when a new M5 bar has closed. recent_m5 is cached by the worker
         #    to the 5-minute boundary, so this is one IPC per bar, not one per poll.
-        need = self.atr_win + 40
+        # Enough bars that EVERY bar we score has a FULL atr_win regime window behind it.
+        #
+        # The regime gate is `atr > median(atr[i-atr_win+1 : i+1])`, and `lo` clamps at 0.
+        # With only `atr_win + 40` bars that clamp bit on the first ~atr_win of them, so
+        # those bars were scored against a median of 5, 20, 60 samples instead of 100 --
+        # a different gate, and therefore potentially different TRADES. It only showed up
+        # after a restart, because `_last_bar_ts` is 0 then and the loop below walks the
+        # whole buffer: the engine re-scored ~8 h of history through a gate that was not
+        # warmed, and wrote the result into the paper record that is supposed to be the
+        # clean read on the edge. Same code, same market, different answer depending on
+        # how recently the process started.
+        #
+        # So carry a full window of warm-up ON TOP of the window we intend to score. The
+        # extra bars cost nothing per poll -- `recent_m5` is cached to the 5-minute
+        # boundary, so this is still one IPC per bar.
+        need = 2 * self.atr_win + _ATR_N + 40
         bars = worker.recent_m5(need)
         if bars is None or len(bars) < self.atr_win + 20:
             self._state = "waiting: warming up M5 history"
@@ -199,17 +234,33 @@ class VolRegimeRider(StrategyBase):
         atr = self._atr_series(h, l, c)
         equity = float(acc.get("equity", 0.0)) or 500.0
 
-        # feed every bar that has closed since we last advanced, in order
-        for i in range(1, n - 1):
+        # The newest CLOSED bar. Only a signal ON this bar may reach the broker -- see below.
+        newest_closed = int(t[n - 2])
+
+        # Feed every bar that has closed since we last advanced, in order -- but never a
+        # bar whose regime window is short. `first_scorable` is the first index with a
+        # full atr_win of ATR behind it; anything earlier is warm-up, not a decision.
+        # Scoring it would answer the gate with a half-built median (see `need` above).
+        first_scorable = self.atr_win + _ATR_N
+        for i in range(max(1, first_scorable), n - 1):
             if t[i] <= self._last_bar_ts:
                 continue
-            lo = max(0, i - self.atr_win + 1)
+            lo = i - self.atr_win + 1
             window = atr[lo:i + 1]
             atr_med = float(np.nanmedian(window)) if np.isfinite(window).any() else np.nan
             hour = int(np.datetime64(int(t[i]), "s").astype("datetime64[h]").astype(int) % 24)
             for act in self._sm.on_bar(o[i], h[i], l[i], c[i], atr[i], atr_med, hour, equity):
                 self._record(act, int(t[i]))
-                self._maybe_place(worker, st, act)
+                # ONLY the newest closed bar may place. Everything else here is HISTORY being
+                # replayed, and replaying history used to send live orders: on the first tick
+                # `_last_bar_ts` is 0, so this loop walks the whole ~11.7 h window and fired
+                # `_maybe_place` on every entry it found -- a 9.5-hour-old signal became a market
+                # order at today's price, sized and stopped against a level long gone. `_apply`
+                # resets `_last_bar_ts` to 0 too, so merely editing "Stop ($/oz)" in the panel
+                # could trigger it. Warming up must never trade; it may only fill in the paper
+                # record and the card. Same freshness rule `_actionable` applies to the human.
+                if int(t[i]) == newest_closed:
+                    self._maybe_place(worker, st, act)
             self._last_bar_ts = int(t[i])
 
         self._state = self._state_label()
@@ -407,6 +458,18 @@ class VolRegimeRider(StrategyBase):
                            "ticket": int(p.ticket), "entry": entry, "best": best,
                            "stop": stop, "basis": basis})
         return len(positions)
+
+    def _on_flat(self) -> None:
+        """Broker says we hold nothing -- so we hold nothing. `_live` is a cache, and a
+        cache that outlives what it points at is worse than no cache: `_maybe_place`
+        refuses to enter while it is set, so a ghost handle silently stops this engine
+        trading, and both UIs render 'riding live ticket N' for a trade that closed."""
+        if self._live is not None:
+            log.info("rider: broker reports no position — dropping stale handle %s",
+                     self._live.get("ticket"),
+                     extra={"event": "rider_stale_handle_cleared", "strategy": self.ID,
+                            "ticket": self._live.get("ticket")})
+            self._live = None
 
     def _adopt_detail(self) -> dict:
         return {"live": self._live}

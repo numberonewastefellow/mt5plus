@@ -348,6 +348,10 @@ class MainActivity : ComponentActivity() {
                             onSelectTf = callbacks.onSelectTf,
                             guard = guard,
                             onSetGuard = callbacks.onSetGuard,
+                            // The quick panel writes through the SAME callbacks the Strategies
+                            // page uses, so there is one path to the server, not two.
+                            onSetStrategy = callbacks.onSetStrategy,
+                            onPlaceCard = callbacks.onPlaceRiderCard,
                             modifier = inset,
                         )
 

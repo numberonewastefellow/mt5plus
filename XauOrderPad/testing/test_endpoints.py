@@ -436,6 +436,75 @@ def test_duplicate_account_login_is_refused():
     assert r.status_code == 200, r.text
 
 
+def test_pinned_instance_refuses_a_different_account():
+    """An instance named after an account must refuse to log in any other one.
+
+    This is what makes naming instances `472200942` rather than `a1` trustworthy: the
+    name stops being a mnemonic and becomes enforced. Refused BEFORE MT5 is touched, so
+    the existing session is left exactly as it was.
+    """
+    original = config.EXPECT_LOGIN
+    try:
+        config.EXPECT_LOGIN = 999999            # the stub's account
+        # The pinned account is still allowed.
+        r = httpx.post(f"{BASE}/api/login", timeout=10, json={
+            "login": 999999, "password": "stub", "server": "STUB-NOT-REAL", "save": False})
+        assert r.status_code == 200, r.text
+
+        # A DIFFERENT account must be refused, and must not disturb the session.
+        r = httpx.post(f"{BASE}/api/login", timeout=10, json={
+            "login": 888888, "password": "stub", "server": "STUB-NOT-REAL", "save": False})
+        assert r.status_code >= 400, f"pinned instance accepted a foreign account: {r.text}"
+        assert "only drives account" in r.text or "999999" in r.text
+
+        st = httpx.get(f"{BASE}/api/state", timeout=5, headers=_hdr()).json()
+        assert (st.get("account") or {}).get("login") == 999999, \
+            "the refused login disturbed the session it should not have touched"
+    finally:
+        config.EXPECT_LOGIN = original
+
+
+def test_wrong_account_on_the_terminal_blocks_trading():
+    """If the terminal is switched to another account, the order path must shut.
+
+    Different failure from the login guard: nobody called /api/login at all. Somebody
+    changed the account inside MT5, and positions_get() would report the new account's
+    book without complaint.
+    """
+    original = config.EXPECT_LOGIN
+    try:
+        config.EXPECT_LOGIN = 12345            # stub reports 999999 -> mismatch
+        end = time.time() + 5.0
+        st = {}
+        while time.time() < end:
+            st = httpx.get(f"{BASE}/api/state", timeout=5, headers=_hdr()).json()
+            if st.get("wrong_account"):
+                break
+            time.sleep(0.05)
+
+        assert st.get("wrong_account"), f"account guard never fired; state={st}"
+        assert st["healthy"] is False, "WRONG ACCOUNT BUT STILL HEALTHY -- would trade it"
+        assert "pinned to 12345" in (st.get("error") or "")
+
+        r = httpx.post(f"{BASE}/order", timeout=10, headers=_hdr(),
+                       json={"side": "buy", "volume": 0.01, "type": "market"})
+        assert r.status_code >= 400 or r.json().get("ok") is False, \
+            "AN ORDER WAS ACCEPTED WHILE THE TERMINAL HELD THE WRONG ACCOUNT"
+    finally:
+        config.EXPECT_LOGIN = original
+        _wait_healthy()          # recovers once the pin matches again
+
+
+def test_unpinned_instance_keeps_single_account_freedom():
+    """EXPECT_LOGIN == 0 is the single-account default and must change nothing."""
+    assert config.EXPECT_LOGIN == 0, "tests must leave EXPECT_LOGIN unpinned"
+    st = _wait_healthy()
+    assert not st.get("wrong_account")
+    r = httpx.post(f"{BASE}/api/login", timeout=10, json={
+        "login": 999999, "password": "stub", "server": "STUB-NOT-REAL", "save": False})
+    assert r.status_code == 200, r.text
+
+
 def test_relogin_to_same_account_is_not_self_blocked():
     """Logging into the account this very server already drives must still work.
 
