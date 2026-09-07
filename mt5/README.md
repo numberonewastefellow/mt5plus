@@ -32,6 +32,14 @@ edit here  ──>  deploy.ps1  ──>  MT5 compiles  ──>  attach to chart 
 > If you change an `.mqh` include, re-run `deploy.ps1` — MT5 only sees what's in its own
 > Experts folder.
 
+## Operator tools
+
+`mt5\tools\reset_demo_balance.bat` puts the Exness demo account back to **$1** so a
+`RecoveryGridScalper` run can be repeated from the same base. It carries **no credential** —
+the Exness session lives outside the repo in `MyCred\`, and expires roughly every 6 hours, so
+the script decodes the token's expiry and refuses to send once it is stale rather than failing
+with an opaque 403. Refresh it with `-ImportCurl`. See [tools/README.md](tools/README.md).
+
 ## Folder structure
 
 Each strategy is **self-contained in its own folder**. The contents of each

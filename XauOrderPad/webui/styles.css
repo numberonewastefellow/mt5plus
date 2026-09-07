@@ -563,6 +563,13 @@ kbd{
 .autotest-verdict.pass  {color:var(--good); background:rgba(25,201,138,.08); border-color:var(--good)}
 .autotest-verdict.review{color:var(--warn); background:rgba(255,176,32,.08); border-color:var(--warn)}
 .autotest-verdict.fail  {color:var(--bad);  background:rgba(255,77,82,.08);  border-color:var(--bad)}
+/* Manual-reload nag: a parked ladder waiting for the operator to set a new level.
+   Pulses so it is noticed on a glance -- it is an ACTION prompt, not a passive warning. */
+.autotest-verdict.attention:not([hidden]){
+  color:var(--warn); background:rgba(255,176,32,.12); border-color:var(--warn);
+  animation:attentionPulse 1.6s ease-in-out infinite;
+}
+@keyframes attentionPulse{50%{background:rgba(255,176,32,.22); border-color:#ffd36a}}
 
 /* ---- Persistent FAIL banner ----
    Shown above the main content area only on Auto-Test FAIL verdict.

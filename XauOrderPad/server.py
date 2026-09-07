@@ -226,6 +226,66 @@ def _require_terminal_path_when_instanced() -> None:
         )
 
 
+def _start_autologin(profile_id: str) -> None:
+    """Log into `profile_id` at startup so a restart returns LIVE, not logged-out.
+
+    A login is a session, not a trade -- nothing here places an order. Runs on a daemon
+    thread with retries because on a fresh boot the terminal may still be launching, and a
+    one-shot attempt would lose the race and leave the server logged out forever.
+
+    Guards, in order:
+      * profile must exist and have a saved password (else nothing to log in with);
+      * REFUSE a profile last seen on a REAL account -- unattended real-money resumption is
+        exactly what must never happen without a human;
+      * the account pin (EXPECT_LOGIN) in the worker independently refuses any account but this
+        instance's own, so a misconfigured AUTOLOGIN can never drive the wrong account.
+    """
+    import threading
+
+    def run() -> None:
+        prof = accounts.get_profile(profile_id)
+        if not prof:
+            log.error("autologin skipped: profile not found",
+                      extra={"event": "autologin_no_profile", "profile_id": profile_id})
+            return
+        if prof.get("last_trade_mode") == 2:
+            log.error("autologin REFUSED: profile last seen on a REAL account",
+                      extra={"event": "autologin_refused_real", "profile_id": profile_id})
+            return
+        password = accounts.get_password(profile_id)
+        if not password:
+            log.error("autologin skipped: no saved password (log in once with Save)",
+                      extra={"event": "autologin_no_password", "profile_id": profile_id})
+            return
+
+        for attempt in range(1, 7):                     # ~6 tries over ~75s as the terminal boots
+            fut = worker.submit({"action": "login", "login": prof["login"],
+                                 "password": password, "server": prof["server"]})
+            try:
+                res = fut.result(timeout=140)
+            except Exception as exc:                    # noqa: BLE001
+                res = {"ok": False, "error": str(exc)}
+            if res.get("ok"):
+                if res.get("is_demo") is False:
+                    # It logged into a REAL account despite the pre-check (last_trade_mode was
+                    # not yet known). It is a session, not a trade -- but shout, loudly.
+                    log.error("autologin landed on a REAL account -- verify this is intended",
+                              extra={"event": "autologin_real_account",
+                                     "login": res.get("login")})
+                log.info("autologin succeeded",
+                         extra={"event": "autologin_ok", "login": res.get("login"),
+                                "is_demo": res.get("is_demo"), "attempt": attempt})
+                return
+            log.warning("autologin attempt failed; will retry",
+                        extra={"event": "autologin_retry", "attempt": attempt,
+                               "error": res.get("error")})
+            time.sleep(15)
+        log.error("autologin gave up after retries -- server stays logged out (tap Login)",
+                  extra={"event": "autologin_gave_up", "profile_id": profile_id})
+
+    threading.Thread(target=run, name="autologin", daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail closed BEFORE the worker starts or the socket serves: a networked bind with no token
@@ -267,6 +327,11 @@ async def lifespan(app: FastAPI):
         url = f"http://{dial}:{config.PORT}/"
         launch_when_ready(url, dial, config.PORT,
                           getattr(config, "BROWSER_MODE", "app"))
+    # Auto-login on boot, if configured. Makes a scheduled restart come back LIVE instead of
+    # logged-out. Runs on a daemon thread with retries (the terminal may still be launching), so
+    # it never delays or blocks startup, and a failure leaves the server logged-out and tappable.
+    if getattr(config, "AUTOLOGIN_PROFILE", ""):
+        _start_autologin(config.AUTOLOGIN_PROFILE)
     try:
         yield
     finally:
@@ -442,11 +507,13 @@ class StrategyReq(BaseModel):
     stop_mode: str | None = None
     retrace: float | None = None
     floor_offset: float | None = None
+    trail_activate: float | None = None
     hard_sl: float | None = None
     cooldown_s: float | None = None
     max_ladders_per_day: int | None = None
     close_batch: int | None = None
     paper: bool | None = None
+    auto_continue: bool | None = None
     # rider (vol-regime trend-rider; paper/suggestion only)
     thrust_mult: float | None = None
     sl: float | None = None
@@ -462,6 +529,13 @@ class StrategyReq(BaseModel):
     # the engine must also declare `allows_real`.
     auto_demo: bool | None = None
     auto_real: bool | None = None
+    # straddle-ladder (sladder). It also reuses the already-declared sl / tp / max_lots /
+    # cooldown_s / volume / max_daily_loss slots above -- a field here is only a transport slot,
+    # and a POST to /api/strategy/sladder routes to that one engine, so sharing names is safe.
+    level: float | None = None
+    gap: float | None = None
+    max_legs: int | None = None
+    always_straddle: bool | None = None
     # shared
     volume: float | None = None
     max_daily_loss: float | None = None

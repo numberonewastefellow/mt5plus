@@ -274,6 +274,20 @@ class TradingViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+        // The ladder rides ONE leg then PARKS -- it never re-enters itself. Chime once on the
+        // OFF->ON edge of its `needs_attention` (server-derived) so the operator knows to set a
+        // new level, wherever they are in the app. `prev` starts null and is only set once the
+        // ladder is actually present, so a ladder found ALREADY parked on connect does not chime
+        // on open -- only a fresh flush does.
+        viewModelScope.launch {
+            var prev: Boolean? = null
+            strategies.collect { ui ->
+                val ladder = ui.items.firstOrNull { it.id == "ladder" } ?: return@collect
+                val on = ladder.needsAttention == true
+                if (prev == false && on) Chime.playAlert()
+                prev = on
+            }
+        }
     }
 
     /**

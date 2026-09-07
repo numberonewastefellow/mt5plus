@@ -208,6 +208,58 @@ the event alone is not enough.
 BLS CPI/NFP schedules, gold price commentary (RoboForex/Babypips/World Gold Council, Apr 2026).*
 
 ---
+
+## 8. Baseline choice decides which spikes fire — rolling-median vs session-aware (2026-08-22)
+
+Cross-validated the **Volume-Spike Straddle** (`XauOrderPad/strategies/straddle.py`) against raw ticks
+(2026-08-11 → 08-24; saved dataset `analysis/tick_data/xauusdm_20260811_20260825/`; reusable replay
+`analysis/straddle_replay.py`). Confirmed first that *everything* here is **tick count**, never real
+volume: `straddle.py:172` reads `bars["tick_volume"]`, and every M5 bar's `real_volume` is **0**
+(min=max=sum=0).
+
+**The finding:** the straddle's RVOL divides the spike bar by the **trailing 90-minute rolling
+median** (`base = median(v[i-90:i])`). That baseline is *regime-adaptive*, which means a big bar
+during an **already-busy session does not register as a spike**:
+
+| Spike (chart UTC+4) | M1 tick_vol | trailing-90 median | RVOL | Straddle (≥8)? |
+|---|--:|--:|--:|:--:|
+| Aug 19 16:37 | 1,998 | **144** (quiet pre-move) | **13.8** | ✅ fires |
+| Aug 20 19:02 | **2,182** | **401** (busy US session) | **5.4** | ❌ missed |
+
+The Aug 20 bar had **more** absolute volume yet a **lower** RVOL, so the straddle skipped the exact
+spike that is obvious on the chart. Over **Aug 11 → 24** it fired **12** times (31 bars ≥ RVOL 8 → 28
+pass the ATR-expanding filter → 12 after the 15-min cooldown). The largest RVOL of all (21.0) was a
+*small* overnight bar that only looked huge against a dead Asian-session baseline — the mirror image.
+(The first 10-day window Aug 11→21 gave **9**; extending to Mon Aug 24 added 3 Monday-session
+entries.)
+
+**Root cause:** the chart shows **absolute** volume; the straddle triggers on **relative** volume vs
+the recent median. They disagree by design. Note `tick_profiler.py` (60-s rolling rate,
+minute-of-day deseasonalized) is a *different* normalization again — same tick-count quantity, so it
+flags a **different set** of spikes.
+
+**Two data-fidelity fixes made while verifying (2026-08-24):**
+- **De-dup bug in `harness/tickdata.py::load_ticks`.** It de-duped ticks on `time_msc` *alone*, which
+  also dropped genuinely-distinct ticks sharing a millisecond → per-minute counts ran **~4% below**
+  MT5 `tick_volume` (worse on spikes), and the saved CSV replay gave **8** entries where MT5 gave 9.
+  Fixed to de-dup on the **full record** `(time_msc, bid, ask, flags)`; the corrected CSV now
+  reproduces the MT5 funnel **exactly** (31 → 28 → 12).
+- **rvol≈8.0 threshold fragility.** The `08-18 13:30` bar sits at exactly RVOL 8.0, so it flips in/out
+  on a handful of ticks. A production version should add hysteresis / a small margin rather than a
+  hard `>= 8`.
+
+### ▶ NEXT: review + backtest (pending as of 2026-08-24)
+1. **Backtest a session-aware baseline for the straddle.** Replace the trailing-90-min rolling
+   median with a **time-of-day / session-aware** baseline (like `tick_profiler.py`'s minute-of-day
+   deseasonalization), and re-run the 10-day replay — measure how many of the chart-obvious session
+   spikes (e.g. Aug 20 19:00) it now catches, and whether the extra signals are worth trading.
+2. **Then build a new strategy** — a sibling to Volume-Spike Straddle that uses the **session-aware
+   baseline instead of the rolling median**. Same straddle mechanics (both legs, ATR stop/target);
+   only the spike-normalization changes. Keep it DEMO-ONLY behind the same `StrategyBase` gates.
+3. Reusable replay is now `analysis/straddle_replay.py` (`straddle_replay.py [START END]`) — the
+   session-aware backtest can fork its baseline computation.
+
+---
 *This document is the reference record of what was tried, what worked, and what didn't.
 The magnitude signal is keep-worthy; the M1/M5 directional scalp is not. News reliably explains
 the volatility (esp. FOMC), but direction stays governed by USD/real-yields, not the headline.*

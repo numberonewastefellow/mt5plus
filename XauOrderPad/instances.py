@@ -166,6 +166,9 @@ def load(path: Path | None = None) -> list[dict[str, Any]]:
             "label": str(item.get("label") or name),
             "mt5_path": mt5_path,
             "expect_login": expect,
+            # Broker server, e.g. "Exness-MT5Trial16". Used to build the boot auto-login profile
+            # id (<name>@<server>). Empty = no auto-login for this instance.
+            "server": str(item.get("server") or "").strip(),
             "token_file": str(item.get("token_file") or f".token.{name}.local"),
         })
 

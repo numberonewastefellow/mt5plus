@@ -109,13 +109,23 @@ be a fact, not a mnemonic.
 
 | Path | Port | Terminal | Task | Pinned to |
 |---|---|---|---|---|
-| `/` | 8765 | `C:\Program Files\MetaTrader 5` | `xauorderpad` | *(unpinned — legacy single-account)* |
-| `/472200942` | 8766 | `C:\mt5\472200942` (`/portable`) | `xauorderpad-472200942` | 472200942 |
-| `/472103079` | 8767 | `C:\mt5\472103079` | `xauorderpad-472103079` | 472103079 |
-| `/472104398` | 8768 | `C:\mt5\472104398` | `xauorderpad-472104398` | 472104398 |
+| `/` (bare) | 8765 | `C:\Program Files\MetaTrader 5` | `xauorderpad` | *(unpinned — serves 472200942 for the phone)* |
+| `/472103079` | 8767 | `C:\mt5\472103079` (`/portable`) | `xauorderpad-472103079` | 472103079 |
+| `/472104398` | 8768 | `C:\mt5\472104398` (`/portable`) | `xauorderpad-472104398` | 472104398 |
 
-Renaming an instance retires its old task automatically — otherwise the previous, *unpinned* server
-would keep holding the same port and quietly serve the account you thought was now guarded.
+**472200942 lives on the DEFAULT server, not a pinned instance.** Running a pinned `/472200942`
+*and* leaving 472200942 on the default double-books the account — the OS lock 409s the second
+server. So one account, one server: the default is 472200942's server; the pinned instances are the
+*other* accounts. (`instances.ec2.json` deliberately omits 472200942 for this reason.)
+
+Renaming or removing an instance retires its old task automatically (ship.ps1) — otherwise the
+previous server would keep holding the same port and quietly serve the account you thought was gone.
+
+**A fresh `/portable` terminal needs a one-time RDP first-run.** The scripted "pre-seed" (copying an
+initialised data dir into the copy) was tried and does **not** work — a fresh portable copy cannot
+bring up its MT5 IPC pipe without a real first-run (`-10005 IPC timeout`). With autologon configured,
+RDP in once, complete first-run + log in with **Save password** on each `C:\mt5\<account>` terminal,
+enable AutoTrading, and disconnect. Every later boot then auto-logs-in.
 
 **One TLS port, not one per account.** The server certificate's SAN is the Elastic *IP* — no port,
 no DNS name — so it already covers every port. N proxies would mean N copies of the same private
@@ -282,6 +292,21 @@ the free-tier credits ([the arithmetic](../DEPLOY_AWS.md#cost-guard)).
 > `config.json` is read only for the `start` banner and the `status` countdown. Change it alone and
 > those will confidently print a number **the box does not honour**. `autostop` is the only thing
 > that moves the real timer; it writes `config.json` back afterwards so the display stays honest.
+
+> **Never run `autostop` (or any startup/shutdown script) as part of a deploy.** Deploying is
+> `ship` + a server restart — it touches the app files and the `xauorderpad` task and **nothing
+> else**. It does *not* read, set, or care about the shutdown timer. So running `autostop` before
+> or after a `ship` does not "help the deploy"; it does the opposite.
+>
+> `autostop` **re-registers `ec2-autostop` as an AtStartup relative countdown** (`shutdown /s /t
+> <secs>`) that re-arms on *every* boot. If you have set a specific one-off shutdown — e.g. a
+> one-time calendar task pinned to the market close — an `autostop` run **silently overwrites it**,
+> and the box then starts stopping itself a fixed number of minutes after each boot instead. That
+> is exactly how a box set to run until Friday ended up powering off two hours after a reboot.
+>
+> Rule of thumb: **deploy and shutdown-timing are separate operations — never interleave them.**
+> Deploy with `ship`; change the stop time deliberately and on its own, and re-verify the
+> `ec2-autostop` trigger afterwards (`Get-ScheduledTask -TaskName ec2-autostop`).
 
 ---
 

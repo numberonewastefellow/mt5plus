@@ -114,3 +114,25 @@ android/local.properties
 # Phone address remembered by deploy.bat. Machine-local, and the wireless-debug
 # port changes on every toggle, so it is noise in a diff.
 android/.deploy-phone
+
+# Exness personal-area session used by mt5/tools/reset_demo_balance.ps1: a JWT plus
+# a Cloudflare clearance cookie. The JWT is a session for the WHOLE brokerage account,
+# not merely the demo one, so it ranks with .token.local and the deploy .pem.
+#
+# It is supposed to live OUTSIDE the repo entirely, in MyCred\ -- these patterns are
+# belt-and-braces for a stray copy dropped in-tree while debugging, which is exactly
+# when it would get swept up by a `git add -A`.
+exness_session.txt
+*exness_session*.txt
+*.curl.txt
+
+# Tick captures are CACHE, not source: 422MB today, and two of them
+# (xauusdm_20260811_20260821 at 153MB, ..._20260825 at 197MB) are over GitHub's
+# 100MB hard limit - staging them does not make a big repo, it makes a REJECTED
+# push. Re-pull any window with analysis/export_ticks.py.
+#
+# The per-capture README.md stays TRACKED on purpose: it records which window was
+# captured and which set is the only true forward test. That provenance is worth
+# keeping even though the rows behind it are regenerable.
+analysis/tick_data/**/raw_ticks.csv
+analysis/tick_data/**/*.zip

@@ -85,10 +85,14 @@ def _settle(seconds: float = 1.2) -> None:
 def disarm_after():
     yield
     # Never leave an engine armed for the next test -- and the stub book is reset by `clean`,
-    # so an armed ladder would otherwise re-fire against a fresh book.
+    # so an armed ladder would otherwise re-fire against a fresh book. Also reset the volatile
+    # brakes/toggles to their defaults: `_ladders_today` accumulates across the whole session
+    # (it is a per-DAY counter), so a leaked `max_ladders_per_day` from one test trips "done for
+    # today" and blocks the NEXT test's very first arm. Same idea for `auto_continue` / `cooldown_s`.
     try:
         httpx.post(f"{BASE}/api/strategy/ladder", timeout=10, headers=_hdr(),
-                   json={"enabled": False})
+                   json={"enabled": False, "auto_continue": False,
+                         "cooldown_s": 0.0, "max_ladders_per_day": 0})
     except Exception:
         pass
     stub._freeze(False)
@@ -222,15 +226,12 @@ def test_flush_never_touches_another_magic():
         assert manual in stub._s.positions, "the flush closed a MANUAL position"
 
 
-# ---------------------------------------------------------------- the re-arm latch
+# ---------------------------------------------------------------- the re-arm policy
 
-def test_a_completed_ladder_does_not_instantly_re_enter():
-    """D1, the defect that turned 25 minutes into 68 ladders.
-
-    After a ladder ends, price is still sitting past the trigger. The old engine armed a
-    fresh ladder on the very next poll and bought again, forever. A crossing must be an
-    EVENT: price has to trade back through the trigger first.
-    """
+def test_one_shot_does_not_re_arm_on_a_re_cross():
+    """The default (auto_continue off). After a run's stop closes it, a bare price re-cross must
+    NOT start a new run -- only a SET LEVEL does. This is the manual-reload workflow, and it makes
+    the old 68-ladders-in-25-min churn impossible."""
     _px(2400.00)
     _arm(side="buy", trigger=2400.10, target=5.00, stop_mode="floor", floor_offset=0.50,
          volume=0.01, max_positions=1, max_lots=0.0,
@@ -240,43 +241,74 @@ def test_a_completed_ladder_does_not_instantly_re_enter():
     _settle()
     assert len(_rungs()) == 1
 
-    _px(2399.00)                                   # through the floor -> flush + ladder done
+    _px(2399.00)                                   # through the floor -> flush + park
     for _ in range(60):
         time.sleep(0.1)
         if not _rungs():
             break
     assert _rungs() == []
 
-    # Now put price back ABOVE the trigger and hold it there. The trigger has not been
-    # RE-CROSSED from below since the ladder ended... except that the flush itself happened
-    # below it, so the latch is satisfied and one new ladder is legitimate. What must NOT
-    # happen is a stream of them.
-    _px(2400.50)
-    _settle(2.0)
-    assert len(_rungs()) <= 1, (
-        f"re-armed repeatedly while parked past the trigger: {len(_rungs())} rungs")
+    # Cross the trigger up-and-down repeatedly -- one-shot must stay parked the whole time.
+    for _ in range(4):
+        _px(2400.60); time.sleep(0.2)
+        _px(2400.00); time.sleep(0.2)
+    _px(2400.60)
+    _settle(1.5)
+    assert _rungs() == [], "one-shot re-armed on a re-cross -- it must wait for a SET LEVEL"
+
+    # A SET LEVEL (no enable toggle) re-engages -- price is already above the new trigger.
+    r = httpx.post(f"{BASE}/api/strategy/ladder", timeout=10, headers=_hdr(),
+                   json={"trigger": 2400.40})
+    assert r.status_code == 200, r.text
+    for _ in range(30):
+        time.sleep(0.15)
+        if _rungs():
+            break
+    assert len(_rungs()) == 1, "a SET LEVEL should re-arm after a one-shot park"
 
 
-def test_cooldown_blocks_the_next_ladder():
-    """The brake that does not depend on price shape at all."""
+def test_auto_continue_re_takes_after_a_flush_while_past_the_level():
+    """auto_continue ON: a run that flushes while price is still past the level starts a NEW run
+    on its own -- the behaviour one-shot suppresses. (Boundary + churn-brake logic is unit-tested
+    on `_rearm_gate` in test_ladder_state.py; this proves the wiring end to end.)"""
     _px(2400.00)
-    _arm(side="buy", trigger=2400.10, target=5.00, stop_mode="floor", floor_offset=0.50,
+    # No max_ladders cap needed: the price is frozen, so run 2 arms and then just holds (no
+    # bounce -> no further flush), which naturally bounds this test to two runs.
+    _arm(side="sell", trigger=2399.90, target=5.00, stop_mode="retrace", retrace=0.40,
          volume=0.01, max_positions=1, entry_mode="timer", entry_gap_ms=100,
-         cooldown_s=3600, paper=False)
+         auto_continue=True, paper=False)
 
-    _px(2400.50)
+    _px(2399.30)                                   # cross down -> run 1 (1 rung @ ~2399.30)
     _settle()
     assert len(_rungs()) == 1
-    _px(2399.00)
-    for _ in range(60):
-        time.sleep(0.1)
-        if not _rungs():
-            break
-    assert _rungs() == []
 
-    _px(2400.50)                                   # cross again, well inside the cooldown
+    # Bounce 0.40 up but STILL below the 2399.90 trigger -> retrace flush, then auto re-arm at
+    # the new (frozen) price. End state: run 1 done, a fresh run open -- not parked.
+    _px(2399.72)
+    took_again = False
+    for _ in range(50):
+        time.sleep(0.1)
+        st = _status()
+        if len(_rungs()) == 1 and st["ladders_done"] >= 1:
+            took_again = True
+            break
+    assert took_again, "auto_continue did not re-take after a flush while price was past the level"
+
+
+def test_cooldown_throttles_auto_continue():
+    """In auto-continue, `cooldown_s` is the churn brake -- it holds the next run even though
+    price is still past the level (the case where auto-continue would otherwise churn a chop)."""
+    _px(2400.00)
+    _arm(side="sell", trigger=2399.90, target=5.00, stop_mode="retrace", retrace=0.40,
+         volume=0.01, max_positions=1, entry_mode="timer", entry_gap_ms=100,
+         auto_continue=True, cooldown_s=3600, paper=False)
+
+    _px(2399.30)                                   # run 1
+    _settle()
+    assert len(_rungs()) == 1
+    _px(2399.72)                                   # flush run 1; price still below the level
     _settle(2.0)
-    assert _rungs() == [], "cooldown did not block the next ladder"
+    assert _rungs() == [], "cooldown did not throttle the auto-continue re-arm"
     assert "cooldown" in _status()["state"]
 
 
@@ -316,3 +348,132 @@ def test_effective_stop_includes_the_spread():
     assert st["spread"] == pytest.approx(SPREAD, abs=0.01)
     assert st["effective_stop"] == pytest.approx(0.50 + SPREAD, abs=0.01)
     assert st["floor_price"] == pytest.approx(2399.00 - 0.50, abs=0.001)
+
+
+# ---------------------------------------------------------------- manual reload UX
+
+
+def _poll_status(pred, tries=40, gap=0.1) -> dict:
+    """Poll the status endpoint until `pred(st)` holds (it lags the broker by one cycle)."""
+    st = _status()
+    for _ in range(tries):
+        st = _status()
+        if pred(st):
+            break
+        time.sleep(gap)
+    return st
+
+
+def test_a_parked_ladder_asks_for_a_new_level_then_clears():
+    """The manual-reload contract. The engine rides ONE leg then PARKS -- it never re-enters
+    itself. It latches needs_attention so the clients can alert the operator to set a new level,
+    and clears it the instant they do. This is what replaces auto re-entry."""
+    _px(2400.00)
+    _arm(side="buy", trigger=2400.10, target=5.00, stop_mode="floor", floor_offset=0.50,
+         volume=0.01, max_positions=1, entry_mode="timer", entry_gap_ms=100, paper=False)
+    _px(2400.50)                                   # cross -> one rung
+    _settle()
+    assert len(_rungs()) == 1
+    _px(2399.00)                                   # through the floor -> flush + PARK
+    for _ in range(60):
+        time.sleep(0.1)
+        if not _rungs():
+            break
+    assert _rungs() == []
+
+    st = _poll_status(lambda s: s.get("needs_attention"))
+    assert st["needs_attention"] is True, "a parked ladder must ask for a new level"
+    assert "new level" in (st["attention_reason"] or "").lower()
+
+    # Setting a NEW LEVEL (no enable toggle) is the manual re-engage -- it resolves the nag.
+    r = httpx.post(f"{BASE}/api/strategy/ladder", timeout=10, headers=_hdr(),
+                   json={"trigger": 2500.00})
+    assert r.status_code == 200, r.text
+    st = _poll_status(lambda s: not s.get("needs_attention"))
+    assert st["needs_attention"] is False, "setting a new level did not clear the nag"
+
+
+def test_would_fire_now_flags_an_already_crossed_level():
+    """A BUY level below the ask (a SELL above the bid) arms INSTANTLY, not on a move. The
+    server derives this from the live quote so both clients can warn before the operator
+    commits -- the trap where a new level enters at once instead of waiting for the drop."""
+    _px(2400.00)                                   # bid 2400.00, ask ~2400.22
+    _arm(side="buy", trigger=2399.00, target=5.00, stop_mode="floor", floor_offset=0.50,
+         paper=True)                               # trigger BELOW the ask -> already crossed
+    st = _poll_status(lambda s: s.get("would_fire_now"))
+    assert st["would_fire_now"] is True
+
+    r = httpx.post(f"{BASE}/api/strategy/ladder", timeout=10, headers=_hdr(),
+                   json={"trigger": 2500.00})       # now ABOVE the ask -> it would wait
+    assert r.status_code == 200, r.text
+    st = _poll_status(lambda s: not s.get("would_fire_now"))
+    assert st["would_fire_now"] is False
+
+
+def test_setting_a_new_level_overrides_the_cooldown():
+    """A cooldown brakes the MACHINE re-trying the same idea; a deliberate new level is the
+    operator's call and must not be held behind it. So an explicit trigger change clears the
+    cooldown and re-arms from the new price -- even mid-cooldown."""
+    _px(2400.00)
+    _arm(side="buy", trigger=2400.10, target=5.00, stop_mode="floor", floor_offset=0.50,
+         volume=0.01, max_positions=1, entry_mode="timer", entry_gap_ms=100,
+         cooldown_s=3600, paper=False)
+    _px(2400.50)                                   # cross -> one rung
+    _settle()
+    assert len(_rungs()) == 1
+    _px(2399.00)                                   # flush + park; the 3600 s cooldown now runs
+    for _ in range(60):
+        time.sleep(0.1)
+        if not _rungs():
+            break
+    assert _rungs() == []
+
+    # A bare re-cross here would be blocked by the cooldown (see test_cooldown_blocks). A
+    # DELIBERATE new level must not be -- it re-arms from the new trigger straight away.
+    _px(2400.50)
+    r = httpx.post(f"{BASE}/api/strategy/ladder", timeout=10, headers=_hdr(),
+                   json={"trigger": 2400.40})
+    assert r.status_code == 200, r.text
+    for _ in range(30):
+        time.sleep(0.15)
+        if _rungs():
+            break
+    assert len(_rungs()) == 1, "a deliberate new level should re-arm despite the cooldown"
+
+
+# ---------------------------------------------------------------- trail activation
+
+
+def test_trail_activate_holds_a_rung_through_an_early_dip():
+    """End to end: trail_activate delays the retrace trail until the run is in profit. With it set,
+    an early dip that a trail-from-entry would flush at a loss leaves the rung OPEN, and status
+    reports the trail as not-yet-armed -- then arms it once price is up by trail_activate.
+
+    Proves the whole wire: the param travels through StrategyReq, the engine honours it in the
+    poll loop against the real order path, and the derived `trail_armed` flag reaches status so
+    both clients can show "trail waiting" instead of reading the quiet stop as broken."""
+    _px(2400.00)                                   # bid 2400.00, ask ~2400.22
+    # trigger ABOVE the ask so it WAITS -- then a move up arms it and fixes the profit basis.
+    _arm(side="buy", trigger=2400.30, target=5.00, stop_mode="retrace", retrace=0.40,
+         trail_activate=1.00, volume=0.01, max_positions=1, entry_mode="timer",
+         entry_gap_ms=100, paper=False)
+
+    _px(2400.50)                                   # ask ~2400.72 > trigger -> arm, 1 rung
+    _settle()
+    assert len(_rungs()) == 1
+    st = _status()
+    assert st["trail_activate"] == pytest.approx(1.00)
+    assert st["trail_armed"] is False, "the trail must not be armed before +1.0 of profit"
+
+    # A 0.50 dip (> the 0.40 retrace) right after entry. A trail-from-entry (trail_activate=0)
+    # would flush here at a loss; with the trail inert, the rung SURVIVES.
+    _px(2400.00)
+    _settle(1.5)
+    assert len(_rungs()) == 1, "trail_activate let an early dip stop out the rung"
+    assert _status()["trail_armed"] is False
+
+    # Run up past +1.0 of profit (ask ~2401.82 vs the ~2400.72 entry) -> the trail arms.
+    _px(2401.60)
+    st = _poll_status(lambda s: s.get("trail_armed"))
+    assert st["trail_armed"] is True, "the trail did not arm after the run made +1.0"
+    assert len(_rungs()) == 1, "arming the trail must not itself close the rung"

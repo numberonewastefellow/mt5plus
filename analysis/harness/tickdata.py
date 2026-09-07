@@ -71,9 +71,17 @@ def load_ticks(symbol: str = "XAUUSD", start: dt.datetime | None = None,
     if not parts:
         raise SystemExit(f"no ticks for {symbol} in {start:%Y-%m-%d}..{end:%Y-%m-%d}")
     allr = np.concatenate(parts)
-    # de-dup + sort by millisecond timestamp (chunks can overlap on the boundary)
-    _, idx = np.unique(allr["time_msc"], return_index=True)
-    allr = allr[idx]
+    # Sort by millisecond timestamp, then drop ONLY exact-duplicate ticks (same
+    # time_msc AND bid AND ask AND flags) -- which is all the day-chunk boundary
+    # overlap produces. Deduping on time_msc ALONE (the old approach) also threw
+    # away genuinely-distinct ticks that share a millisecond (common on gold), so
+    # per-minute counts ran ~4% below MT5's tick_volume and flipped rvol-threshold
+    # bars in the straddle replay. Full-identity dedup keeps those ticks.
+    order = np.lexsort((allr["flags"], allr["ask"], allr["bid"], allr["time_msc"]))
+    allr = allr[order]
+    dup = ((np.diff(allr["time_msc"]) == 0) & (np.diff(allr["bid"]) == 0) &
+           (np.diff(allr["ask"]) == 0) & (np.diff(allr["flags"]) == 0))
+    allr = allr[np.concatenate(([True], ~dup))]
     return Ticks(
         symbol=symbol, point=point, contract=contract,
         t_msc=allr["time_msc"].astype("int64"),

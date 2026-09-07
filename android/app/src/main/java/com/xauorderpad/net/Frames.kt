@@ -128,6 +128,25 @@ data class StrategyStatus(
     val paper: Boolean? = null,
     val spread: Double? = null,
     val warning: String? = null,
+    /**
+     * The ladder's spread GUARD, decided SERVER-SIDE (`TrendLadder._guard_check`) and re-checked
+     * every poll. [guardOk] is false when the target or the trail sits inside the live spread --
+     * a trade that cannot win, which the engine refuses to arm. [guardReason] is the exact
+     * sentence the server would raise, so the client can grey out ARM with it BEFORE posting
+     * rather than posting and reading the refusal back as an error. [minStop] is the floor both
+     * the target and the trail must clear (the live spread). Null on non-ladder engines.
+     */
+    @SerialName("guard_ok") val guardOk: Boolean? = null,
+    @SerialName("guard_reason") val guardReason: String? = null,
+    @SerialName("min_stop") val minStop: Double? = null,
+    /**
+     * Why NEW entries are blocked, when they are: `"params_changed"` (a mid-ladder edit -- the open
+     * book finishes on its old rules, then the queued level goes live) or `"adopted"` (positions
+     * rebuilt from the broker after a restart). Null when not managing. Lets the panel say "new
+     * level queued behind N open trades" instead of leaving the operator guessing why ARM did
+     * nothing.
+     */
+    @SerialName("managing_reason") val managingReason: String? = null,
     val params: StrategyParams? = null,
     /** Rungs currently open, and what they add up to in lots. */
     @SerialName("open_positions") val openPositions: Int? = null,
@@ -149,6 +168,44 @@ data class StrategyStatus(
      * non-zero value means "closing in progress", not "stuck".
      */
     @SerialName("flush_remaining") val flushRemaining: Int? = null,
+    /**
+     * Manual-reload alert. The ladder rides ONE leg then PARKS -- it never re-enters itself
+     * (that would be unattended new risk). When it flushes the server latches this, and
+     * [attentionReason] says why, so the app can chime + prompt the operator to SET A NEW LEVEL
+     * rather than let a trend walk away un-traded. Cleared when they re-level, toggle, or it
+     * re-arms. Derived SERVER-SIDE so both clients agree; gated on `enabled` server-side.
+     */
+    @SerialName("needs_attention") val needsAttention: Boolean? = null,
+    @SerialName("attention_reason") val attentionReason: String? = null,
+    /**
+     * True when the CURRENT trigger is already on the crossed side (a SELL level above the bid,
+     * a BUY below the ask) so a fresh ladder would arm INSTANTLY rather than wait for the move.
+     * Server-derived from the live quote; warn on it before the operator commits a new level.
+     */
+    @SerialName("would_fire_now") val wouldFireNow: Boolean? = null,
+    /**
+     * Whether the retrace trail is currently ACTIVE. With `trail_activate > 0` the trail is inert
+     * until the run is up that much (only the hard_sl protects); false here + a positive
+     * `trail_activate` means "waiting to arm". Null on non-ladder engines / no open run.
+     */
+    @SerialName("trail_armed") val trailArmed: Boolean? = null,
+
+    // ---- straddle-ladder (sladder) only; null on every other engine ---------
+    /**
+     * Which phase the walking straddle grid is in, decided SERVER-SIDE (`StraddleGridState.phase`):
+     * `"armed"` (waiting for price to reach the stepped level) -> `"straddle"` (a straddle is open,
+     * resolving) -> back to `"armed"` at the stepped level -> ... -> `"parked"` (max_legs hit).
+     * Render it; do not recompute it.
+     */
+    val phase: String? = null,
+    /** The LAST resolved direction (for display): `"buy"` | `"sell"`. Null before the first resolve. */
+    val direction: String? = null,
+    /** Price the NEXT straddle arms at (the grid's current level), or the level while still armed. */
+    @SerialName("next_entry") val nextEntry: Double? = null,
+    /** Straddles placed this run -- counted against `max_legs` (a "leg" here is one straddle). */
+    @SerialName("legs_taken") val legsTaken: Int? = null,
+    /** Legs currently open (0 between straddles, 2 while a straddle resolves, 1 while a winner rides). */
+    @SerialName("open_legs") val openLegs: Int? = null,
 
     // ---- rider-only; null on every other engine ----------------------------
     /** The current SUGGESTION. Only `kind == "enter"` is actionable. See [RiderCard]. */
@@ -233,6 +290,12 @@ data class StrategyParams(
     val retrace: Double? = null,
     @SerialName("floor_offset") val floorOffset: Double? = null,
     /**
+     * How far in PROFIT the run must get before the retrace trail arms. 0 = trail from entry
+     * (can close below entry on a dip). >= retrace => arms at breakeven, so the trail never
+     * books a loss (the hard_sl covers the downside until then). retrace mode only.
+     */
+    @SerialName("trail_activate") val trailActivate: Double? = null,
+    /**
      * Ladder only: the BROKER-side stop, in $/oz, attached to every rung at fill time
      * (`strategy_place(..., sl_dist=hard_sl, ...)`). It is a backstop for the process
      * DYING, not the working stop -- [retrace] is what actually exits the ladder, and it
@@ -246,6 +309,13 @@ data class StrategyParams(
     @SerialName("max_positions") val maxPositions: Int? = null,
     @SerialName("max_lots") val maxLots: Double? = null,
     val paper: Boolean? = null,
+    /**
+     * Ladder re-arm policy. false (default) = ONE-SHOT: after a run's stop, park and wait for
+     * the operator to SET LEVEL again. true = AUTO-CONTINUE: keep taking runs while price stays
+     * past the level, stop only when it returns. Opt-in (in a chop it churns). See the engine's
+     * `_rearm_gate`.
+     */
+    @SerialName("auto_continue") val autoContinue: Boolean? = null,
     /**
      * Rider execution switches, one per account class. Read here (not off the top-level
      * status) because the SWITCH must show what was actually SAVED, so a rejected or
@@ -262,6 +332,22 @@ data class StrategyParams(
     @SerialName("stop_units") val stopUnits: String? = null,
     val sl: Double? = null,
     val trail: Double? = null,
+    // ---- straddle-ladder (sladder) only ----
+    /** The arm price the straddle is placed at. `sl`/`volume`/`maxLots`/`maxDailyLoss` above are reused. */
+    val level: Double? = null,
+    /** $/oz take-profit per leg (sladder). NOT the ladder's `target`; a separate wire field. */
+    val tp: Double? = null,
+    /** $/oz past each take-profit before the next continuation entry arms. */
+    val gap: Double? = null,
+    /** Continuation entries per run before the engine parks. 0 = uncapped. The primary safety brake. */
+    @SerialName("max_legs") val maxLegs: Int? = null,
+    @SerialName("cooldown_s") val cooldownS: Double? = null,
+    /**
+     * Continuation mode. false (DEFAULT) = single leg on the trend side after the first straddle
+     * (rides the trend). true = every entry is a straddle (walking grid; re-detects direction each
+     * step, nets ~0). Server-owned; the panel toggle just reflects and sets it.
+     */
+    @SerialName("always_straddle") val alwaysStraddle: Boolean? = null,
 )
 
 /**

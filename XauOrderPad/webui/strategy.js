@@ -67,6 +67,7 @@
         target: ["ldTarget", num],
         stop_mode: ["ldStopMode", str],
         retrace: ["ldRetrace", num],
+        trail_activate: ["ldTrailActivate", num],
         floor_offset: ["ldFloorOffset", num],
         max_positions: ["ldMaxPos", int],
         max_lots: ["ldMaxLots", num],
@@ -78,6 +79,7 @@
         cooldown_s: ["ldCooldown", num],
         max_ladders_per_day: ["ldMaxLadders", int],
         paper: ["ldPaper", bool],
+        auto_continue: ["ldAutoContinue", bool],
       },
       status: {
         state: ["ldState", (v, s) => v || (s.enabled ? "armed" : "disabled")],
@@ -97,6 +99,37 @@
       },
       errorEl: "ldError",
       warnEl: "ldWarn",
+    },
+    {
+      id: "sladder",
+      label: "Str·Ladder",
+      panel: "sladderPanel",
+      enabledEl: "slEnabled",
+      // The opening straddle holds a long AND a short at once -- a netting account nets them
+      // to zero, so the engine refuses to arm there (StrategyBase.needs_hedging).
+      needsHedging: true,
+      fields: {
+        level: ["slLevel", num],
+        sl: ["slSl", num],
+        tp: ["slTp", num],
+        gap: ["slGap", num],
+        volume: ["slVolume", num],
+        max_legs: ["slMaxLegs", int],
+        max_lots: ["slMaxLots", num],
+        cooldown_s: ["slCooldown", num],
+        max_daily_loss: ["slMaxLoss", num],
+        always_straddle: ["slAlwaysStraddle", bool],
+      },
+      status: {
+        state: ["slState", (v, s) => v || (s.enabled ? "armed" : "disabled")],
+        phase: ["slPhase", (v) => v || "—"],
+        direction: ["slDir", (v) => (v ? v.toUpperCase() : "—")],
+        next_entry: ["slNext", (v) => (v ? Number(v).toFixed(2) : "—")],
+        legs_taken: ["slLegs", (v) => v ?? 0],
+        open_legs: ["slOpen", (v) => v ?? 0],
+        spread: ["slSpread", (v) => (v ? v.toFixed(3) + "/oz" : "—")],
+      },
+      errorEl: "slError",
     },
     {
       id: "rider",
@@ -138,6 +171,9 @@
   let userTouched = false;     // don't stomp inputs the user is mid-edit
   let last = {};               // last /api/strategies payload
   let paperWasOn = {};         // per engine: was PAPER on at last render?
+  // Edge-trigger for the manual-reload alert: chime only on the OFF->ON transition,
+  // never every poll while it stays parked.
+  let attnWasOn = {};
   // The rider's execution switches as the SERVER last reported them. Confirms fire on
   // the OFF->ON edge only, so re-saving the panel with auto already on does not
   // re-prompt (and, more importantly, a prompt cannot be trained into muscle memory).
@@ -213,7 +249,8 @@
         else w.hidden = true;
       }
     }
-    if (eng.id === "ladder") { renderSpreadHint(s); renderStopMode(s); }
+    if (eng.id === "ladder") { renderSpreadHint(s); renderStopMode(s); renderAttention(s); renderFireHint(s); }
+    if (eng.id === "sladder") { renderSladderHints(s); renderSladderAttention(s); renderSladderFire(s); }
     if (eng.id === "rider") {
       renderRiderCard(s);
       renderStopUnits();
@@ -315,8 +352,27 @@
     if (rRow) rRow.hidden = mode !== "retrace";
     if (fRow) fRow.hidden = mode !== "floor";
 
-    const hint = $("ldFloorHint"), off = $("ldFloorOffset");
     const spread = Number(s.spread || 0);
+
+    // retrace vs spread. This is the guard that actually bites in normal session -- the server
+    // refuses when `retrace <= spread` (every rung stops out before it can move) -- yet it was the
+    // ONE guard with no hint here, so the refusal only ever showed up as an error string after
+    // Apply. Same shape as the target and floor hints.
+    const rHint = $("ldRetraceHint"), rtr = $("ldRetrace");
+    if (rHint && rtr) {
+      if (mode !== "retrace" || !spread) { rHint.textContent = ""; rtr.classList.remove("bad"); }
+      else {
+        const v = parseFloat(rtr.value);
+        const bad = !isNaN(v) && v <= spread;
+        rHint.textContent = bad
+          ? `— inside the ${spread.toFixed(2)}/oz spread → every rung stops out before it moves`
+          : `— live spread ${spread.toFixed(2)}/oz`;
+        rtr.classList.toggle("bad", bad);
+        rHint.classList.toggle("bad", bad);
+      }
+    }
+
+    const hint = $("ldFloorHint"), off = $("ldFloorOffset");
     if (!hint || !off) return;
     if (mode !== "floor" || !spread) { hint.textContent = ""; off.classList.remove("bad"); return; }
     const v = parseFloat(off.value);
@@ -326,6 +382,110 @@
       : `— live spread ${spread.toFixed(2)}/oz`;
     off.classList.toggle("bad", bad);
     hint.classList.toggle("bad", bad);
+  }
+
+  /* A distinct double-chime for the manual-reload alert. Prefers app.js's `beep`
+     (which honours the user's sound toggle); falls back to a self-contained tone so
+     this file keeps working even loaded on its own. Never throws. */
+  function chime() {
+    try {
+      if (typeof window.beep === "function") {
+        window.beep("buy");
+        setTimeout(() => { try { window.beep("buy"); } catch (e) {} }, 180);
+        return;
+      }
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ac = new AC();
+      for (const t of [0, 0.18]) {
+        const o = ac.createOscillator(), g = ac.createGain();
+        o.connect(g); g.connect(ac.destination);
+        o.frequency.value = 880; o.type = "sine";
+        g.gain.setValueAtTime(0.0001, ac.currentTime + t);
+        g.gain.exponentialRampToValueAtTime(0.14, ac.currentTime + t + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + t + 0.15);
+        o.start(ac.currentTime + t); o.stop(ac.currentTime + t + 0.16);
+      }
+    } catch (e) {}
+  }
+
+  /* Manual-reload alert. The engine rides ONE leg then PARKS -- it never re-enters
+     itself. `needs_attention` (derived server-side, so both clients agree) lights this
+     banner and chimes ONCE on the off->on edge, so the operator sets a new level rather
+     than watch a trend walk away un-traded. */
+  function renderAttention(s) {
+    const el = $("ldAttention");
+    if (!el) return;
+    const on = !!s.needs_attention;
+    if (on) {
+      el.hidden = false;
+      el.textContent = "🔔 " + (s.attention_reason ||
+        "Ladder closed out and parked — set a new level to re-engage.");
+      if (!attnWasOn.ladder) { chime(); toast("Ladder parked — set a new level to re-engage", "info"); }
+    } else {
+      el.hidden = true;
+    }
+    attnWasOn.ladder = on;
+  }
+
+  /* Warn, on the trigger field, when the CURRENT trigger is already on the crossed side
+     -- a SELL level above the bid (or a BUY below the ask) arms INSTANTLY instead of
+     waiting for the move. `would_fire_now` is derived server-side from the live quote. */
+  function renderFireHint(s) {
+    const el = $("ldFireHint");
+    if (!el) return;
+    if (s.would_fire_now) {
+      el.textContent = s.enabled
+        ? "⚠ already past — this level fires INSTANTLY, not on a move"
+        : "⚠ already past — arms instantly the moment you enable";
+      el.classList.add("bad");
+    } else {
+      el.textContent = "";
+      el.classList.remove("bad");
+    }
+  }
+
+  /* Straddle-ladder hints, mirroring the ladder's: redden sl/tp when either sits inside the
+     live spread (the server refuses to arm then -- an sl inside the spread stops on the first
+     tick, a tp inside it never nets a win), and warn on the level field when price already sits
+     at it (arming would place the straddle immediately). All verdicts are server-derived; this
+     only surfaces WHY before Apply, never recomputes the refusal. */
+  function renderSladderHints(s) {
+    const spread = Number(s.spread || 0);
+    for (const [inp, hint] of [["slSl", "slSlHint"], ["slTp", "slTpHint"]]) {
+      const el = $(inp), h = $(hint);
+      if (!el || !h) continue;
+      if (!spread) { h.textContent = ""; el.classList.remove("bad"); continue; }
+      const v = parseFloat(el.value);
+      const bad = !isNaN(v) && v <= spread;
+      h.textContent = bad
+        ? `— inside the ${spread.toFixed(2)}/oz spread → cannot win`
+        : `— live spread ${spread.toFixed(2)}/oz`;
+      el.classList.toggle("bad", bad);
+      h.classList.toggle("bad", bad);
+    }
+  }
+  function renderSladderFire(s) {
+    const el = $("slFireHint");
+    if (!el) return;
+    if (s.would_fire_now) {
+      el.textContent = s.enabled
+        ? "⚠ price is AT the level — the straddle goes on now"
+        : "⚠ price is at the level — arming places the straddle at once";
+      el.classList.add("bad");
+    } else { el.textContent = ""; el.classList.remove("bad"); }
+  }
+  function renderSladderAttention(s) {
+    const el = $("slAttention");
+    if (!el) return;
+    const on = !!s.needs_attention;
+    if (on) {
+      el.hidden = false;
+      el.textContent = "🔔 " + (s.attention_reason ||
+        "Run parked — set a new level to continue the trend.");
+      if (!attnWasOn.sladder) { chime(); toast("Straddle-ladder parked — set a new level", "info"); }
+    } else el.hidden = true;
+    attnWasOn.sladder = on;
   }
 
   function renderAll(all) {
@@ -553,6 +713,7 @@
       const touched = () => {
         userTouched = true;
         if (eng.id === "ladder") { renderSpreadHint(last.ladder || {}); renderStopMode(last.ladder || {}); }
+        if (eng.id === "sladder") { renderSladderHints(last.sladder || {}); renderSladderFire(last.sladder || {}); }
       };
       el.addEventListener("input", touched);
       // A <select> fires "change", not "input", in every browser that matters. Wiring

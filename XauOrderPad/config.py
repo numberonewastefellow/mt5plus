@@ -53,6 +53,7 @@ STRATEGY_MAGICS = {
     "straddle": 532027,
     "ladder": 532028,
     "rider": 532029,          # vol-regime trend-rider (paper/suggestion only)
+    "sladder": 532030,        # straddle-ladder: straddle a level, then grid the winning side
 }
 
 # Vol-Regime Trend-Rider — a PAPER/SUGGESTION engine. It computes the verified
@@ -151,6 +152,12 @@ LADDER_DEFAULTS = {
     "stop_mode": "retrace",
     "retrace": 0.30,         # retrace mode: $/oz pullback from the extreme -> close out
     "floor_offset": 0.0,     # floor mode: $/oz BEYOND the trigger before flushing
+    # How far in PROFIT a run must get before the retrace trail ARMS. 0 = the classic
+    # trail-from-entry (active immediately -- can close BELOW entry on a dip). Set it >= retrace
+    # for the standard "trailing stop activates in profit" behaviour (arms at breakeven, so the
+    # trail never books a loss; the broker hard_sl covers the downside until then). Set it to the
+    # target (with `target` = 0) for "let it run to +X, THEN trail". retrace mode only.
+    "trail_activate": 0.0,
     "hard_sl": 3.00,         # $/oz broker-side stop, in case this process dies
     "max_daily_loss": 200.0, # USD kill-switch
     "cooldown_s": 0.0,       # min seconds between ladders; 0 = none
@@ -170,6 +177,14 @@ LADDER_DEFAULTS = {
     # operator had to hunt for a toggle to make the engine they just armed actually trade.
     # An arm that does not arm is worse than an honest one behind a confirmation.
     "paper": False,          # False = places real orders (demo accounts only). See above.
+    # Re-arm policy after a run's stop closes it. FALSE (default) = ONE-SHOT: the engine parks
+    # and waits for the operator to SET LEVEL again -- a bare price re-cross does nothing. This
+    # is the safe default and matches the operator's workflow (ARM stays on, they set levels).
+    # TRUE = AUTO-CONTINUE: after the trail banks a run, keep taking runs WHILE price is still
+    # past the trigger, and stop only when price RETURNS to the trigger (then park + alert). It
+    # is the trend mode -- in a chop it churns, so it is opt-in and throttled by `cooldown_s`
+    # and `max_ladders_per_day`. See strategies/ladder.py `_rearm_gate`.
+    "auto_continue": False,
 }
 
 # Why `max_lots` matters more than `max_positions`, and why the flush is BATCHED.
@@ -191,7 +206,65 @@ LADDER_DEFAULTS = {
 # pad, AND the stop that just decided to bail out. So the exit closes at most
 # `close_batch` positions per cycle and resumes on the next one: the book still
 # empties promptly, but every individual cycle stays inside its budget.
+# TREND MODE (stack, park, reload by hand). To pyramid a trend rather than scalp the trigger:
+# set `max_positions = 0` (uncapped) WITH a real `max_lots`, and `stop_mode = "floor"` (hold every
+# rung through the pullbacks) or `"retrace"` (lock in on a bounce). One ladder then rides the whole
+# leg. When it flushes the engine does NOT re-enter itself -- that would be unattended new risk, the
+# one thing this codebase refuses. It PARKS and latches `needs_attention`, and both clients alert the
+# operator to SET A NEW LEVEL to re-load; re-levelling clears the cooldown so a deliberate act never
+# waits behind a machine brake. `would_fire_now` warns when the new level is already crossed (it would
+# arm instantly). See analysis/TREND_LADDER_STRATEGY.md §10 -- and note §6d still holds: this is a
+# bigger LEVER, not an edge, so a wrong trigger loses faster. max_lots is mandatory when uncapped.
 ENTRY_GAP_MS_MIN = 100     # floor on entry_gap_ms: 0 would mean one order_send PER POLL
+
+# --- Straddle-Ladder (experimental, DEMO-ONLY, HEDGING account required) ----
+# A DIFFERENT engine from `straddle` and `ladder` -- it owns magic 532030 and does not
+# touch either of theirs. The operator sets a LEVEL by hand (the ladder's UX), the engine
+# opens a straddle there (one long + one short, both with the SAME sl/tp bracket), and the
+# first `tp`-sized move RESOLVES it: the winning leg banks +tp, the losing leg stops -sl,
+# net ~0 minus spread. That first move is a pure DIRECTION DETECTOR. From then on the engine
+# re-enters ONLY the winning side, one fresh sl/tp bracket at a time, armed `gap` past each
+# take-profit -- a one-directional grid that milks a trend.
+#
+#   level 4050, sl 2, tp 2, gap 1 (worked example):
+#     straddle: long 4050 (sl 4048 / tp 4052), short 4050 (sl 4052 / tp 4048)
+#     price 4052 -> long tp +2, short sl -2  => direction UP
+#     continuation: enter long at 4053 (tp 4055 / sl 4051); tp -> next entry 4056; etc.
+#
+# UNITS ARE $/oz, exactly like the ladder's `target`: sl=2.0 means $2.00 (4050->4048), it is
+# NOT MT5 points. `strategy_place` converts the distance to a price internally.
+#
+# SAFETY MODEL (operator's chosen behaviour):
+#   * On a continuation SL the engine RE-ARMS AND RETRIES THE SAME SIDE -- direction is locked
+#     for the whole run; a reversal is NOT auto-detected. That means a true reversal bleeds
+#     (buy dip -> SL -> retry) until a CAP halts it, so the caps are load-bearing:
+#       - `max_legs`  : continuation entries per run. THE primary safety bound. Hit it -> the
+#                       engine PARKS and latches needs_attention (chime); a new SET LEVEL resets.
+#       - `max_lots`  : total open-lots ceiling (rarely binds in sequential mode; wired anyway).
+#       - `max_daily_loss` : the inherited $200 kill-switch, the backstop.
+#   * SEQUENTIAL: at most ONE continuation position open at a time (re-enter only after the
+#     prior leg closes). No per-leg time-stop.
+# Like every engine but the rider it is `allows_real = False` (auto-disables off demo), and it
+# is `needs_hedging = True` because the opening straddle holds both legs at once.
+STRADDLE_LADDER_DEFAULTS = {
+    "level": 0.0,            # arm price; 0 = not set (engine will not fire)
+    "sl": 2.0,               # $/oz stop distance   per leg (4050 -> 4048)
+    "tp": 2.0,               # $/oz target distance per leg (4050 -> 4052)
+    "gap": 1.0,              # $/oz past a take-profit before the next continuation entry arms
+    "volume": 0.01,          # lots per leg
+    "max_legs": 10,          # entries per run (initial straddle + each order); 0 = UNCAPPED (discouraged)
+    "max_lots": 0.0,         # total open-lots cap; 0 = UNCAPPED
+    "cooldown_s": 0.0,       # min seconds between continuation entries; 0 = none
+    "max_daily_loss": 200.0, # USD kill-switch (inherited StrategyBase behaviour)
+    # What happens AFTER the first straddle resolves:
+    #   False (DEFAULT) = SINGLE-LEG trend continuation. The first order is a straddle only to detect
+    #     direction; from the 2nd order on it takes ONE leg on the trend side. Each entry arms at the
+    #     last SUCCESSFUL take-profit +/- gap -- a TP advances the level, an SL retries the same level
+    #     (it does not step off the stop). This rides a trend (+tp per order) instead of netting ~0.
+    #   True = WALKING STRADDLE GRID. EVERY entry is a straddle, stepping gap past each winner's TP.
+    #     Re-detects direction every step (no locked direction to bleed against), but nets ~0 per step.
+    "always_straddle": False,
+}
 
 # Minimum seconds between throttled writes of an engine's per-day counters. `state.save`
 # is a read-modify-write of a JSON file and the ladder reaches it from `_finish_ladder`,
@@ -262,6 +335,19 @@ try:
     EXPECT_LOGIN = int(os.environ.get("XAUORDERPAD_EXPECT_LOGIN", "") or 0)
 except ValueError:
     EXPECT_LOGIN = 0
+
+# Auto-login on boot: the saved profile_id (e.g. "472200942@Exness-MT5Trial16") this server
+# logs into at startup, so a scheduled restart or a Windows-Update reboot comes back LIVE
+# instead of logged-out. Empty = no auto-login (the historical default; servers boot logged out).
+#
+# A login is a SESSION, not a trade -- this never places an order. It was safe to add only once
+# the box gained an interactive autologon desktop: the old reason session-active started False was
+# that auto-attaching on a headless session-0 box hung ~65s on an IPC timeout. With a real desktop
+# the terminal is up, so the attach is instant.
+#
+# Two guards live in server.py's autologin: it refuses a profile last seen on a REAL account, and
+# for a pinned instance the account pin (EXPECT_LOGIN) already refuses any profile but its own.
+AUTOLOGIN_PROFILE = os.environ.get("XAUORDERPAD_AUTOLOGIN", "").strip()
 MT5_LOGIN = 0
 MT5_PASSWORD = ""
 MT5_SERVER = ""

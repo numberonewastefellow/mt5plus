@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from strategies.ladder import LadderState
+from strategies.ladder import LadderState, TrendLadder
 
 TRIGGER = 100.0
 
@@ -153,3 +153,158 @@ def test_rollback_un_believes_a_refused_entry():
     rid = st.on_tick(99.97, 100.01, 0)[0][1]
     st.rollback_entry(rid)
     assert st.entries == [] and st.n_taken == 0
+
+
+# ---------------------------------------------------------------- trend stacking
+
+def test_step_mode_stacks_down_a_trend_and_the_floor_holds():
+    """The behaviour the operator asked for: an uncapped floor-mode SELL that pyramids DOWN a
+    falling trend -- one rung per `entry_step` of new low -- and holds every rung through the
+    pullbacks, flushing only when price comes back to the floor. A partial step must NOT add."""
+    st = mk(side="sell", stop_mode="floor", floor_offset=0.20, target=99.0,
+            entry_mode="step", entry_step=0.30, max_positions=0, max_lots=0.0)
+    assert st.floor == pytest.approx(TRIGGER + 0.20)
+    assert kinds(st.on_tick(99.99, 100.03, 0)) == ["enter"]        # rung 0 @ bid 99.99
+    assert st.on_tick(99.84, 99.88, 100) == [], "a 0.15 dip is not a full step -> no add"
+    for i in range(1, 5):                                          # each 0.35 lower (> step) adds ONE
+        bid = round(99.99 - 0.35 * i, 2)
+        assert kinds(st.on_tick(bid, round(bid + 0.04, 2), 100 + 100 * i)) == ["enter"], \
+            f"a step down clear of entry_step should add rung {i}"
+    assert len(st.entries) == 5
+    assert st.on_tick(100.10, 100.14, 9000) == [], "a bounce below the floor must not flush"
+    acts = st.on_tick(100.25, 100.29, 9200)                        # clearly back to the floor
+    assert kinds(acts) == ["exit_all"]
+    assert len(acts[0][3]) == 5, "the floor closes the WHOLE stack at once"
+
+
+@pytest.mark.parametrize("spread", [0.04, 0.24, 0.50])
+def test_retrace_trigger_is_measured_ask_to_ask_and_is_spread_invariant(spread):
+    """The trailing stop is a DIFFERENCE on the entry-side series (highest ask - current ask for
+    a buy), so the spread CANCELS: it fires when the ask gives back exactly `retrace` from its
+    high, at the same tick for any spread, and FILLS at the bid. This is the regression pin for
+    the "compare the bid to (highest_ask - retrace)" proposal -- that would double-count the
+    spread and trip the stop a whole spread too early. bid = ask - spread throughout."""
+    st = mk(side="buy", stop_mode="retrace", retrace=0.30, target=99.0,
+            floor_offset=0.0, entry_mode="step", entry_step=5.0)
+    st.on_tick(round(100.01 - spread, 2), 100.01, 0)               # arm @ ask 100.01
+    st.on_tick(round(100.34 - spread, 2), 100.34, 200)             # extreme ask = 100.34
+    assert st.on_tick(round(100.05 - spread, 2), 100.05, 300) == [], "0.29 off the high -> not yet"
+    acts = st.on_tick(round(100.00 - spread, 2), 100.00, 400)      # 0.34 off the high -> fire
+    assert kinds(acts) == ["exit_all"] and acts[0][2] == "retrace"
+    assert acts[0][1] == pytest.approx(round(100.00 - spread, 2)), "fills at the bid = ask - spread"
+
+
+# ---------------------------------------------------------------- trail activation
+
+
+def test_trail_activate_zero_is_the_classic_trail_from_entry_and_can_lose():
+    """The DEFAULT (trail_activate=0): the retrace trail is live from the first tick, so a dip
+    straight after entry -- before the run has made a cent -- stops out at a LOSS. This is the
+    behaviour trail_activate exists to make optional; pinned here so a change of default is loud."""
+    st = mk(side="buy", stop_mode="retrace", retrace=0.30, target=99.0,
+            trail_activate=0.0, entry_mode="step", entry_step=5.0)
+    st.on_tick(99.97, 100.01, 0)                    # arm @ ask 100.01, extreme 100.01
+    acts = st.on_tick(99.66, 99.70, 200)            # ask 0.31 BELOW entry, never any profit
+    assert kinds(acts) == ["exit_all"] and acts[0][2] == "retrace"
+    assert acts[0][1] < 100.01, "the classic trail books a LOSS on an early dip (exits below entry)"
+
+
+def test_trail_activate_holds_through_the_early_dip_then_arms_in_profit():
+    """trail_activate=1.0: the retrace trail is INERT until the run is up by 1.0. The same early
+    dip that stopped the classic trail at a loss does nothing here; only after +1.0 does the trail
+    arm, and the pullback that then fires it books a PROFIT."""
+    st = mk(side="buy", stop_mode="retrace", retrace=0.30, target=99.0,
+            trail_activate=1.0, entry_mode="step", entry_step=5.0)
+    st.on_tick(99.97, 100.01, 0)                    # arm @ ask 100.01
+    assert st.on_tick(99.66, 99.70, 200) == [], "0.31 dip before +1.0 profit: the trail is inert"
+    assert st._trail_armed is False
+    assert st.on_tick(101.06, 101.10, 400) == [], "run +1.09: arms the trail, no exit yet"
+    assert st._trail_armed is True
+    acts = st.on_tick(100.75, 100.79, 600)          # 0.31 off the 101.10 high -> fire
+    assert kinds(acts) == ["exit_all"] and acts[0][2] == "retrace"
+    assert acts[0][1] > 100.01, "the armed trail now exits in PROFIT, above the entry"
+
+
+def test_trail_activate_at_retrace_never_stops_the_trail_below_entry():
+    """The safety promise: with trail_activate >= retrace the trail cannot arm until the run is up
+    by a full retrace, so its FIRST possible stop lands at breakeven on the entry-side price --
+    never below entry. The realised fill still costs the spread, like every exit, and no more."""
+    spread = 0.04                                   # bid = ask - 0.04 throughout
+    st = mk(side="buy", stop_mode="retrace", retrace=0.30, target=99.0,
+            trail_activate=0.30, entry_mode="step", entry_step=5.0)
+    st.on_tick(99.97, 100.01, 0)                    # arm @ ask 100.01
+    st.on_tick(100.31, 100.35, 200)                 # ask +0.34 -> arms (extreme 100.35)
+    assert st._trail_armed is True
+    acts = st.on_tick(100.00, 100.04, 400)          # 0.31 off the high -> fire at ask 100.04
+    assert kinds(acts) == ["exit_all"]
+    realized = acts[0][1] - 100.01                  # exit bid - entry ask = the buy's actual $/oz
+    assert realized >= -spread - 1e-9, "trail_activate >= retrace booked a loss worse than the spread"
+
+
+def test_trail_activate_is_mirrored_for_a_sell():
+    """Same activation on the short side: profit is the bid FALLING, so the trail arms only once
+    the bid is trail_activate below entry, and an early bounce before that does nothing."""
+    st = mk(side="sell", stop_mode="retrace", retrace=0.30, target=99.0,
+            trail_activate=1.0, entry_mode="step", entry_step=5.0)
+    st.on_tick(99.99, 100.03, 0)                    # arm @ bid 99.99 (bid < trigger 100.0)
+    assert st.on_tick(100.30, 100.34, 200) == [], "0.31 bounce before -1.0: the trail is inert"
+    assert st._trail_armed is False
+    assert st.on_tick(98.90, 98.94, 400) == [], "bid -1.09: arms the trail"
+    assert st._trail_armed is True
+    acts = st.on_tick(99.25, 99.29, 600)            # 0.35 off the 98.90 low -> fire
+    assert kinds(acts) == ["exit_all"] and acts[0][2] == "retrace"
+    assert acts[0][1] < 99.99, "a short's winning exit is an ASK below the entry bid"
+
+
+# ---------------------------------------------------------------- re-arm policy (the gate)
+
+def _parked_engine(side: str, trigger: float, auto_continue: bool) -> TrendLadder:
+    """A TrendLadder in the exact state a run leaves behind: `_rearm_ok` False, no cooldown.
+    `_rearm_gate` is pure enough (side + trigger + the quote) to test on its own -- no broker."""
+    e = TrendLadder()
+    e.side = side
+    e.trigger = trigger
+    e.auto_continue = auto_continue
+    e.cooldown_s = 0.0
+    e.max_ladders_per_day = 0
+    e._rearm_ok = False
+    e._last_ladder_end = 0.0
+    e._needs_attention = False
+    return e
+
+
+def test_one_shot_gate_refuses_every_re_cross():
+    """The default: once a run ends, a bare price move -- past the level, a re-cross up, anything
+    -- never starts another run. Only a SET LEVEL / re-enable (which set `_rearm_ok`) does. This
+    is what makes the old 68-ladders churn impossible."""
+    e = _parked_engine("sell", 2399.90, auto_continue=False)
+    assert e._rearm_gate(2399.00, 2399.04, 100.0) is not None      # far past the level
+    assert e._rearm_ok is False
+    assert e._rearm_gate(2400.50, 2400.54, 101.0) is not None      # a re-cross up
+    assert e._rearm_ok is False
+
+
+def test_auto_continue_gate_re_arms_while_price_is_past_the_level():
+    e = _parked_engine("sell", 2399.90, auto_continue=True)
+    assert e._rearm_gate(2399.00, 2399.04, 100.0) is None, "still below the trigger -> keep going"
+    assert e._rearm_ok is True
+
+
+def test_auto_continue_gate_stops_and_latches_on_return_to_the_level():
+    """The boundary that makes auto-continue safe: when price comes back to the trigger the move
+    is over, so it parks + alerts -- and STAYS parked even if price dips past again (the next
+    move is a fresh decision, not an automatic re-entry)."""
+    e = _parked_engine("sell", 2399.90, auto_continue=True)
+    msg = e._rearm_gate(2399.95, 2399.99, 100.0)                   # back at the level
+    assert msg is not None and "returned" in msg
+    assert e._needs_attention is True and e._rearm_ok is False
+    assert e._rearm_gate(2399.00, 2399.04, 101.0) is not None, "a returned move must not resume"
+    assert e._rearm_ok is False
+
+
+def test_auto_continue_gate_is_mirrored_for_a_buy():
+    e = _parked_engine("buy", 2400.10, auto_continue=True)
+    assert e._rearm_gate(2400.50, 2400.54, 100.0) is None, "ask past the trigger -> keep going"
+    e2 = _parked_engine("buy", 2400.10, auto_continue=True)
+    assert e2._rearm_gate(2399.90, 2399.94, 100.0) is not None, "ask back below -> stop"
+    assert e2._needs_attention is True

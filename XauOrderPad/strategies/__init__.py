@@ -12,9 +12,10 @@ from .base import StrategyBase
 from .ladder import LadderState, TrendLadder
 from .rider import VolRegimeRider
 from .straddle import VolumeSpikeStraddle
+from .straddle_ladder import StraddleGridState, StraddleLadder
 
 # Instantiated once per worker (see Mt5Worker.__init__).
-ENGINES = (VolumeSpikeStraddle, TrendLadder, VolRegimeRider)
+ENGINES = (VolumeSpikeStraddle, TrendLadder, VolRegimeRider, StraddleLadder)
 
 __all__ = ["StrategyBase", "VolumeSpikeStraddle", "TrendLadder", "LadderState",
-           "ENGINES"]
+           "StraddleLadder", "StraddleGridState", "ENGINES"]

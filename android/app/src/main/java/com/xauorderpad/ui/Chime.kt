@@ -36,6 +36,20 @@ object Chime {
         }, "om-chime").apply { isDaemon = true }.start()
     }
 
+    /**
+     * A short, repeatable two-note alert for the Trend-Ladder "set a new level" prompt.
+     *
+     * Unlike [playOnce] this is NOT latched -- a parked ladder may fire it on each flush. The
+     * caller edge-triggers it (needs_attention off->on) so it does not repeat every poll. Same
+     * daemon-thread, swallow-everything discipline: an alert that crashed the app would be worse
+     * than a silent one. Rising A5->E6 so it is distinct from the low welcome swell.
+     */
+    fun playAlert() {
+        Thread({
+            try { renderAlert() } catch (_: Throwable) { /* never fatal */ }
+        }, "ladder-alert").apply { isDaemon = true }.start()
+    }
+
     private fun render() {
         val sampleRate = 44_100
         val seconds = 1.8
@@ -59,7 +73,30 @@ object Chime {
             val v = (s * env * vib * 0.35 * Short.MAX_VALUE)
             buf[i] = v.toInt().coerceIn(-32_768, 32_767).toShort()
         }
+        stream(buf, sampleRate, seconds)
+    }
 
+    private fun renderAlert() {
+        val sampleRate = 44_100
+        val seconds = 0.55
+        val n = (sampleRate * seconds).toInt()
+        val buf = ShortArray(n)
+        val gap = 0.22                                        // two notes, second starts here
+        for (i in 0 until n) {
+            val t = i.toDouble() / sampleRate
+            val second = t >= gap
+            val f = if (second) 1318.5 else 880.0            // E6 after A5
+            val local = if (second) t - gap else t
+            val env = (local / 0.006).coerceAtMost(1.0) * exp(-local * 9.0)
+            val v = sin(2 * PI * f * t) * env * 0.30 * Short.MAX_VALUE
+            buf[i] = v.toInt().coerceIn(-32_768, 32_767).toShort()
+        }
+        stream(buf, sampleRate, seconds)
+    }
+
+    /** Stream one PCM buffer through a short-lived AudioTrack, then release it. On a daemon
+     *  thread already; follows the phone's media volume (silent when muted). */
+    private fun stream(buf: ShortArray, sampleRate: Int, seconds: Double) {
         val attrs = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)

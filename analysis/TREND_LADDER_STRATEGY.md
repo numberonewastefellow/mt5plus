@@ -11,6 +11,108 @@ strongest evidence the wall is real.
 
 ---
 
+## 0. In plain language (read this before the arithmetic)
+
+Three words do all the work, and conflating them is what makes *"what is the SL?"* unanswerable:
+
+- **Rung = one trade.** The engine can open several trades in a row as price keeps moving your way
+  — trade 1, then trade 2 a little further on, then trade 3 — like climbing a ladder. Each rung is
+  a *separate* position with its *own* entry price.
+- **Spread = an entry fee.** At any instant you buy at the higher price and sell at the lower one;
+  the gap is the broker's cut. **Every trade opens already down one spread.** On this demo it is
+  ~0.04 in normal session; measured 0.240 on real data (§3), wider at news/rollover.
+- **Trail = a give-back limit.** Once you are in profit, picture a line following price. It moves
+  *up* on each new high and **never moves back down**. Set to 0.30 it sits 30¢ under the best price
+  reached; if price gives back more than that, **the whole ladder closes at once.**
+
+The three exits are three *different* mechanisms — this is the crux:
+
+| control | who holds it | what it covers | does it move? |
+|---|---|---|---|
+| **TP** (`target`) | the engine | **one trade** — closes that rung at +TP profit | no |
+| **trail** (`retrace`) | the engine | **the WHOLE ladder at once**, trailing the best price | yes — follows the peak up |
+| **SL** (`hard_sl`) | **the broker** | **one trade**, set at *its own* fill | **never** — placed once, untouched |
+
+So *"if it took 5 trades, what is the SL?"* — there is no single SL. There are five, each at *its*
+fill − `hard_sl`, all sitting on the broker's server, none ever modified. They are **insurance for
+this server dying**: if the engine stops, your trades have no TP and no trail, and those broker
+stops are all that is left. In normal running the *trail* ends the ladder long before any SL is
+near.
+
+### Two worked stories (0.01 lot ⇒ $1 of price = $1)
+
+**Story A — "buy above 4136", trail 0.30, TP 1.00, spread 0.04.**
+Buy-price crosses 4136 → open trade 1 @ 4136.02 (broker SL parked at 4133.02). Price runs, opening
+trade 2 @ 4136.33 and trade 3 @ 4136.65, then **peaks at 4137.00** — the give-back line locks at
+4136.70. Price falls to 4136.70 → **all three close together**, sold at the bid 4136.66:
++0.64, +0.33, +0.01 ≈ **+$0.98**. You dialled a 0.30 trail and gave back 0.34 — the extra 0.04 is
+the spread (this is the `effective_stop` field). The 3.00 SLs never came near.
+*Note:* with TP 1.00 and step 0.30 you never actually **hold** 5 rungs — trade 1 hits its $1 target
+before trade 5 opens. The ladder fills at the top and drains from the bottom. To hold 5 at once you
+need `TP > 4 × step + spread ≈ 1.24`.
+
+**Story B — price fell to 4135.80, you set a new level 4135.85 with trades still open.**
+The engine says *finish what you started*: `_apply` puts it in **managing** mode (`_managing=True`),
+so it opens **nothing** at 4135.85 — not now, not when price crosses back up. The open trades keep
+running on their **original** trail/TP; their broker SLs are unchanged. Only when the last one
+closes does 4135.85 wake up and become live. **But** if nothing is open (the trail already flushed
+everything), 4135.85 goes live *immediately* and enters at once if price is above it. Same two taps,
+opposite outcomes — which is why the panel now says "new level queued" when a book is open.
+
+### Sanity ranges (for a 0.04 spread)
+
+- **trail**: ≥ 4–8× the spread → **0.15–0.30**. Below the spread the engine **refuses** — the trade
+  cannot win (§6, and `_param_guard`).
+- **TP**: ≤ ~2× the trail, or price must run the full TP without a single wobble. Trail 0.30 →
+  **0.50–0.60**. TP 1.00 behind a 0.30 trail is why the live run hit **0 targets in 79 trades**.
+- **SL**: leave it wide (3.00). It is insurance; it should never be the thing that closes you.
+
+> The guard compares against the **live** spread, which changes. A trail that is accepted in normal
+> session is **refused** at news/rollover when the spread widens past it — and because the check runs
+> **every poll**, a widening spread will **auto-disarm a running ladder**. That is correct, not a
+> bug; the panel now shows the live spread so it is not a surprise.
+
+### 0.1 Two trailing models — `trail_activate` (why a "trail" can lose)
+
+The trail has **two shapes**, and the default is the one that can lose money right after you enter.
+
+- **Trail-from-entry** (`trail_activate = 0`, the default). The give-back line is live from the very
+  first tick, anchored to the entry. So a dip *straight after entry* — before the trade has made a
+  cent — can pull back `retrace` and **close the whole ladder below entry, at a loss**. This is a
+  *chandelier* stop. It is the historical behaviour, kept as the default so nothing changes silently.
+- **Activate-in-profit** (`trail_activate > 0`). The trail is **inert** until the run is up by
+  `trail_activate`; only the broker `hard_sl` protects until then. This is the standard MT5 "Trailing
+  Stop": it *arms* once you are far enough ahead, and from that point trails as usual. Set
+  `trail_activate >= retrace` and its **first possible stop is at breakeven** — the trail can no
+  longer book a directional loss (it still gives up one spread on the exit, like everything here).
+
+Same price path, buy entry at ask **4136.02**, `retrace` 0.30, spread 0.04:
+
+| step | ask | note |
+|---|---|---|
+| 1. enter | 4136.02 | broker `hard_sl` parked far below |
+| 2. dip | 4135.70 | −0.32, **no profit yet** |
+| 3. recover + run | 4137.00 | peak, +0.98 |
+| 4. pull back | 4136.70 | gives back 0.30 from the peak |
+
+| `trail_activate` | trail arms when… | at the dip (step 2) | result |
+|---|---|---|---|
+| **0** (default) | immediately | pull 0.32 ≥ 0.30 → **flushes** | **−$0.36** — a loss booked before the move even happened |
+| **0.30** (= `retrace`) | at +0.30 (ask 4136.32) | inert → **survives** | rides to the peak, trails, exits 4136.66 → **+$0.64** |
+| **1.00** (= a full TP) | at +1.00 (ask 4137.02) | inert → **survives** | peak +0.98 **never arms it**; the trail never fires, the rung rides on the broker `hard_sl` alone |
+
+Reading the table: the *only* difference between the −$0.36 loss and the +$0.64 win is whether the
+trail was allowed to fire on the early dip. `trail_activate = retrace` buys that protection for free
+(first stop = breakeven). Pushing it as high as a TP turns the engine into "let it run to +X, *then*
+trail" — more room for the trend, but no trail-protection at all below +X, so a peak that stops just
+short leaves you riding only the wide `hard_sl`. It is **`retrace`-mode only** (floor mode has no
+trail to activate). The clients show **`trail_armed`** — *trail waiting for +X* vs *trail active* — so
+a deliberately-quiet trail is not mistaken for a broken one. This changes **nothing** about the broker
+order: the ladder still sends `hard_sl` as the only broker stop and **no broker TP**; `trail_activate`
+only gates when the engine's *own* trail may act.
+
+---
+
 ## 1. The rule
 
 | | |
@@ -304,3 +406,49 @@ cd XauOrderPad
   `analysis/` runs it over these ticks and **must reproduce §6c** (1 position ≈ −$30/ladder at
   random triggers). If it ever stops matching, the engine has drifted from the model that was
   validated here — fix the engine, not the doc.
+
+---
+
+## 10. Trend mode: stack, park, re-load by hand (the 2026-07-23 change)
+
+A live SELL on demo 472200942 **sat out a clean 2.7 drop** (16:17:57→16:20:25 UTC,
+4048.5 → 4045.82) — flat the whole way down, then fired again only once price bounced back.
+Proven from the tick feed, not guessed.
+
+**Root cause.** After a trailing flush the re-arm gate (§ "the trigger is an EVENT") requires
+price to trade back **through the trigger** before a new ladder starts. On a *sustained* trend
+price never does — so the gate is unsatisfiable exactly while the move is strongest. That gate
+is correct for **fading a level** (it killed the 68-ladders churn) and backwards for **riding a
+trend**: the engine trades the chop and skips the run.
+
+**The re-arm policy is a toggle — `auto_continue` (default OFF).**
+
+- **Uncap it** — `max_positions = 0` + a real `max_lots`. One run now pyramids the whole leg,
+  one rung per `entry_step` on each new extreme, `max_lots` the only bound on stacked size.
+- **OFF — one-shot (default):** when the stop closes a run, the engine **PARKS** and latches
+  `needs_attention`; a bare price re-cross does **nothing**. Both clients chime + show *"set a new
+  level to re-engage"* on the off→on edge. Setting a new trigger resets the latch **and clears the
+  cooldown** (a deliberate act must not wait behind a machine brake), so it re-arms from the new
+  price at once. `would_fire_now` warns when that level is already on the crossed side (a SELL
+  above the bid / a BUY below the ask) so it does not enter by surprise. This is the safe default
+  and matches the operator's real workflow (ARM stays on, they set levels).
+- **ON — auto-continue (opt-in):** after the trail banks a run, keep taking runs **while price is
+  still past the level**, and stop only when price **returns to the level** (then park + alert,
+  and stay parked until a SET LEVEL even if price dips past again). This is the trend mode. In a
+  chop it churns — so it is opt-in, and `cooldown_s` / `max_ladders_per_day` are its brakes. The
+  return-to-level boundary is what keeps it bounded, unlike the old 68-ladder churn.
+
+Why not *always* auto-continue: re-entering on continuation opens **new risk unattended**, which
+this codebase is careful about (nothing re-arms after a restart, for the same reason). The toggle
+keeps the safe behaviour the default and puts the aggressive one behind a deliberate switch.
+
+**Hold-through vs lock-in** is the operator's `stop_mode` choice, unchanged:
+`floor` holds every rung through the wiggles and flushes only on a return to the trigger;
+`retrace` trails the extreme and locks in on a pullback. Either way the leg is ONE ladder and the
+re-load is manual.
+
+**The caveats still stand, and matter more here, not less.** §6d proves no parameter set beats the
+spread without a real directional edge — uncapped stacking is a bigger **lever**, not an edge, so a
+wrong trigger loses *faster*. `max_lots` is mandatory. Manual reload means in a fast move you must
+react to each park or miss a leg. And the demo spread (~0.04) **flatters** every result versus the
+0.240 measured on real ticks — good for checking *behaviour*, optimistic for *edge*.

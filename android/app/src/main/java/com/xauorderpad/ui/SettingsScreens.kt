@@ -606,6 +606,18 @@ fun StrategyScreen(
                 )
             }
 
+            // ---- daily-loss cap: COMMON to every engine ----------------------
+            // Each engine owns its own kill-switch (its own magic, its own limit), so this
+            // is per-strategy: it edits THIS engine's max_daily_loss only. Lives here, above
+            // the engine-specific `when`, so all three (straddle/ladder/rider) carry it and
+            // straddle -- which has no other phone-side settings -- still gets its cap.
+            Spacer(Modifier.height(20.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Spacer(Modifier.height(16.dp))
+
+            SectionLabel("DAILY LOSS CAP")
+            StrategyDailyLoss(s, live, onSet)
+
             when (engineId) {
                 "ladder" -> {
                     Spacer(Modifier.height(20.dp))
@@ -654,6 +666,38 @@ fun StrategyScreen(
                                 if (wantLive) confirmPaperOff = true
                                 else onSet(s.id, null, buildJsonObject {
                                     put("paper", JsonPrimitive(true))
+                                })
+                            },
+                        )
+                    }
+
+                    Spacer(Modifier.height(20.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                    Spacer(Modifier.height(16.dp))
+
+                    // Re-arm policy. OFF (default) = one-shot: after the stop closes a run, PARK
+                    // and wait for a new level. ON = keep taking runs while price stays past the
+                    // level, stop when it returns. Sent only when changed, like the other fields.
+                    SectionLabel("AFTER A RUN")
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Keep taking trades past the level", fontSize = 15.sp,
+                                 fontWeight = FontWeight.Bold)
+                            Text(
+                                if (s.params?.autoContinue == true)
+                                    "ON — auto-continues down the move; stops when price returns to your level."
+                                else
+                                    "OFF — stops after each run; set a new level to go again.",
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = s.params?.autoContinue == true,
+                            enabled = live,
+                            onCheckedChange = { want ->
+                                onSet(s.id, null, buildJsonObject {
+                                    put("auto_continue", JsonPrimitive(want))
                                 })
                             },
                         )
@@ -730,8 +774,9 @@ fun StrategyScreen(
                     Spacer(Modifier.height(16.dp))
                     SectionLabel("TUNING")
                     Text(
-                        "This engine has no phone-side settings. Its parameters (volume threshold, " +
-                            "ATR stop, target R, hold time) are tuned in the web panel.",
+                        "Apart from the daily-loss cap above, this engine has no phone-side " +
+                            "settings. Its parameters (volume threshold, ATR stop, target R, " +
+                            "hold time) are tuned in the web panel.",
                         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -1234,6 +1279,16 @@ private fun LadderBook(s: StrategyStatus, digits: Int) {
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(12.dp)) {
+            // Manual-reload alert. The engine parks after a leg (it never re-enters itself), so
+            // this is the prompt to SET A NEW LEVEL and keep riding a trend. The chime fires
+            // app-wide from the ViewModel; this is the visible half. Derived server-side.
+            if (s.needsAttention == true) {
+                Text(
+                    "🔔 ${s.attentionReason ?: "Closed out and parked — set a new level to re-engage."}",
+                    fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Amber,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+            }
             KvRow("Open rungs", "${s.openPositions ?: 0}")
             KvRow("Open lots", Fmt.lot(s.openLots ?: 0.0))
             KvRow("Cap (rungs / lots)", "$capRungs / $capLots")
@@ -1357,6 +1412,54 @@ private fun LadderTrigger(
              fontSize = 11.sp, fontFamily = FontFamily.Monospace,
              color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+}
+
+// The per-engine daily-loss kill-switch, made editable. `max_daily_loss` already rode the
+// wire (StrategyParams.maxDailyLoss) and was shown read-only in the real-money confirm; this
+// is the input that actually sets it. Mirrors LadderTrigger: server-keyed seed so a 5 Hz
+// snapshot can't wipe typing, APPLY sends only this param with enabled=null (never arms), and
+// the free-form params path means no Api.kt / Frames.kt change was needed.
+@Composable
+private fun StrategyDailyLoss(
+    s: StrategyStatus,
+    live: Boolean,
+    onSet: (String, Boolean?, JsonObject) -> Unit,
+) {
+    var cap by remember(s.params?.maxDailyLoss) {
+        mutableStateOf(s.params?.maxDailyLoss?.takeIf { it > 0.0 }?.let { Fmt.price(it, 0) } ?: "")
+    }
+    val typed = cap.trim().toDoubleOrNull()
+    val valid = typed != null && typed > 0.0
+
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                "Realized + floating loss that auto-disables THIS engine for the rest of the " +
+                    "day. Raising it also clears an already-tripped cap.",
+                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        TextButton(
+            onClick = {
+                onSet(s.id, null, buildJsonObject {
+                    put("max_daily_loss", JsonPrimitive(typed))
+                })
+            },
+            enabled = live && valid,
+        ) { Text("APPLY", fontWeight = FontWeight.Bold) }
+    }
+
+    OutlinedTextField(
+        value = cap,
+        onValueChange = { cap = it },
+        enabled = live,
+        singleLine = true,
+        label = { Text("max daily loss (USD)", fontSize = 10.sp) },
+        textStyle = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
