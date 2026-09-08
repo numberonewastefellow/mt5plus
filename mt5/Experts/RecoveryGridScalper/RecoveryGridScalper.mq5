@@ -41,12 +41,30 @@
 input group "Exit"
 input double ExitTargetPct   = 28.9;  // Close-all target, % of the balance at cycle open
 input double ExitGivebackPct = 15.0;  // Or: retrace this % of balance from the basket's peak
+// THE QUICK ARM - a third exit, in $/oz above the basket's AVERAGE entry, decaying with age.
+//
+// QuickExitArmPct IS LOAD-BEARING, not a nicety. Ungated at 0.30 $/oz this arm is nearer than the
+// ExitTargetPct arm on 31 of 31 logged cycles - it would fire first every time and the 28.9%
+// target would become dead code. Requiring the basket to have been DOWN this far first keeps the
+// target alive on the cycles that never got into trouble (16 of 31, and they are the winners),
+// and hands the quick exit only to baskets that went underwater and recovered.
+input bool   EnableQuickExit  = true;  // The time-decaying $/oz exit (false = previous 2-arm behaviour)
+input bool   EnableTimeDecay  = true;  // false = fixed at QuickExitStartUSD, no decay
+input double QuickExitStartUSD= 0.30;  // $/oz above average entry, at cycle open
+input double QuickExitFloorUSD= 0.10;  // ...decaying linearly to this
+input int    QuickExitDecaySec= 60;    // ...over this many seconds
+input double QuickExitArmPct  = 15.0;  // Only after the basket has been down this % of balance
 //--- sizing ---------------------------------------------------------
 //
 // The batch and the depth cap are DERIVED FROM BALANCE (Utils.mqh), not set here. The
 // operator's own run opened ONE position at $0.30-$0.99 and grew the count with the account
 // before the lot moved; a hardcoded batch of 3 put three times that exposure on a $1 account.
 input group "Sizing"
+// GRID = add only while underwater (what the video did: 33 of 34 clean add events, 97%, were in
+// loss). TREND = add on any move >= AddStepUSD in EITHER direction, because direction here is the
+// operator's call. Everything else is identical, so the modes differ in one place and stay
+// comparable in the logs. Hotkeys T and G switch it live.
+input ENUM_RGS_ADD_MODE AddMode = RGS_MODE_TREND;  // Trend = add both ways, Grid = add only in loss
 input bool   AutoLot        = true;   // Lot from the balance tier table
 input double ManualLotInput = 0.0;    // >0 forces this lot (panel box overrides)
 //--- add throttle (BOTH must pass) ----------------------------------
@@ -85,6 +103,8 @@ input bool   EnableHotkeys  = true;   // false = mouse-click only (original beha
 input string HotkeyBuy      = "B";
 input string HotkeySell     = "S";
 input string HotkeyCloseAll = "P";
+input string HotkeyTrend    = "T";    // switch AddMode to TREND
+input string HotkeyGrid     = "G";    // switch AddMode to GRID
 
 CRgsExec   g_exec;
 CRgsLogger g_log;
@@ -97,6 +117,8 @@ bool       g_hotkeys_armed=false;   // EnableHotkeys is an input (read-only); th
 int        g_vk_buy=0;
 int        g_vk_sell=0;
 int        g_vk_close=0;
+int        g_vk_trend=0;
+int        g_vk_grid=0;
 
 //+------------------------------------------------------------------+
 //| One letter -> its virtual-key code, or -1 if not exactly one letter |
@@ -121,21 +143,29 @@ void ResolveHotkeys()
    g_vk_buy  =RGS_KeyOf(HotkeyBuy);
    g_vk_sell =RGS_KeyOf(HotkeySell);
    g_vk_close=RGS_KeyOf(HotkeyCloseAll);
-   if(g_vk_buy<0 || g_vk_sell<0 || g_vk_close<0)
+   g_vk_trend=RGS_KeyOf(HotkeyTrend);
+   g_vk_grid =RGS_KeyOf(HotkeyGrid);
+   if(g_vk_buy<0 || g_vk_sell<0 || g_vk_close<0 || g_vk_trend<0 || g_vk_grid<0)
      {
       Print("RGS: HotkeyBuy/HotkeySell/HotkeyCloseAll must each be exactly one letter - "
             "hotkeys DISABLED for this session. Mouse clicks still work.");
       return;
      }
-   if(g_vk_buy==g_vk_sell || g_vk_buy==g_vk_close || g_vk_sell==g_vk_close)
+   // All five must be distinct. A collision binds one key to two actions, and BUY colliding
+   // with a mode switch would place an order when the operator meant to change a setting.
+   int keys[5]; keys[0]=g_vk_buy; keys[1]=g_vk_sell; keys[2]=g_vk_close;
+   keys[3]=g_vk_trend; keys[4]=g_vk_grid;
+   bool clash=false;
+   for(int i=0;i<5 && !clash;i++) for(int j=i+1;j<5;j++) if(keys[i]==keys[j]) { clash=true; break; }
+   if(clash)
      {
-      Print("RGS: HotkeyBuy/HotkeySell/HotkeyCloseAll must all be different letters - "
-            "hotkeys DISABLED for this session. Mouse clicks still work.");
+      Print("RGS: every Hotkey* input must be a DIFFERENT letter - hotkeys DISABLED for this "
+            "session. Mouse clicks still work.");
       return;
      }
    g_hotkeys_armed=true;
-   PrintFormat("RGS: hotkeys armed - BUY [%s]  SELL [%s]  CLOSE ALL [%s]",
-               HotkeyBuy,HotkeySell,HotkeyCloseAll);
+   PrintFormat("RGS: hotkeys armed - BUY [%s]  SELL [%s]  CLOSE ALL [%s]  TREND [%s]  GRID [%s]",
+               HotkeyBuy,HotkeySell,HotkeyCloseAll,HotkeyTrend,HotkeyGrid);
   }
 
 //+------------------------------------------------------------------+
@@ -174,18 +204,27 @@ int OnInit()
    double kill_pct=(EnableDailyLossKill ? DailyLossKillPct : 0.0);
    g_engine.Init(_Symbol,GetPointer(g_exec),GetPointer(g_log),
                  ExitTargetPct,ExitGivebackPct,AddStepUSD,AddCooldownSec,
-                 MinFreeMargin,MaxTotalLots,kill_pct,AutoRestart,RealMarginPerLotUSD);
+                 MinFreeMargin,MaxTotalLots,kill_pct,AutoRestart,
+                 EnableQuickExit,EnableTimeDecay,QuickExitStartUSD,QuickExitFloorUSD,
+                 QuickExitDecaySec,QuickExitArmPct,AddMode,RealMarginPerLotUSD);
 
    double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+   g_panel.SetMaxLots(MaxTotalLots);
    g_panel.Create(ChartID(),AutoLot?RGS_TierLot(bal):ManualLotInput);
    if(ManualLotInput>0.0)
       ObjectSetString(ChartID(),RGS_EDT_LOT,OBJPROP_TEXT,DoubleToString(ManualLotInput,2));
 
-   PrintFormat("RGS started on %s | exit %.1f%% of balance, or %.1f%% give-back from peak | "
-               "batch %d and depth cap %d at this balance | add step %.3f + %ds | "
-               "backstops: lots %.2f, free margin %.2f, kill %.2f",
-               _Symbol,ExitTargetPct,ExitGivebackPct,
-               RGS_GroupFor(bal,RGS_TierLot(bal)),RGS_MaxPositionsFor(bal,RGS_TierLot(bal)),
+   // The banner names the ADD MODE and BOTH position ceilings. `depth cap` is the risk budget;
+   // `lot cap` is what MaxTotalLots actually permits at this lot size, and it is routinely the
+   // smaller of the two - on 2026-09-08 the depth cap read 18 while the lot cap allowed 3, and
+   // five of seven cycles stopped there with nothing in the log to say so.
+   double tier=RGS_TierLot(bal);
+   int    lot_cap=(MaxTotalLots>0.0 && tier>0.0 ? (int)MathFloor(MaxTotalLots/tier+1e-9) : 0);
+   PrintFormat("RGS started on %s | mode %s | exit %.1f%% of balance, or %.1f%% give-back from "
+               "peak | batch %d, depth cap %d, LOT CAP %d at this balance (the smaller one "
+               "binds) | add step %.3f + %ds | backstops: lots %.2f, free margin %.2f, kill %.2f",
+               _Symbol,RGS_AddModeName(AddMode),ExitTargetPct,ExitGivebackPct,
+               RGS_GroupFor(bal,tier),RGS_MaxPositionsFor(bal,tier),lot_cap,
                AddStepUSD,AddCooldownSec,MaxTotalLots,MinFreeMargin,
                (kill_pct>0.0 ? kill_pct/100.0*bal : 0.0));
    RGS_WarnExposure(_Symbol,bal);
@@ -273,7 +312,8 @@ void RefreshPanel()
    double gb=(g_engine.State()==RGS_RUNNING ? g_engine.GiveBack() : ExitGivebackPct/100.0*bal);
    g_panel.Update(st,g_engine.CycleId(),g_engine.IsBuy(),n,lots,net,
                   tg,tier,warn,cap,grp,g_engine.BestPnl(),
-                  gb,g_engine.MarginPerLot());
+                  gb,g_engine.MarginPerLot(),
+                  (g_engine.AddMode()==RGS_MODE_TREND?"TREND":"GRID"),g_engine.QuickPerOz());
   }
 
 //+------------------------------------------------------------------+
@@ -354,6 +394,23 @@ void OnChartEvent(const int id,const long &lparam,const double &dparam,const str
       // subwindow has keyboard focus, same as the mouse click already is.
       if(!g_hotkeys_armed || g_lot_edit_active) return;
       int key=(int)lparam;
+      // Mode switches take effect immediately, mid-cycle included: the add gate is re-read every
+      // tick, so flipping T/G changes how the CURRENT basket continues. Both are logged so a
+      // later analysis can tell which mode a cycle actually ran under.
+      if(key==g_vk_trend)
+        {
+         g_engine.SetAddMode(RGS_MODE_TREND);
+         Print("RGS: add mode -> TREND (adds on any move >= step, either direction)");
+         g_log.Note(g_engine.CycleId(),"add mode -> TREND");
+         RefreshPanel(); return;
+        }
+      if(key==g_vk_grid)
+        {
+         g_engine.SetAddMode(RGS_MODE_GRID);
+         Print("RGS: add mode -> GRID (adds only while underwater)");
+         g_log.Note(g_engine.CycleId(),"add mode -> GRID");
+         RefreshPanel(); return;
+        }
       if(key==g_vk_buy)   { DoStartCycle(true, "pressed hotkey"); return; }
       if(key==g_vk_sell)  { DoStartCycle(false,"pressed hotkey"); return; }
       if(key==g_vk_close) { DoCloseAll("pressed hotkey"); }

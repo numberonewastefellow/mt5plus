@@ -467,6 +467,155 @@ wipe ledger in §1: **2 of 5 wipes never went green**, so no exit rule could eve
 
 ---
 
+### 2026-09-07 (evening) — TREND mode + a time-decaying QUICK arm, gated
+
+Two new behaviours built at the operator's request. Both are **departures from the source**, both are
+inputs, and both default so the previous behaviour is one setting away.
+
+**1. `AddMode` — TREND (default) / GRID.** Until now the grid added only while underwater. Checked
+against the video: of 261 add events, filtered to those where the OCR was clean **and** the equity
+identity `equity_before − balance == pnl_total_before` holds, **33 of 34 (97%) happened with the
+basket in loss** — the one exception was at +1.1% of balance. So `if(net < 0)` was not an oversight;
+it is what the source did. TREND adds on any move ≥ step in **either** direction, on the reasoning
+that direction here is the operator's call rather than the algorithm's. Everything else — cooldown,
+depth cap, margin floor, lot cap — is identical, so the modes differ in one line and stay comparable.
+
+**2. The QUICK arm.** `net >= QuickExitPerOz(age) × total_oz`, decaying linearly **0.30 → 0.10 $/oz**
+above average entry over 60 s. Motivated by measurement: duration is the strongest single predictor
+of trouble here — cycles finishing inside 40 s had a median worst drawdown of **5–15% of balance**;
+those still open past 40 s had **57–89%**.
+
+**The constraint that shaped it, and nearly broke it.** The operator's requirement was that the
+28.9% target must **not** become dead code. Measured: at `QuickExitStartUSD = 0.30` the quick arm is
+nearer than the target on **31 of 31 logged cycles** — it would have fired first every time and the
+target would never have run again.
+
+Fix: gate the quick arm behind *"this basket has been down ≥ `QuickExitArmPct` of balance"*, which
+is the operator's own description (*"we hold only in case we are in loss and wait for recovery"*).
+
+| gate | keep the 28.9% target | eligible for QUICK |
+|---|---|---|
+| **−15% of balance** | **16 of 31 (52%)** — and they are the clean winners: +24.36, +26.73, +39.04, +32.29, **+90.25**, +36.38 | 15 (48%) |
+
+~~−15% is not fitted. Among cycles running ≥45 s the sick ones bottom at −56.7% or worse and the
+healthy ones only reach −5.5%; nothing lands between.~~ **REFUTED the same evening — see the next
+entry.**
+
+**All three arms stay IN PROFIT ONLY** — none ever closes a red basket. Unchanged, and deliberate.
+
+**Explicitly NOT verified.** The parameter sweeps used along the way (which produced headline numbers
+like +206 and +322) **assume a peak is reachable whenever it exceeds the threshold, ignoring time
+ordering** — they let a rule capture peaks it could not have reached because its arm was not yet
+live. **Those figures are inflated and must not be quoted.** Confirmation needs tick replay on the
+cycles where entries are known (2026-09-07 ×4; 2026-09-03 c3 and c12). `close_reason = quick` is
+logged so the three arms can be separated in the next analysis.
+
+### 2026-09-07 (late) — the ordered replay: constraint HOLDS, its justification DOES NOT
+
+Built `analysis/video_ocr/replay_quick_arm.py` and ran the verification promised in the entry above,
+across **all 31 v2-logged cycles** rather than the six originally scoped. It rebuilds each basket
+from the real `OPEN` rows, pulls the real ticks for the window, activates each leg at its true fill
+instant, and evaluates the arms in `OnTick` order. Reconstruction checks out: **leg count and total
+lots match the cycle log exactly on all 31**, and replayed `worst_pnl` tracks the logged value.
+
+**The constraint holds: 0 violations.** 16 of 31 cycles never open the gate, so they keep the 28.9%
+target and the give-back. The target is not dead code.
+
+**But the reason given for −15% was wrong.** Distance from the arm line, gate-shut cycles first:
+
+| cycle | cushion / overshoot |
+| --- | --- |
+| `8242/c1` shut by | **$0.17** |
+| `1794/c6` shut by | $0.53 |
+| `1794/c1` armed by | $0.54 |
+| `8242/c6` armed by | $0.63 |
+| `1794/c2` armed by | $0.85 |
+| `1794/c12` armed by | $0.88 |
+
+**Ten of 31 sit within $6 of flipping.** There is no gap. The gate works, but it is a knife-edge on a
+third of the book, and that is a different claim from the one this document made an hour earlier.
+
+Two further findings, both of which limit what any offline replay of this system can say:
+
+* **Gate state depends on TIMING, not on the cycle.** `8242/c1` is gate-shut when give-back fires
+  (worst −13.50 vs arm line −13.66) yet its full-cycle worst is **−31.53**. A few more seconds and
+  the same cycle belongs to the other arm.
+* **The broker's tick archive is not what the EA saw.** `2147/c1` replays a peak of **+216.67**
+  against a logged **+31.10**; four `target` closes replay peaks of ~$12–21 against a logged ~$29.
+  The archive smooths fast spikes in both directions. So *which arm fires first* is indicative only.
+  The gate classification is the part worth trusting, because it rests on `worst_pnl`, which
+  reconciles.
+
+**This is the third time a lever looked good until it was scored properly** (Lever A, Lever C, now
+the −15% gap claim), and the second time the error was *ignoring time ordering*. The §7 standing rule
+gains a clause: **a threshold justified by "a gap in the data" must be shown as a per-cycle distance
+table, not as two summary statistics.** Two aggregates can straddle a gap that no individual cycle
+respects — which is exactly what happened here.
+
+**Still unverified, and not verifiable offline:** that the *MQL5* implements this. The replay tests
+the design in Python; the shipped code is checked by inspection at `GridEngine.mqh:492-501` and needs
+a live run showing `close_reason = quick`.
+
+**Lever status after this entry:** A deferred · B still the only lever standing on the exposure side ·
+C refuted. The QUICK arm is *not* Lever A — A reduced the give-back threshold; this adds a separate
+time-decayed arm behind a drawdown gate.
+
+### 2026-09-08 — `MaxTotalLots` was the binding cap all along, and it logged NOTHING
+
+Seven cycles, 471.27 → 1512.49. **Five of them opened one batch and then sat still**, and the log
+did not say why.
+
+| cycle | lot | filled | depth cap | lots | target | target $/oz | closed by | net |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.10 | 10 | 24 | 1.00 | 136.20 | 1.36 | target | +124.95 |
+| 2 | 0.10 | 10 | 27 | 1.00 | 172.31 | 1.72 | quick | +29.98 |
+| 3 | 0.33 | 3 | 15 | 0.99 | 180.97 | 1.83 | give-back | **−3.93** |
+| 4 | 0.33 | 3 | 15 | 0.99 | 179.84 | 1.82 | target | +179.77 |
+| 5 | 0.33 | 3 | 15 | 0.99 | 231.79 | 2.34 | target | +256.38 |
+| **6** | 0.33 | **3** | **18** | 0.99 | 305.88 | **3.09** | give-back | +117.23 |
+| 7 | 0.33 | 3 | 21 | 0.99 | 339.76 | 3.43 | target | +336.84 |
+
+**Cause: `MaxTotalLots = 1.00`.** At `lot 0.33` the opening batch is 0.99 lots and a fourth position
+needs 1.32, so `lots_ok` (`GridEngine.mqh:521`) was false on every tick. Margin was irrelevant —
+$1,042 free against a $5.28 add. The depth cap said 18. **The README called `MaxTotalLots` a
+"backstop only"; that line is now struck through, because it is the cap that actually binds.**
+
+**Defect: the lot cap blocked adds silently.** The add gate logged for `!marg_ok` and `!deep_ok` but
+had **no branch for `!lots_ok`**. Cycles 1–2 produced `MaxTotalLots 1.00 reached` only because at
+0.10 lot the cap bit *inside* `OpenBatch`; at 0.33 it bites one level up and wrote nothing. Same
+class as the 2026-09-03 log-blindness defect. **Fixed:** new branch with `block_logged=3`, plus
+`mode`, `lot cap` and calibrated `margin/lot` on the `CYCLE n START` line and in a matching NOTE
+(a NOTE rather than a new cycles-CSV column, which would have broken the v2 header mid-file).
+
+**Cycle 6 in detail — it missed by five cents an ounce.** 99 oz, avg entry 4397.605. Peak +301.08 =
+3.041 $/oz; the target needed 3.090 $/oz. Give-back then fired at 301.08 − 158.76 = 142.32, closing
+at +141.48 → realised 128.12 − 10.89 commission = **+117.23**. The quick arm could not help: it needs
+the basket down $158.76 and the worst was −$122.76. **Cycle 3 is the same defect as a loss** — peak
++109.22, exited at +15.29, **−3.93 after commission**.
+
+**The structural shape.** `required $/oz = ExitTargetPct% × balance ÷ (MaxTotalLots × 100)`. Ounces
+frozen, target scaling with balance, so every win raises the bar: 1.36 → 1.82 → 2.34 → 3.09 → 3.43,
+next **4.42**. Duration climbs with it: 6 s → 31 s → 44 s → 72 s. **And the lot tier makes it a
+cliff, not a slope:** the balance has just crossed $1,500, so the tier steps 0.33 → 0.99 and the
+next cycle opens **one** position; above $3,400 the tier is 1.99 and nothing opens at all.
+
+**Methodology correction, and a standing rule.** A tick-based pass suggested four adds fired while
+the basket was green — a real bug had it been true, on a GRID-only build. It was an artifact: it
+assumed one price per batch (fills slip across several) and sampled a full second before the
+decision. The EA's own logged `bid`/`ask` disproved it. **When the question is what the engine saw,
+use the logged bid/ask, not a reconstructed tick window.** This is the third time this session that
+a finding survived only until it was scored properly.
+
+**Leverage was NOT the cause today** (margin $16/lot, ~27,000:1). The 2026-09-07 1:200 window was
+transient. Parked, with the operator's decision to keep the demo at 1:Unlimited, in
+[LEVERAGE_DEPENDENCY.md](LEVERAGE_DEPENDENCY.md).
+
+**Decisions taken:** demo stays 1:Unlimited · `MaxTotalLots`, `ExitTargetPct`, lot tiers and all exit
+rules **unchanged** · fix the logging first, then decide with data. Operator manual written:
+[PARAMETERS.md](PARAMETERS.md).
+
+---
+
 ## 10. How to reproduce any figure here
 
 Peaks and P&L paths are reconstructed from the broker's own ticks, because the log samples only at

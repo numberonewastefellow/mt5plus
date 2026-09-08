@@ -64,6 +64,11 @@ private:
 
    //--- inputs, copied in at Init
    double            m_target_pct, m_giveback_pct;
+   //--- the time-decayed $/oz floor, and which way the grid adds
+   bool              m_quick_on, m_quick_decay;
+   double            m_quick_start, m_quick_floor, m_quick_arm_pct;
+   int               m_quick_secs;
+   ENUM_RGS_ADD_MODE m_add_mode;
    double            m_add_step, m_min_free, m_max_lots, m_kill_pct;
    double            m_day_start_bal;  // balance the trading day opened with
    int               m_cooldown;
@@ -219,6 +224,7 @@ private:
       if(why==RGS_CLOSE_KILL)     reason="daily_loss_kill";
       if(why==RGS_CLOSE_DEINIT)   reason="ea_removed";
       if(why==RGS_CLOSE_EXTERNAL) reason="external";
+      if(why==RGS_CLOSE_QUICK)    reason="quick";
       if(failed>0) reason=reason+"_PARTIAL";
 
       m_log.Trade(m_cyc.id,"CLOSE",0,m_cyc.is_buy,tl,exit_px,0.0,np,closed,tl,
@@ -246,12 +252,18 @@ public:
                           const double target_pct,const double giveback_pct,
                           const double add_step,const int cooldown,const double min_free,
                           const double max_lots,const double kill_pct,const bool auto_restart,
+                          const bool quick_on,const bool quick_decay,const double quick_start,
+                          const double quick_floor,const int quick_secs,const double quick_arm_pct,
+                          const ENUM_RGS_ADD_MODE add_mode,
                           const double real_margin_per_lot=0.0)
      {
       m_sym=sym; m_exec=ex; m_log=lg;
       m_target_pct=target_pct; m_giveback_pct=giveback_pct;
       m_add_step=add_step; m_cooldown=cooldown; m_min_free=min_free;
       m_max_lots=max_lots; m_kill_pct=kill_pct; m_auto_restart=auto_restart;
+      m_quick_on=quick_on; m_quick_decay=quick_decay; m_quick_start=quick_start;
+      m_quick_floor=quick_floor; m_quick_secs=quick_secs; m_add_mode=add_mode;
+      m_quick_arm_pct=quick_arm_pct;
       m_margin_per_lot=(real_margin_per_lot>0.0 ? real_margin_per_lot : 0.0);
       m_state=RGS_IDLE; m_next_id=1; m_day_realised=0.0; m_day=0;
       m_day_start_bal=AccountInfoDouble(ACCOUNT_BALANCE);
@@ -265,6 +277,16 @@ public:
    int               DepthCap() const { return m_cyc.depth_cap; }
    int               Group()    const { return m_cyc.group; }
    double            BestPnl()  const { return m_cyc.best_pnl; }
+   //--- 0 when the arm is off or not yet armed, so the panel shows "-" rather than a number the
+   //--- engine will not act on.
+   double            QuickPerOz() const
+     {
+      if(!m_quick_on || m_state!=RGS_RUNNING) return 0.0;
+      if(m_cyc.worst_pnl > -(m_quick_arm_pct/100.0*m_cyc.balance_open)) return 0.0;
+      return QuickExitPerOz();
+     }
+   ENUM_RGS_ADD_MODE AddMode() const { return m_add_mode; }
+   void              SetAddMode(const ENUM_RGS_ADD_MODE m) { m_add_mode=m; }
    double            DayRealised() const { return m_day_realised; }
    double            MarginPerLot() const { return m_margin_per_lot; }
    double            KillAt()      const { return KillLevel(); }
@@ -288,6 +310,29 @@ public:
    //--- The give-back arm: close when the basket retraces this much from its own high-water
    //--- mark. `best_pnl` was already being tracked and read by nothing.
    double            GiveBack() const { return m_giveback_pct/100.0*m_cyc.balance_open; }
+
+   //--- THE TIME-DECAYED EXIT, in $/oz above the basket's AVERAGE entry.
+   //---
+   //--- `net = total_oz x (price - avg_entry)`, so `net >= X * total_oz` is exactly
+   //--- "price is X above average entry" - the number the operator reads off the chart.
+   //---
+   //--- It decays LINEARLY from QuickExitStartUSD to QuickExitFloorUSD over
+   //--- QuickExitDecaySec, so a cycle that has been running gets easier to close. That is
+   //--- the point: duration is the strongest single predictor of trouble in this log -
+   //--- cycles finishing inside 40 s had a median worst drawdown of 5-15% of balance, while
+   //--- those still open past 40 s had a median of 57-89%.
+   //---
+   //--- NOTE, measured: at QuickExitStartUSD = 0.30 this arm is nearer than the
+   //--- ExitTargetPct arm on 31 of 31 logged cycles, so in practice it REPLACES the target
+   //--- rather than supplementing it. That is a deliberate choice, not an oversight.
+   double            QuickExitPerOz() const
+     {
+      if(!m_quick_on) return 0.0;
+      if(!m_quick_decay || m_quick_secs<=0) return m_quick_start;
+      double age=(double)(TimeCurrent()-m_cyc.t_open);
+      double k  =MathMin(1.0,MathMax(0.0,age/(double)m_quick_secs));
+      return m_quick_start-(m_quick_start-m_quick_floor)*k;
+     }
 
    void              SetPaused(const bool p)
      {
@@ -359,10 +404,29 @@ public:
       m_cyc.group=grp;
       m_cyc.target=m_target_pct/100.0*bal;      // FIXED here, never recomputed. See CloseTarget().
       m_state=RGS_RUNNING;
+      // The START line names the ADD MODE and the calibrated margin cost, because neither was
+      // recoverable from any log before: a cycle's mode could not be told from its fills (a
+      // whipsaw makes GRID and TREND produce the same adds), and gold's margin went
+      // $0.00 -> $2,205.60 -> $16.00 per lot inside 24 h with nothing marking the change.
+      //
+      // `lot cap` is the number of positions MaxTotalLots actually allows at this lot size. It is
+      // frequently FAR below `depth cap` - on 2026-09-08 the depth cap said 18 and the lot cap
+      // allowed 3 - and it is the one that binds. See PARAMETERS.md, "the three ceilings".
+      int lot_cap=(m_max_lots>0.0 && use>0.0 ? (int)MathFloor(m_max_lots/use+1e-9) : 0);
       PrintFormat("RGS CYCLE %d START %s lot %.2f  balance %.2f  batch %d  depth cap %d  "
+                  "lot cap %d  mode %s  margin/lot %.2f  "
                   "target %.3f (%.1f%%)  give-back %.3f (%.1f%%)",
                   m_cyc.id,(is_buy?"BUY":"SELL"),use,bal,grp,cap,
+                  lot_cap,RGS_AddModeName(m_add_mode),m_margin_per_lot,
                   m_cyc.target,m_target_pct,GiveBack(),m_giveback_pct);
+      // ...and the same facts as a NOTE, so they land in the TRADES CSV too. The Print above only
+      // reaches the Experts log, which is not what the analysis scripts read. Deliberately a NOTE
+      // rather than a new cycles-CSV column: a column would change the v2 header mid-file and
+      // break every script that reads it, for a fact that fits in the comment field.
+      m_log.Note(m_cyc.id,StringFormat("cycle open mode=%s lot=%.2f depth_cap=%d lot_cap=%d "
+                                       "margin_per_lot=%.2f target=%.3f giveback=%.3f",
+                                       RGS_AddModeName(m_add_mode),use,cap,lot_cap,
+                                       m_margin_per_lot,m_cyc.target,GiveBack()));
       if(OpenBatch(grp,use,true)<=0)
         {
          Print("RGS: initial batch opened nothing - returning to IDLE.");
@@ -434,15 +498,41 @@ public:
             FinishCycle(RGS_CLOSE_GIVEBACK);
             return;
            }
+         // QUICK arm - "price is X above the basket's AVERAGE entry", X decaying with age.
+         // net == total_oz x (price - avg_entry), so comparing net to X x total_oz IS that
+         // statement, in the units the operator reads off the chart.
+         //
+         // THE GATE IS LOAD-BEARING. Ungated, at QuickExitStartUSD = 0.30, this arm is nearer
+         // than the ExitTargetPct arm on 31 of 31 logged cycles: it would fire first every time
+         // and the 28.9% target would become dead code. Requiring the basket to have been down
+         // QuickExitArmPct% of balance FIRST keeps the target alive on the cycles that never got
+         // into trouble (16 of 31, and they are the clean winners), and hands the quick exit only
+         // to baskets that went underwater and recovered - the case it was asked for.
+         if(m_quick_on && tl>0.0
+            && m_cyc.worst_pnl <= -(m_quick_arm_pct/100.0*m_cyc.balance_open))
+           {
+            double peroz=QuickExitPerOz();
+            if(peroz>0.0 && net >= peroz*tl*RGS_OZ_PER_LOT)
+              {
+               FinishCycle(RGS_CLOSE_QUICK);
+               return;
+              }
+           }
         }
 
       // 2) ADD while underwater, throttled by BOTH price and time, and bounded by the depth
       //    the risk budget allowed at open. `m_max_lots` is now a backstop, not the cap.
-      if(net<0.0)
+      // GRID adds only while underwater; TREND adds on movement either way. Everything
+      // downstream - step, cooldown, margin, lot cap, depth cap - is identical, so the two modes
+      // differ in exactly one place and stay comparable when the logs are analysed later.
+      bool may_add=(m_add_mode==RGS_MODE_GRID ? (net<0.0) : true);
+      if(may_add)
         {
          double px=(m_cyc.is_buy ? SymbolInfoDouble(m_sym,SYMBOL_ASK)
                                  : SymbolInfoDouble(m_sym,SYMBOL_BID));
-         double adverse=(m_cyc.is_buy ? m_cyc.last_add_price-px : px-m_cyc.last_add_price);
+         double signed_adv=(m_cyc.is_buy ? m_cyc.last_add_price-px : px-m_cyc.last_add_price);
+         double adverse=(m_add_mode==RGS_MODE_GRID ? signed_adv
+                                                   : MathAbs(px-m_cyc.last_add_price));
          int    room   =m_cyc.depth_cap-n;
          bool step_ok =(adverse >= m_add_step);
          bool time_ok =(TimeCurrent()-m_cyc.t_last_add >= m_cooldown);
@@ -474,6 +564,23 @@ public:
                m_cyc.block_logged=2;
                m_log.Note(m_cyc.id,StringFormat("add BLOCKED: depth %d/%d - the risk budget is "
                                                 "spent, holding for the bounce",n,m_cyc.depth_cap));
+              }
+           }
+         // MaxTotalLots. This branch did not exist, so the day's most binding constraint wrote
+         // NOTHING: on 2026-09-08 five of seven cycles opened one batch (0.33 lot x 3 = 0.99) and
+         // then sat still, because a 4th would have been 1.32 > 1.00 - and no log said so. It was
+         // only ever visible when the cap bit INSIDE OpenBatch (a lot small enough to stop the
+         // batch mid-way, e.g. 0.10); at 0.33 it bites here, one level up. Same class as the
+         // log-blindness defect of 2026-09-03: the log has to record why the engine did nothing.
+         else if(step_ok && time_ok && !lots_ok)
+           {
+            if(m_cyc.block_logged!=3)
+              {
+               m_cyc.block_logged=3;
+               m_log.Note(m_cyc.id,StringFormat("add BLOCKED: MaxTotalLots %.2f reached - %d "
+                                                "positions, %.2f lots open, next add needs %.2f "
+                                                "(depth cap %d was never the limit)",
+                                                m_max_lots,n,tl,tl+m_cyc.lot,m_cyc.depth_cap));
               }
            }
         }

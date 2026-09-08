@@ -31,9 +31,42 @@ enum ENUM_RGS_CLOSE_REASON
    RGS_CLOSE_MANUAL,      // operator pressed CLOSE ALL
    RGS_CLOSE_KILL,        // daily loss kill
    RGS_CLOSE_DEINIT,      // EA removed with a basket open
-   RGS_CLOSE_EXTERNAL     // the basket vanished without the EA closing it: a broker
+   RGS_CLOSE_EXTERNAL,    // the basket vanished without the EA closing it: a broker
                           // stop-out, or a manual close from the Trade tab
+   RGS_CLOSE_QUICK        // the time-decayed $/oz floor - see QuickExitPerOz()
   };
+
+//+------------------------------------------------------------------+
+//| HOW THE GRID ADDS.                                               |
+//|                                                                  |
+//| GRID  - add only while the basket is UNDERWATER, on adverse       |
+//|         movement. This averages down to recover a loss and is     |
+//|         what the video operator did: 33 of 34 clean add events    |
+//|         (97%) happened with the basket in loss.                   |
+//|                                                                  |
+//| TREND - add on movement in EITHER direction. The operator picks   |
+//|         the side, so a favourable run is also a reason to add:    |
+//|         more ounces on a move that is already working. Same step, |
+//|         same cooldown, same depth cap, same margin guard.         |
+//|                                                                  |
+//| TREND is NOT what the video did - it is a deliberate departure,   |
+//| being tested because direction here is a human decision rather    |
+//| than the algorithm's. Expect it to enlarge BOTH tails.            |
+//+------------------------------------------------------------------+
+enum ENUM_RGS_ADD_MODE
+  {
+   RGS_MODE_TREND = 0,    // add on any move >= step, either direction
+   RGS_MODE_GRID          // add only while underwater, on adverse moves
+  };
+
+//--- The mode has to appear in the LOG, not just on the panel. A cycle's mode cannot be
+//--- recovered from its fills after the fact: when price whipsaws inside the cooldown, GRID
+//--- and TREND produce the same adds, and reading a tick window instead of the logged bid/ask
+//--- gives the wrong answer (that mistake was made on 2026-09-08 and had to be retracted).
+string RGS_AddModeName(const ENUM_RGS_ADD_MODE m)
+  {
+   return(m==RGS_MODE_GRID ? "GRID" : "TREND");
+  }
 
 // Panel object names. Prefixed so OnDeinit can delete exactly ours and
 // leave any other chart objects alone.
@@ -49,6 +82,7 @@ enum ENUM_RGS_CLOSE_REASON
 #define RGS_LBL_BASKET            RGS_PFX "lbl_basket"
 #define RGS_LBL_ACCOUNT           RGS_PFX "lbl_account"
 #define RGS_LBL_TRAIL             RGS_PFX "lbl_trail"
+#define RGS_LBL_MODE              RGS_PFX "lbl_mode"
 #define RGS_LBL_LOT               RGS_PFX "lbl_lot"
 #define RGS_LBL_WARN              RGS_PFX "lbl_warn"
 #define RGS_BG                    RGS_PFX "bg"

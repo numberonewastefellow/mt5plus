@@ -17,6 +17,7 @@ class CRgsPanel
   {
 private:
    long              m_chart;
+   double            m_max_lots;   // MaxTotalLots; 0 = not set, cycle line then shows depth cap only
 
    void              Btn(const string name,const int x,const int y,const int w,const int h,
                          const string text,const color bg,const color fg)
@@ -52,6 +53,10 @@ private:
      }
 
 public:
+   //--- MaxTotalLots, held so the cycle line can show the ceiling that actually binds. Set once
+   //--- at Create; it is an input and never changes during a session.
+   void              SetMaxLots(const double v) { m_max_lots=v; }
+
    void              Create(const long chart_id,const double tier_lot)
      {
       m_chart=chart_id;
@@ -61,7 +66,7 @@ public:
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_XDISTANCE,x-6);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_YDISTANCE,y-6);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_XSIZE,RGS_W);
-      ObjectSetInteger(m_chart,RGS_BG,OBJPROP_YSIZE,RGS_ROW*9+40);
+      ObjectSetInteger(m_chart,RGS_BG,OBJPROP_YSIZE,RGS_ROW*10+40);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_BGCOLOR,C'22,24,28');
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_BORDER_TYPE,BORDER_FLAT);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_COLOR,clrDimGray);
@@ -94,10 +99,11 @@ public:
       Lbl(RGS_LBL_BASKET ,x,y+RGS_ROW*2,     "basket : -",clrSilver);
       Lbl(RGS_LBL_TRAIL  ,x,y+RGS_ROW*3,     "peak   : -",clrSilver);
       Lbl(RGS_LBL_ACCOUNT,x,y+RGS_ROW*4,     "acct   : -",clrSilver);
+      Lbl(RGS_LBL_MODE   ,x,y+RGS_ROW*5,     "mode   : -",clrSilver);
       // " " and not "": MT5 renders an OBJ_LABEL with EMPTY text as its default
       // caption, the literal word "Label", which sat on the panel looking like a
       // bug. A single space is the empty state.
-      Lbl(RGS_LBL_WARN   ,x,y+RGS_ROW*5,     " ",clrOrange);
+      Lbl(RGS_LBL_WARN   ,x,y+RGS_ROW*6,     " ",clrOrange);
       ChartRedraw(m_chart);
      }
 
@@ -134,14 +140,23 @@ public:
                             const int n_open,const double total_lots,const double net_pnl,
                             const double target,const double tier_lot,const string warn,
                             const int depth_cap,const int group,const double best_pnl,
-                            const double giveback,const double margin_per_lot)
+                            const double giveback,const double margin_per_lot,
+                            const string add_mode,const double quick_per_oz)
      {
       ObjectSetString(m_chart,RGS_LBL_STATE,OBJPROP_TEXT,
                       StringFormat("state  : %s",state));
+      // TWO ceilings, and the panel used to show only the generous one. `depth cap` is the risk
+      // budget; MaxTotalLots permits `lot_cap` positions at this lot size, and that is usually
+      // the smaller. Showing "cap 3 of 18 (lots)" stops the panel promising depth the EA will
+      // never reach - on 2026-09-08 it read "cap 18" while the basket was frozen at 3.
+      int lot_cap=(m_max_lots>0.0 && tier_lot>0.0 ? (int)MathFloor(m_max_lots/tier_lot+1e-9) : 0);
+      string capstr=(lot_cap>0 && lot_cap<depth_cap
+                     ? StringFormat("cap %d of %d (lots)",lot_cap,depth_cap)
+                     : StringFormat("cap %d",depth_cap));
       ObjectSetString(m_chart,RGS_LBL_CYCLE,OBJPROP_TEXT,
-                      StringFormat("cycle  : #%d %s  lot %.2f  batch %d  cap %d",
+                      StringFormat("cycle  : #%d %s  lot %.2f  batch %d  %s",
                                    cycle_id,(cycle_id>0?(is_buy?"BUY":"SELL"):"-"),
-                                   tier_lot,group,depth_cap));
+                                   tier_lot,group,capstr));
       // The target is a FIXED dollar amount, so the $/oz it implies falls as the basket grows.
       // Showing that number is the point: it is what the operator watches, and it is what the
       // old volume-scaled target held constant.
@@ -152,6 +167,17 @@ public:
                                    (oz>0.0 ? target/oz : 0.0)));
       // The give-back arm fires at peak - giveback. Showing both makes it visible WHY a basket
       // closed below its high-water mark instead of looking like a missed target.
+      // The quick arm is only meaningful once ARMED (the basket has been underwater past
+      // QuickExitArmPct). QuickPerOz() returns 0 until then, so show "-" rather than a number
+      // the engine will not act on. Shown in BOTH units: $/oz is what the operator reads off the
+      // chart, the $ figure is what the basket must actually reach.
+      ObjectSetString(m_chart,RGS_LBL_MODE,OBJPROP_TEXT,
+                      quick_per_oz>0.0
+                      ? StringFormat("mode   : %-5s   quick %.3f $/oz = %+.2f",
+                                     add_mode,quick_per_oz,quick_per_oz*oz)
+                      : StringFormat("mode   : %-5s   quick: not armed",add_mode));
+      ObjectSetInteger(m_chart,RGS_LBL_MODE,OBJPROP_COLOR,
+                       (quick_per_oz>0.0 ? clrAqua : clrSilver));
       ObjectSetString(m_chart,RGS_LBL_TRAIL,OBJPROP_TEXT,
                       StringFormat("peak   : %+.2f   exit if <= %+.2f",
                                    best_pnl,(best_pnl>0.0 ? best_pnl-giveback : 0.0)));

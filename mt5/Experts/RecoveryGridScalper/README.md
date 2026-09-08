@@ -282,6 +282,107 @@ below `target`, and price then continues in the same direction after the close. 
 common case, raise `KeepPeakPct` (keep more of the peak, exit later) or `RecoveryArmPct` (arm on a
 bigger peak) rather than reverting — the dead zone must not come back.
 
+## Two modes, and a third exit arm (2026-09-07)
+
+Both are **new behaviour, not tuning**, and both are inputs so the old behaviour is one setting away.
+
+### `AddMode` — TREND (default) or GRID
+
+Until now the grid added **only while the basket was underwater** (`if(net < 0)`). That is what the
+video did: of 261 recorded add events, filtered to those where the OCR was clean *and* the equity
+identity `equity_before − balance == pnl_total_before` holds, **33 of 34 (97%) happened with the
+basket in loss.** The single exception was at +1.1% of balance — noise.
+
+| mode | adds when |
+|---|---|
+| **GRID** | `net < 0` **and** adverse move ≥ `AddStepUSD` — averaging down to recover, exactly as before |
+| **TREND** *(default)* | any move ≥ `AddStepUSD`, **either direction** — a favourable run is also a reason to add |
+
+Cooldown, depth cap, margin floor and lot cap are **identical** in both, so the two differ in exactly
+one line and stay comparable when the logs are analysed. Hotkeys **`T`** and **`G`** switch live.
+
+> **TREND is a deliberate departure from the source.** The rationale is that direction here is the
+> operator's decision, not the algorithm's — so when the call is right, add. Expect it to enlarge
+> **both** tails: every account wipe on record came from carrying too many ounces into a reversal,
+> and this adds ounces precisely when a reversal is closest.
+
+### The QUICK arm — a time-decaying exit, gated on having been underwater
+
+```
+net >= QuickExitPerOz(age) x total_oz
+QuickExitPerOz decays LINEARLY  QuickExitStartUSD -> QuickExitFloorUSD  over QuickExitDecaySec
+```
+
+`net = total_oz × (price − avg_entry)`, so this **is** "price is X above the basket's average
+entry" — the number read off the chart. Decay is motivated by measurement: duration is the strongest
+single predictor of trouble in this log. Cycles finishing inside 40 s had a median worst drawdown of
+**5–15% of balance**; those still open past 40 s had **57–89%**.
+
+**The gate exists because without it the 28.9% target becomes dead code.** Measured: at
+`QuickExitStartUSD = 0.30` the quick arm is nearer than the target on **31 of 31 logged cycles**, so
+it would fire first every single time. Gating it behind *"this basket has been down ≥
+`QuickExitArmPct` of balance"* keeps the target alive on the cycles that never had trouble:
+
+| gate | cycles keeping the 28.9% target | eligible for QUICK |
+|---|---|---|
+| −15% of balance | **16 of 31 (52%)** — the clean winners (+24.36, +26.73, +39.04, +32.29, **+90.25**, +36.38 …) | 15 (48%) |
+
+> **The "clean gap" justification for −15% is REFUTED — see the ordered replay below.** It was
+> claimed here that sick cycles bottom at −56.7% or worse while healthy ones only reach −5.5%, with
+> nothing in between. A tick-ordered replay shows that gap does not exist: **ten of 31 cycles sit
+> within $6 of the arm line**, and the closest is **$0.17**. The gate still keeps the target alive,
+> but it is a knife-edge on roughly a third of cycles, not a choice inside a natural gap.
+
+**All three arms remain IN PROFIT ONLY.** None of them ever closes a red basket — that is the
+observed strategy (88% of video closes were green; cycle 7 was held through a 92%-of-balance
+drawdown) and it is unchanged.
+
+### Inputs
+
+**➡️ [PARAMETERS.md](PARAMETERS.md) is the reference** — units, defaults, worked examples and the
+consequences of changing each one. Summarised here only for the arm this section is about:
+`AddMode` (**Trend**), `EnableQuickExit`, `EnableTimeDecay`, `QuickExitStartUSD` (0.30 $/oz),
+`QuickExitFloorUSD` (0.10), `QuickExitDecaySec` (60), and `QuickExitArmPct` (15.0) — **the gate that
+keeps the target alive**.
+
+### The ordered replay — what it verified, and what it broke
+
+`analysis/video_ocr/replay_quick_arm.py` replays all **31 v2-logged cycles** tick by tick. It
+rebuilds each basket from the real `OPEN` rows (entry time, price, lot), pulls the real ticks for
+the cycle window, activates each leg at the instant it actually filled, and evaluates the arms in
+the order `GridEngine.mqh::OnTick` does — watermarks first, then target → give-back → quick.
+
+The reconstruction is sound: **leg count and total lots match the cycle log exactly on all 31**, and
+replayed `worst_pnl` tracks the logged value closely.
+
+**PASS — the constraint holds.** 0 violations. 16 of 31 cycles never open the gate and so keep the
+28.9% target and the give-back; 11 close on the quick arm; the rest ran to their real close without
+any arm firing inside the window.
+
+**Three things the replay broke, which matter more than the pass:**
+
+1. **The "clean gap" claim is false** (struck through above). Cushions from the arm line: `$0.17`,
+   `$0.53`, `$0.54`, `$0.63`, `$0.85`, `$0.88`, `$3.82`, `$3.82`, `$4.01`, `$4.16` … Ten cycles are
+   within $6 of flipping. The gate is a knife-edge, not a natural boundary.
+2. **Gate state is a function of TIMING, not of the cycle.** `8242/c1` is gate-shut at the moment
+   give-back fires (worst −13.50 vs an arm line of −13.66) but its full-cycle worst is **−31.53** —
+   it would have armed had it lived a few seconds longer. Which arm owns a cycle can change without
+   the cycle changing.
+3. **The broker's tick archive is NOT what the EA saw.** On fast cycles the two disagree badly, in
+   both directions: `2147/c1` replays a peak of **+216.67** where the EA logged **+31.10**; four
+   `target` closes replay peaks of only ~$12–21 against a logged ~$29. So the *which-arm-fires-first*
+   column is indicative, not authoritative. The gate classification is the trustworthy part, because
+   it rests on `worst_pnl`, which does reconcile.
+
+**Still not verified, and not verifiable offline:** that the *MQL5* implements this. The replay
+tests the design in Python. What checks the shipped code is
+[GridEngine.mqh:492-501](RecoveryGridScalper/GridEngine.mqh) by inspection, plus a live run with
+`close_reason = quick` in the log.
+
+Figures of the "+206 / +322" kind from the earlier **unordered** sweeps remain inflated — they let a
+rule capture peaks its arm was not live for — and must not be quoted. The ordered replay above
+replaces them.
+
 ## Using it
 
 1. `cd D:\llm\ios\mt5plus\mt5` then `.\deploy.ps1 -Strategy RecoveryGridScalper`
@@ -458,16 +559,18 @@ close-all → *not stated*. Opened 4 (−1.68), added 5+, ran into profit, close
 **Nothing that sizes or exits is a constant — every one is a fraction of balance.** That is what
 makes the rule scale-free: the same settings fitted a $1.47 account and a $1,181 one.
 
-| Input | Meaning |
-|---|---|
-| `ExitTargetPct` | close all at this **% of the balance the cycle opened with** (default 28.9) |
-| `ExitGivebackPct` | or when the basket retraces this % of balance **from its own peak** (default 15) |
-| `AutoLot` / `ManualLotInput` | lot from the balance tier, or the panel override box |
-| `AddStepUSD` / `AddCooldownSec` | the two add throttles — **both** must pass (0.05 and 2 s) |
-| `MinFreeMargin` | stop adding when free margin drops below this |
-| `MaxTotalLots` | **backstop only.** The binding cap is the balance-derived depth budget |
-| `DailyLossKill` | close all + halt for the day if realised loss exceeds this |
-| `DemoOnly` | refuse to run unless `ACCOUNT_TRADE_MODE == DEMO` |
+**➡️ The full input reference — meaning, units, worked examples, and what breaks if you change each
+one — is [PARAMETERS.md](PARAMETERS.md).** It is the operator manual; this section only records the
+design intent behind the inputs. Do not duplicate the table here: it drifted once already, on the
+single most important row.
+
+> ~~`MaxTotalLots` — **backstop only.** The binding cap is the balance-derived depth budget.~~
+> **WRONG, corrected 2026-09-08.** `MaxTotalLots` is routinely *the* binding cap, not a backstop.
+> On 2026-09-08, five of seven cycles opened one batch and then froze: at `lot 0.33` a fourth
+> position needs 1.32 lots against a 1.00 cap, while the depth budget said 18. The lot cap also
+> steps hard with the lot tier — at balance ≥ $1,500 the tier is 0.99, so **one** position fits, and
+> at ≥ $3,400 the tier is 1.99 and **nothing opens at all**. See
+> [PARAMETERS.md](PARAMETERS.md#the-three-ceilings--why-it-stops-adding).
 
 The batch size and the depth cap are **not** inputs. They come from `RGS_GroupFor(balance)` and
 `RGS_MaxPositionsFor(balance)` in `Utils.mqh`, ported from

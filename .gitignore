@@ -126,10 +126,14 @@ exness_session.txt
 *exness_session*.txt
 *.curl.txt
 
-# Tick captures are CACHE, not source: 422MB today, and two of them
-# (xauusdm_20260811_20260821 at 153MB, ..._20260825 at 197MB) are over GitHub's
-# 100MB hard limit - staging them does not make a big repo, it makes a REJECTED
-# push. Re-pull any window with analysis/export_ticks.py.
+# Tick captures are CACHE, not source (422MB today) - re-pull any window with
+# analysis/export_ticks.py.
+#
+# analysis/.gitignore already drops *.csv, so raw_ticks.csv was covered; the line
+# below is deliberate duplication so the rule survives an edit to that nested file,
+# where nothing signals that a 197MB payload depends on it. The *.zip line is NOT
+# redundant - the nested rule lists only *.csv and *.html, so the 45MB
+# xausd_raw_tick.zip was staged-able until now.
 #
 # The per-capture README.md stays TRACKED on purpose: it records which window was
 # captured and which set is the only true forward test. That provenance is worth
