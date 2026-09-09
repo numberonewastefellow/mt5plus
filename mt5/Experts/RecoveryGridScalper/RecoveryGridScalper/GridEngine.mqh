@@ -67,6 +67,16 @@ private:
    //--- the time-decayed $/oz floor, and which way the grid adds
    bool              m_quick_on, m_quick_decay;
    double            m_quick_start, m_quick_floor, m_quick_arm_pct;
+   //--- THE EXPOSURE CAP, in $/oz. Ounces are capped at balance/m_ruin_move, so gold must move
+   //--- this far against the whole basket to consume the account. Larger = smaller = safer.
+   //--- 0 disables it. See RGS_MaxOuncesFor() in Utils.mqh for the full rationale.
+   double            m_ruin_move;
+   //--- The LAST finished cycle, kept so the panel can still show it. Survives until the next
+   //--- cycle closes; `m_prev_valid` is false until the first one does.
+   SCycle            m_prev;
+   double            m_prev_bal_after;
+   string            m_prev_reason;
+   bool              m_prev_valid;
    int               m_quick_secs;
    ENUM_RGS_ADD_MODE m_add_mode;
    double            m_add_step, m_min_free, m_max_lots, m_kill_pct;
@@ -234,6 +244,14 @@ private:
       if(failed>0)
          Print("RGS *** ",failed," position(s) FAILED TO CLOSE - check the Trade tab. ***");
 
+      // KEEP THE FINISHED CYCLE. `m_cyc.Reset()` on the next line is what used to destroy it, so
+      // the panel's peak/drawdown snapped to 0 the instant a cycle closed and the operator could
+      // not review what had just happened without opening the CSV. Snapshot here, one line before.
+      m_prev          = m_cyc;
+      m_prev_bal_after= bal_after;
+      m_prev_reason   = reason;
+      m_prev_valid    = true;
+
       m_state=RGS_IDLE;
       m_cyc.Reset();
 
@@ -254,7 +272,7 @@ public:
                           const double max_lots,const double kill_pct,const bool auto_restart,
                           const bool quick_on,const bool quick_decay,const double quick_start,
                           const double quick_floor,const int quick_secs,const double quick_arm_pct,
-                          const ENUM_RGS_ADD_MODE add_mode,
+                          const ENUM_RGS_ADD_MODE add_mode,const double ruin_move,
                           const double real_margin_per_lot=0.0)
      {
       m_sym=sym; m_exec=ex; m_log=lg;
@@ -263,7 +281,8 @@ public:
       m_max_lots=max_lots; m_kill_pct=kill_pct; m_auto_restart=auto_restart;
       m_quick_on=quick_on; m_quick_decay=quick_decay; m_quick_start=quick_start;
       m_quick_floor=quick_floor; m_quick_secs=quick_secs; m_add_mode=add_mode;
-      m_quick_arm_pct=quick_arm_pct;
+      m_quick_arm_pct=quick_arm_pct; m_ruin_move=ruin_move;
+      m_prev_valid=false; m_prev_bal_after=0.0; m_prev_reason=""; m_prev.Reset();
       m_margin_per_lot=(real_margin_per_lot>0.0 ? real_margin_per_lot : 0.0);
       m_state=RGS_IDLE; m_next_id=1; m_day_realised=0.0; m_day=0;
       m_day_start_bal=AccountInfoDouble(ACCOUNT_BALANCE);
@@ -284,6 +303,17 @@ public:
       if(!m_quick_on || m_state!=RGS_RUNNING) return 0.0;
       if(m_cyc.worst_pnl > -(m_quick_arm_pct/100.0*m_cyc.balance_open)) return 0.0;
       return QuickExitPerOz();
+     }
+   //--- The last finished cycle, pre-formatted. Built here rather than in the panel or the EA so
+   //--- there is exactly ONE place that knows the layout, and the panel stays a pure renderer.
+   //--- Returns "-" until a cycle has closed.
+   string            PrevSummary() const
+     {
+      if(!m_prev_valid) return "-";
+      return StringFormat("#%d %s lot %.2f  peak %+.2f  dd %+.2f  bal %.2f->%.2f (%s)",
+                          m_prev.id,(m_prev.is_buy?"BUY":"SELL"),m_prev.lot,
+                          m_prev.best_pnl,m_prev.worst_pnl,
+                          m_prev.balance_open,m_prev_bal_after,m_prev_reason);
      }
    ENUM_RGS_ADD_MODE AddMode() const { return m_add_mode; }
    void              SetAddMode(const ENUM_RGS_ADD_MODE m) { m_add_mode=m; }
@@ -357,18 +387,31 @@ public:
          return false;
         }
       double bal=AccountInfoDouble(ACCOUNT_BALANCE);
-      int    cap=RGS_MaxPositionsFor(bal,use);
-      int    grp=RGS_GroupFor(bal,use);
+      int    cap=RGS_MaxPositionsFor(bal,use,m_ruin_move);
+      int    grp=RGS_GroupFor(bal,use,m_ruin_move);
 
       // REFUSE rather than round up. A budget that affords zero positions means this account
       // cannot run this strategy; opening one anyway would be a different, riskier strategy
       // wearing the same name. Ported from grid_state._open_cycle, which does the same.
       if(cap < 1)
         {
-         PrintFormat("RGS: REFUSED - a %.0f%% drawdown budget on %.2f affords 0 positions at "
-                     "%.2f lot. This account is too small for this strategy; it is not a "
-                     "setting you can turn up.",RGS_RISK_PCT,bal,use);
-         m_log.Note(0,StringFormat("REFUSED bal=%.2f lot=%.2f cap=0",bal,use));
+         // Say WHICH cap refused, and - for the exposure cap - exactly what to do about it.
+         // The minimum 0.01 lot is 1 oz, so trading needs balance >= RuinMoveUSD. Telling the
+         // operator "set RuinMoveUSD to X" beats a bare refusal they cannot act on.
+         double max_oz=RGS_MaxOuncesFor(bal,m_ruin_move);
+         if(m_ruin_move>0.0 && max_oz < use*RGS_OZ_PER_LOT)
+            PrintFormat("RGS: REFUSED - the exposure cap allows %.1f oz at balance %.2f with "
+                        "RuinMoveUSD %.2f, but one %.2f lot position is %.0f oz. Needs balance "
+                        ">= %.2f, or set RuinMoveUSD to %.2f (a %.2f move would then end the "
+                        "account).",max_oz,bal,m_ruin_move,use,use*RGS_OZ_PER_LOT,
+                        m_ruin_move*use*RGS_OZ_PER_LOT,bal/(use*RGS_OZ_PER_LOT),
+                        bal/(use*RGS_OZ_PER_LOT));
+         else
+            PrintFormat("RGS: REFUSED - a %.0f%% drawdown budget on %.2f affords 0 positions at "
+                        "%.2f lot. This account is too small for this strategy; it is not a "
+                        "setting you can turn up.",RGS_RISK_PCT,bal,use);
+         m_log.Note(0,StringFormat("REFUSED bal=%.2f lot=%.2f cap=0 ruin_move=%.2f max_oz=%.1f",
+                                   bal,use,m_ruin_move,max_oz));
          return false;
         }
 
@@ -412,13 +455,21 @@ public:
       // `lot cap` is the number of positions MaxTotalLots actually allows at this lot size. It is
       // frequently FAR below `depth cap` - on 2026-09-08 the depth cap said 18 and the lot cap
       // allowed 3 - and it is the one that binds. See PARAMETERS.md, "the three ceilings".
-      int lot_cap=(m_max_lots>0.0 && use>0.0 ? (int)MathFloor(m_max_lots/use+1e-9) : 0);
+      int    lot_cap=(m_max_lots>0.0 && use>0.0 ? (int)MathFloor(m_max_lots/use+1e-9) : 0);
+      double max_oz =RGS_MaxOuncesFor(bal,m_ruin_move);
+      double held_oz=cap*use*RGS_OZ_PER_LOT;
       PrintFormat("RGS CYCLE %d START %s lot %.2f  balance %.2f  batch %d  depth cap %d  "
-                  "lot cap %d  mode %s  margin/lot %.2f  "
+                  "lot cap %d  max oz %.0f (ruin move %.2f $/oz)  mode %s  margin/lot %.2f  "
                   "target %.3f (%.1f%%)  give-back %.3f (%.1f%%)",
                   m_cyc.id,(is_buy?"BUY":"SELL"),use,bal,grp,cap,
-                  lot_cap,RGS_AddModeName(m_add_mode),m_margin_per_lot,
+                  lot_cap,max_oz,m_ruin_move,RGS_AddModeName(m_add_mode),m_margin_per_lot,
                   m_cyc.target,m_target_pct,GiveBack(),m_giveback_pct);
+      // The number the operator should read before clicking: at full depth, how far gold has to
+      // move against the basket to consume the balance, and how far it has to move to hit target.
+      if(held_oz>0.0)
+         PrintFormat("RGS CYCLE %d RISK: at full depth %.0f oz - target needs %.3f $/oz, "
+                     "the account is gone at %.3f $/oz.",
+                     m_cyc.id,held_oz,m_cyc.target/held_oz,bal/held_oz);
       // ...and the same facts as a NOTE, so they land in the TRADES CSV too. The Print above only
       // reaches the Experts log, which is not what the analysis scripts read. Deliberately a NOTE
       // rather than a new cycles-CSV column: a column would change the v2 header mid-file and
@@ -562,8 +613,17 @@ public:
             if(m_cyc.block_logged!=2)
               {
                m_cyc.block_logged=2;
-               m_log.Note(m_cyc.id,StringFormat("add BLOCKED: depth %d/%d - the risk budget is "
-                                                "spent, holding for the bounce",n,m_cyc.depth_cap));
+               // Name WHICH cap bound it. depth_cap is min(staircase budget, exposure cap), and
+               // saying "the risk budget is spent" when the exposure cap was the binder sends
+               // the operator to the wrong dial. Runs once per transition, not per tick.
+               int stair=RGS_MaxPositionsFor(m_cyc.balance_open,m_cyc.lot,0.0);
+               string why=(m_ruin_move>0.0 && m_cyc.depth_cap<stair
+                           ? StringFormat("the EXPOSURE CAP (RuinMoveUSD %.2f -> %.1f oz max)",
+                                          m_ruin_move,
+                                          RGS_MaxOuncesFor(m_cyc.balance_open,m_ruin_move))
+                           : "the risk budget");
+               m_log.Note(m_cyc.id,StringFormat("add BLOCKED: depth %d/%d - %s is spent, "
+                                                "holding for the bounce",n,m_cyc.depth_cap,why));
               }
            }
          // MaxTotalLots. This branch did not exist, so the day's most binding constraint wrote

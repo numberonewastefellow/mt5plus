@@ -383,6 +383,48 @@ Figures of the "+206 / +322" kind from the earlier **unordered** sweeps remain i
 rule capture peaks its arm was not live for — and must not be quoted. The ordered replay above
 replaces them.
 
+## Lot sizing: v1 established vs v2 experimental
+
+**Read this before changing `AutoLot` behaviour.** Two sizing rules exist. Only one has ever traded.
+
+| balance | **v1 tier** (ran live) | **v2 proportional** (EXPERIMENT) | v1 positions | v2 positions |
+|---|---|---|---|---|
+| 500 | 0.10 | 0.10 | 10 | 10 |
+| 647 | 0.33 | 0.12 | **3** | 10 |
+| 1500 | **0.99** | 0.30 | **3** | 10 |
+| 1749 | 0.99 | 0.34 | **3** | 10 |
+| 3400 | **1.99** | 0.68 | **3** | 10 |
+| 8000 | 1.99 | 1.60 | 8 | 10 |
+
+*(positions = what the `RuinMoveUSD = 5.00` exposure cap allows at that lot)*
+
+### v1 — `RGS_TierLot`, the established rule
+
+Balance-threshold steps, ported from the video analysis. **Every live cycle to date ran this**, and
+its results are recorded in full: 73 cycles, **70% winners**, **net −1,029.83**, three accounts lost.
+Preserved in [BASELINE_v1_TIERLOT.md](BASELINE_v1_TIERLOT.md), restorable from git, and kept in the
+code behind `UseLegacyTierLot` so it can be re-run for comparison rather than only read.
+
+### v2 — `lot = balance / (RuinMoveUSD × TargetRungs × 100)`
+
+> ⚠️ **EXPERIMENTAL. Unproven. Not yet measured against P(ruin) or out-of-sample data.**
+> Do not treat any v2 number as established until the replay harness has been validated against
+> history and the result survives a train/test split.
+
+**Why it is being tried.** v1's rung count under the exposure cap runs **1, 2, 6, 10, 3, 6, 3, 3, 5,
+3, 8** as the balance grows — erratic, and at 3 rungs the basket fills at a single price. It then
+**cannot average, so its average entry never moves and its target is frozen** while price runs away.
+That is the exact shape of the 2026-09-09 wipe: three fills, all at **4417.305**, target pinned at
+4415.605, price gone to 4423+.
+
+v2 holds **10 rungs at every balance** and **reproduces v1 exactly at $500** — it agrees with the
+existing design where that design was sane and only removes the cliffs.
+
+**Paired change, not optional.** With the target expressed as `ExitTargetUSD = 0.30 $/oz`, a
+give-back of 15% of balance works out to **0.75 $/oz** — 2.5× *beyond* the target, so the target
+always fires first and the give-back arm becomes dead code. `ExitGivebackUSD ≈ 0.15 $/oz` moves with
+it. See [PARAMETERS.md](PARAMETERS.md).
+
 ## Using it
 
 1. `cd D:\llm\ios\mt5plus\mt5` then `.\deploy.ps1 -Strategy RecoveryGridScalper`
@@ -408,8 +450,27 @@ own volume research + ladder study both land on "predicts move size, not directi
 adverse ticks that wipes the account is a matter of *when*, not *if*.
 
 It is being built as a **research/demo tool to watch the behaviour**, not a money-printer. The safety
-inputs (demo-account guard, `MinFreeMargin` floor, `MaxTotalLots` cap, `DailyLossKill`) are
-**damage-limiters, not a cure**.
+inputs (demo-account guard, `RuinMoveUSD` exposure cap, `MinFreeMargin` floor, `MaxTotalLots` cap,
+`DailyLossKill`) are **damage-limiters, not a cure**.
+
+> **This is not hypothetical — it happened on 2026-09-08.** The account went
+> **1,274.59 → 3,913.90 → 0.00 in 2 minutes 10 seconds**: thirteen winning cycles, then one 1.234 $/oz
+> reversal against 2,985 oz. A $1 reset died the same way 13 cycles later. The prediction above —
+> *many tiny wins, then one adverse run* — is exactly what the log shows.
+>
+> Two corrections to what this README used to claim, both made that day:
+>
+> * **The 44%-of-balance drawdown budget is a GRID model and does not bound TREND.** It assumes each
+>   rung is deeper underwater than the last. In TREND every ounce can be underwater together, and the
+>   budget was breached at **68.6%** and **82.3%** of balance.
+> * **`MaxTotalLots` was never "a backstop".** Until 2026-09-08 it was the *only* thing bounding
+>   exposure; raising it 1.00 → 50.00 is what allowed the wipe.
+>
+> The primary risk control is now **`RuinMoveUSD`** (default 5.00): ounces are capped at
+> `balance ÷ RuinMoveUSD`, and it is mode-independent because it bounds ounces held. It converts ruin
+> into a drawdown — it does **not** make the strategy profitable, and on the same data the set is a
+> net loss with or without it. Full numbers: [PARAMETERS.md](PARAMETERS.md) and
+> [LIVE_RUN_ANALYSIS.md](LIVE_RUN_ANALYSIS.md) §9.
 
 ---
 

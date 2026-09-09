@@ -66,7 +66,7 @@ public:
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_XDISTANCE,x-6);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_YDISTANCE,y-6);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_XSIZE,RGS_W);
-      ObjectSetInteger(m_chart,RGS_BG,OBJPROP_YSIZE,RGS_ROW*10+40);
+      ObjectSetInteger(m_chart,RGS_BG,OBJPROP_YSIZE,RGS_ROW*11+40);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_BGCOLOR,C'22,24,28');
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_BORDER_TYPE,BORDER_FLAT);
       ObjectSetInteger(m_chart,RGS_BG,OBJPROP_COLOR,clrDimGray);
@@ -100,6 +100,7 @@ public:
       Lbl(RGS_LBL_TRAIL  ,x,y+RGS_ROW*3,     "peak   : -",clrSilver);
       Lbl(RGS_LBL_ACCOUNT,x,y+RGS_ROW*4,     "acct   : -",clrSilver);
       Lbl(RGS_LBL_MODE   ,x,y+RGS_ROW*5,     "mode   : -",clrSilver);
+      Lbl(RGS_LBL_PREV   ,x,y+RGS_ROW*6,     "prev   : -",clrSilver);
       // " " and not "": MT5 renders an OBJ_LABEL with EMPTY text as its default
       // caption, the literal word "Label", which sat on the panel looking like a
       // bug. A single space is the empty state.
@@ -141,8 +142,13 @@ public:
                             const double target,const double tier_lot,const string warn,
                             const int depth_cap,const int group,const double best_pnl,
                             const double giveback,const double margin_per_lot,
-                            const string add_mode,const double quick_per_oz)
+                            const string add_mode,const double quick_per_oz,
+                            const string prev)
      {
+      // Pre-formatted by CRgsEngine::PrevSummary(); the panel only renders it. The last cycle's
+      // peak and drawdown used to vanish the instant it closed, so nothing could be reviewed at
+      // the chart.
+      ObjectSetString(m_chart,RGS_LBL_PREV,OBJPROP_TEXT,StringFormat("prev   : %s",prev));
       ObjectSetString(m_chart,RGS_LBL_STATE,OBJPROP_TEXT,
                       StringFormat("state  : %s",state));
       // TWO ceilings, and the panel used to show only the generous one. `depth cap` is the risk
@@ -161,10 +167,15 @@ public:
       // Showing that number is the point: it is what the operator watches, and it is what the
       // old volume-scaled target held constant.
       double oz=total_lots*RGS_OZ_PER_LOT;
+      // Two $/oz numbers side by side, because they are the same dial: the target sits at
+      // ExitTargetPct of the RUIN distance, always. Seeing "tgt 1.45 $/oz | ruin 5.02 $/oz"
+      // makes the trade the operator is taking explicit before it goes wrong.
+      double ruin=(oz>0.0 ? AccountInfoDouble(ACCOUNT_BALANCE)/oz : 0.0);
       ObjectSetString(m_chart,RGS_LBL_BASKET,OBJPROP_TEXT,
-                      StringFormat("basket : %d/%d pos  net %+.2f / tgt %.2f  (%.3f $/oz)",
+                      StringFormat("basket : %d/%d pos  net %+.2f / tgt %.2f  (%.3f $/oz | "
+                                   "ruin %.2f)",
                                    n_open,depth_cap,net_pnl,target,
-                                   (oz>0.0 ? target/oz : 0.0)));
+                                   (oz>0.0 ? target/oz : 0.0),ruin));
       // The give-back arm fires at peak - giveback. Showing both makes it visible WHY a basket
       // closed below its high-water mark instead of looking like a missed target.
       // The quick arm is only meaningful once ARMED (the basket has been underwater past

@@ -614,6 +614,471 @@ transient. Parked, with the operator's decision to keep the demo at 1:Unlimited,
 rules **unchanged** · fix the logging first, then decide with data. Operator manual written:
 [PARAMETERS.md](PARAMETERS.md).
 
+### 2026-09-08 20:00:53 — ACCOUNT WIPED. The sizing rule, and the exposure cap that replaces it
+
+**1,274.59 → 3,913.90 → 0.00 in 2 minutes 10 seconds**, broker stop-out, equity **−79.68**
+(negative-balance protection absorbed the rest). A $1 reset then grew to ~$7 over 13 cycles and lost
+all of it on the 14th. **Both accounts died the same way on the same afternoon.**
+
+**Attribution.** This ran on the *previous* binary. That evening's build hit disk at 20:05:33 and
+loaded at 20:13:14 — after the wipe — and was logging-only. Sizing and TREND were identical in both.
+
+**Trigger.** `MaxTotalLots` raised **1.00 → 50.00** at 19:58:22, to stop position rejections. Those
+rejections were the risk control.
+
+**The final cycle** — SELL, lot 1.99, 15 positions, **29.85 lots = 2,985 oz on $3,913**. Five
+batches into a **$2 band in 10 seconds**; `AddStepUSD = 0.05` throttled nothing, the 2 s cooldown
+was the only brake and gold moved ~1 $/oz between batches. Avg entry 4396.191, exit 4397.425 →
+**1.234 $/oz × 2,985 oz = −$3,683** plus $328 commission.
+
+**The defect.** The depth cap does shrink as the lot grows — 18 → 12 from lot 0.33 to 0.99 — but
+**volume doubles** (5.94 → 11.88 lots). Across the whole ladder the ruin distance was near-constant:
+
+| balance | lot | cap | ounces | eff. leverage | $/oz to WIPE |
+|---|---|---|---|---|---|
+| 471 | 0.10 | 24 | 240 | 2,242× | 1.96 |
+| 1512 | 0.99 | 12 | 1188 | 3,457× | 1.27 |
+| 3913 | 1.99 | 15 | 2985 | 3,357× | **1.31** |
+
+**A $1.3–1.9 move took the whole account at any balance.** Cycle 6 died on 1.234.
+
+**Why the 44% budget did not hold.** `RGS_MaxPositionsFor` prices drawdown as a staircase with rungs
+`RGS_RISK_STEP = 0.18` apart. Live, batches landed ~1 $/oz apart (cooldown-throttled, not
+step-throttled), and **TREND adds on favourable moves**, so there is no staircase at all — every
+ounce is underwater together on a reversal. `Utils.mqh`'s "0.18-with-a-0.05-step is conservative"
+argument holds for **GRID only**; the comment is now corrected in place. Measured: with the lot cap
+at 1.00, worst drawdown across 8 cycles was 20.5%; uncapped, **68.6% and 82.3%** — breached twice.
+
+**The identity behind all of it:**
+
+```text
+target move  =  ExitTargetPct × ruin move   =   0.289 × ruin move
+```
+
+The target always sits **29% of the way to ruin**, for any sizing, any balance. Reaching the target
+easily and surviving a reversal are one dial turned opposite ways. That is the strategy, not a bug.
+
+**Fix shipped: `RuinMoveUSD` (default 5.00), the exposure cap.** Ounces capped at
+`balance ÷ RuinMoveUSD`; `RGS_MaxPositionsFor` now returns `min(staircase, exposure cap)`. It is
+**mode-independent by construction** — it bounds ounces held, and ounces do not care whether GRID or
+TREND acquired them. Ruin distance becomes a near-constant **5–7 $/oz** instead of 1.3–1.9. The
+staircase model is kept only for parity with `lot_position_engine.py` and is no longer load-bearing.
+
+**Scored against winners AND catastrophes, per §7** — truncating each cycle's legs at the cap and
+re-pricing at the same logged exit price:
+
+| | net actual | net capped | delta |
+|---|---|---|---|
+| run 5506 (8 cycles, already clamped at 1.00 lot) | +803.32 | +781.84 | −21.48 |
+| 7502/c4 — a winner it shrinks badly | **+1324.33** | **−52.57** | **−1376.90** |
+| 7502/c6 — the wipe | **−3993.58** | **−1244.15** | **+2749.43** |
+| **all cycles** | **−552.04** | **−238.73** | **+313.31** |
+| ending balance | **0.00 (wiped)** | **232.54** | |
+
+**This is not a free win and is not being presented as one.** It costs real upside — `c4` turns a
++1,324 winner into a −53 loser, the same shape that got Lever C refuted. It barely touches a
+sanely-sized run (−21 across all of run 5506). **And the set is still a net loss either way.** The
+cap converts ruin into a drawdown; it does not make the strategy profitable.
+
+**Side effect, documented not hidden:** the cap implies a minimum viable balance of `RuinMoveUSD`,
+because the smallest lot is 1 oz. At the default a **$1 account is refused**, with a message naming
+the setting to change. That refusal is honest — 1 oz on $1 has a ruin move of $1, and no parameter
+alters that.
+
+**Lever status:** **Lever B is now IMPLEMENTED** — it was the only lever left standing, and this is
+the direct evidence for it. A deferred · C refuted.
+
+### 2026-09-08 (late) — first exposure-cap session: both arms confirmed, and four open findings
+
+Balance reset to $500. **Recorded before deciding anything, on the operator's instruction — no
+exit-rule or sizing change was made on this evidence.**
+
+#### 1. Both exit arms confirmed working, live
+
+| cycle | lot | pos | outcome |
+|---|---|---|---|
+| 1 | 0.10 | 10/10 | clean (worst −5.52) → quick never armed → ran to **target**, 44 s, **+147.25** |
+| 2 | 0.33 | 3/3 | worst **−309.78** (47.9% of balance) → gate opened, decay pulled the bar to **0.100 $/oz**, banked the bounce → **quick**, 214 s, **+18.51** |
+
+Cycle 2 also displayed the **give-back dead zone** on the panel (`peak +63.84  exit if <= -33.25` —
+a negative trigger, unreachable while green). The quick arm is what rescued it.
+
+#### 2. Cycle 1 waited 44 s because 28.9% no longer transfers
+
+The basket was full in **8 seconds**; the other 34 were spent waiting for price to travel.
+
+```text
+target move ($/oz)  =  ExitTargetPct x ruin move
+   the video (1-3 oz on $1.47-2.00)   ruin ~0.7-1.5  ->  0.19-0.43 $/oz   (matches its 0.10-0.30 exits)
+   this account BEFORE the cap        ruin  2.08     ->  0.60 $/oz
+   this account NOW                   ruin  5.00     ->  1.445 $/oz
+```
+
+**28.9% was calibrated against the video's ruin distance of ~1 $/oz.** Raising ruin to 5.00 — the
+change that made the account survivable — pushed the target from a ~0.30 move to a ~1.45 move.
+Arithmetic, not a bug. The two settings are **one dial** and cannot be tuned separately.
+
+#### 3. ExitTargetPct swept over 63 cycles
+
+| pct | closed | total net | median s | target | give-back | quick | never exited |
+|---|---|---|---|---|---|---|---|
+| **28.9% (current)** | 32 | +1429.80 | 15 | 10 | 9 | 13 | **31** |
+| **20.0%** | 43 | **+1877.26** | 13 | 28 | 3 | 12 | 20 |
+| 15.0% | 47 | +1695.32 | 11 | 41 | 0 | 6 | 16 |
+| 10.0% | 51 | +1164.62 | 7 | 49 | 0 | 2 | 12 |
+| 6.0% | 55 | +842.13 | 5 | 54 | 0 | 1 | 8 |
+| 4.0% | 57 | +640.51 | 3 | 57 | 0 | 0 | 6 |
+
+**20% wins on every measured axis:** +447 over 28.9%, faster, and 43 cycles closed by a rule instead
+of 32. **The give-back arm dies at ≤15%** (9 → 3 → 0) — once `ExitTargetPct <= ExitGivebackPct` the
+target always fires first, so any move to 15% or below must lower `ExitGivebackPct` in the same
+change.
+
+**Caveat that cuts against the current setting:** "total net" counts only cycles an arm actually
+closed. The "never exited" column — closed some other way, including stop-outs — contributes
+nothing, so **every row flatters itself and 28.9% flatters itself most** (31 hanging vs 6).
+
+> An earlier `ExitTargetPct ≈ 6%` suggestion was drawn from **one** cycle and is **refuted** by this
+> sweep. That cycle simply suited it. Recorded as another instance of the §7 rule.
+
+#### 4. Cycle 4 — the quick arm missed arming by $3.26
+
+```text
+balance 718.13   4 x 0.33 = 132 oz   avg entry 4393.158
+quick GATE needs worst <= -107.72     actual worst -104.46   <- SHORT BY $3.26
+```
+
+Tick-verified: deepest −104.48 at 30 s; green at 35 s; +78.08 at 55 s; **+146.98 at 65 s**; give-back
+fired at peak − 107.72 = +47.31, closing at 71 s for **+25.30 net**.
+
+Had the gate opened, the arm would have fired at **35 s** for ~**+10.50 net**. **The give-back path
+made 2.4× more** — on this cycle, failing to arm was the *luckier* outcome, at the cost of 36 extra
+seconds and a −104 drawdown. Both are true.
+
+**Third knife-edge instance for the −15% gate** ($0.17, $3.26, and ten of 31 within $6). At −15% it
+is close to a coin flip on a large share of cycles.
+
+#### 5. The lot tier and the exposure cap are set independently
+
+```text
+bal 500.00 -> lot 0.10 (10 oz each), cap 100.0 oz -> 10 positions
+bal 647.25 -> lot 0.33 (33 oz each), cap 129.4 oz ->  3 positions
+```
+
+Crossing $600 flips the tier. The cap holds **risk** near-constant (100 vs 129 oz), but the tier
+decides how coarsely it is chopped: **10 rungs became 3**. With 3 rungs and no room to add, cycle 2
+sank to 48% of balance. Above $1,500 the tier is 0.99 and the cap allows **one**. Deriving the lot
+from the cap — `lot = max_oz / (rungs × 100)` — would hold the rung count steady. Not built.
+
+**Shipped this session:** the previous-cycle panel row (`prev : #1 SELL lot 0.10 peak +148.59
+dd -5.52 bal 500.00->647.25 (target)`), because `peak` reset to 0 on close and a finished cycle could
+not be reviewed at the chart. No trading logic touched.
+
+**Deferred, deliberately:** the −15% gate, `ExitTargetPct`/`ExitGivebackPct`, and lot-from-cap
+sizing. Gather more cycles first.
+
+### 2026-09-09 — causality corrected, the sweep refined, and cycle 7
+
+#### The exposure cap moved the target — `ExitTargetPct` was never changed
+
+Worth stating plainly because it was asked directly. `ExitTargetPct` has been **28.9% throughout**.
+What moved the target in *price* terms is `RuinMoveUSD = 5.00`:
+
+```text
+target $/oz  =  ExitTargetPct x (balance / ounces)
+```
+
+At balance 500: **240 oz → 0.60 $/oz** before the cap, **100 oz → 1.445 $/oz** after. Same
+percentage, 2.4× further away, because the basket holds 2.4× fewer ounces. **This was the deliberate
+trade for survivability after two wipes at a ~1.3 $/oz ruin distance — but the side-effect on the
+target should have been stated when the cap was deployed, not discovered a cycle later.**
+
+The video's ~0.30 exits come from the same formula: 1–3 oz on a $1.47–2.00 balance is a ruin
+distance of ~0.7–1.5 $/oz, and 28.9% of that is **0.19–0.43 $/oz**. Same rule, enormous leverage.
+
+#### Finer ExitTargetPct sweep — the peak is 21%, on a flat 20–22% plateau
+
+The previous entry reported "20% is the peak" from six coarse points. Re-run on **66 cycles**:
+
+| pct | closed | total net |
+|---|---|---|
+| 28.9% (current) | 34 | +1483.35 |
+| 24% | 40 | +2123.40 |
+| 22% | 44 | +2295.38 |
+| **21%** | 44 | **+2337.82** |
+| 20% | 46 | +2302.83 |
+| 18% | 46 | +2181.53 |
+| 15% | 50 | +1989.55 |
+
+**The optimum is a broad plateau at 20–22%** — anywhere in it is equivalent, so precision beyond
+"about 21%" is false confidence. Totals differ from the previous table (+1483 vs +1430 at 28.9%)
+because the set grew from 63 to 66 cycles. Still **not applied** — operator's decision.
+
+#### Cycle 7 — "every position is green, why no exit?" Answer: waiting for the target
+
+SELL, balance 953.45, 5 positions = 165 oz, entries clustered at 4425.635 (×3) and 4426.4 (×2):
+
+```text
+ sec        ask  | per-position P&L                | BASKET
+   3   4426.125  | -16.2 -16.2 -16.2  +9.4 +11.6   |  -27.49
+  12   4425.315  | +10.6 +10.6 +10.6 +36.2 +38.3   | +106.16   <- the state observed
+  24   4425.925  |  -9.6  -9.6  -9.6 +16.0 +18.2   |   +5.51   <- nearly gave it ALL back
+  30   4424.205  | +47.2 +47.2 +47.2 +72.8 +74.9   | +289.31   -> TARGET fires
+```
+
+At +106.16: target needed **275.55**; the give-back trigger was **−18.71** (negative — dead zone);
+the quick gate needed worst ≤ **−143.02** and worst was **−104.38**, short by **$38.64**. **No arm
+could fire.** Closed on target at 30 s, **net +236.63**.
+
+**Two things to carry forward:**
+
+1. **The engine closes on BASKET net, never per position.** Split entry clusters make individual
+   tickets show wildly different P&L while the total is far from any threshold. This is the second
+   time a per-position view has driven an "it should have exited" expectation.
+2. **Waiting paid, but narrowly.** Exiting at 12 s banks ~+88 net; it made +236.63. Yet at 24 s the
+   basket was back to **+5.51** — it nearly surrendered everything before the spike. **Third
+   consecutive cycle where the early-exit instinct would have made less money.** That is an argument
+   for measuring across many cycles, not for dismissing the instinct.
+
+Unlike cycle 4's $3.26, this gate miss was a clear $38.64 — the gate behaved correctly here.
+
+#### Open design item: time decay for a basket that is in PROFIT
+
+The decay/bounce exit currently reaches only baskets that first went `QuickExitArmPct` (15%)
+underwater, so **a cycle green from the start has no fast exit at all** (cycle 1: `quick: not armed`,
+44 s hold). The operator wants the decay available on a bounce-back in profit too.
+
+**The tension to resolve before building it:** removing the underwater gate is exactly what the gate
+exists to prevent — ungated at 0.30 $/oz the quick arm beats the target on **31 of 31** cycles and
+the target becomes dead code, a standing hard constraint. Any design must keep the target alive and
+be scored against winners **and** catastrophes first. Recorded; not designed, not built.
+
+### 2026-09-09 15:00:51Z — THIRD WIPE. The exposure cap held, and it did not matter
+
+Cycle 12: SELL, 3 × 0.99 lot = **297 oz** on balance **1,748.76**, stopped out at equity −169.26.
+133 s. This is the third account lost (2026-09-08 ×2, 2026-09-09 ×1).
+
+**The cap was not breached.** `RuinMoveUSD = 5.00` allowed **349.8 oz**; the basket held **297**.
+Ruin distance was `1748.76 / 297 = 5.888 $/oz`. Then gold moved:
+
+```text
+sec 130   ask 4418.617   net  -389.66
+sec 140   ask 4427.783   net -3111.97      <- +9.17 $/oz in UNDER TEN SECONDS
+```
+
+**Misjudgement to record against my own recommendation.** `RuinMoveUSD = 5.00` was chosen and
+described as "far outside normal excursions" on a sample of **0.45–1.97 $/oz** measured over a few
+quiet hours. Today's move was **4.6× the largest excursion in that sample**. The sample was too
+small and too short to support the claim, and the claim was load-bearing.
+
+**The structural point, which outranks the number:** no value of `RuinMoveUSD` prevents this. It
+only sets *how large* a move is fatal. With **no stop loss**, a sufficiently fast spike always wins —
+`RuinMoveUSD = 9` would also have died today. Real protections are a broker-side stop, exposure so
+small the target is unreachable, or not holding through spike windows. A stop loss is **deferred by
+the operator**, deliberately.
+
+**Arm-by-arm, tick-verified — and it corrects the first reading of this cycle.** The quick arm
+**did** arm, at **66 s**; past `QuickExitDecaySec = 60` the decay was already at its **floor,
+0.10 $/oz = +$29.70**. But the basket **never returned to profit** — zero ticks green after arming,
+best −176.42. The +182.95 peak happened *before* it went underwater. **Time decay worked; price
+never came back.**
+
+| arm | needed | reachable? |
+|---|---|---|
+| Target | 505.39 (1.70 $/oz) | never close |
+| Give-back | retrace 262.31 from a peak that never exceeded **182.95** | **impossible — dead zone** |
+| Quick | armed 66 s, needed +29.70 | armed, but never green again |
+
+**The give-back dead zone has now cost three accounts.** At `ExitGivebackPct = 5%` the trigger would
+have been `182.95 − 87.44 ≈ +95`, firing near 55 s and leaving the account around **1,838 instead of
+0**. Candidate fix: express give-back as a fraction of the **peak**, not of balance, which removes
+the dead zone by construction. **Not applied — must be swept against winners and catastrophes
+first.**
+
+**Operator's direction after this wipe:** three separate problems — (1) the lot tier cliff starving
+the grid of rungs, (2) the target distance, (3) the exit arms in a losing cycle — each analysed on
+its own, **fixed only on statistics, not blindly**. Stop loss parked. `RuinMoveUSD` stays 5.00 until
+1–3 are measured.
+
+**Tooling added:** `mt5/tools/export_history.py` — read-only (`history_deals_get`), emits a
+per-position CSV and a per-**basket** CSV carrying `avg_entry`, `avg_exit` and `diff_usd_per_oz`,
+which is the quantity every exit rule actually acts on.
+
+### 2026-09-09 — ⚠️ THE TABLE IN THIS ENTRY IS WRONG. See the correction entry that follows it.
+
+> **Retained deliberately, struck through, because the error is instructive.** Every figure in the
+> table below was computed with `logged_net` sourced from the cycles CSV's **`realised`** column.
+> On a broker stop-out `realised` is **0.00** while `net_broker` carries the real damage. The
+> comparison therefore **priced account-destroying cycles at zero** and reported +5904 for a
+> configuration that wiped the account three times. The conclusion drawn from it — "the give-back
+> fix is refuted" — is also wrong. **Read the next entry.**
+
+### ~~2026-09-09 — the give-back "fix" is REFUTED~~ (SUPERSEDED — see above and below)
+
+The dead-zone fix proposed above (give-back as a fraction of the **peak**) was swept over **73
+cycles** before adoption, per the §7 rule. Every cycle counted once: by the simulated rule where it
+fires, otherwise at its **real logged outcome**, stop-outs included.
+
+| give-back rule | rule-closed | net (rule) | net (actual) | **TOTAL** |
+|---|---|---|---|---|
+| **15% of balance (current)** | 36 | +1845.60 | +4058.43 | **+5904.03** |
+| 10% of balance | 49 | +1325.34 | +2938.19 | +4263.53 |
+| 5% of balance | 59 | −189.71 | −159.70 | −349.41 |
+| 50% of peak | 63 | −394.04 | +35.96 | −358.08 |
+| 30% of peak | 63 | −206.58 | +35.96 | −170.62 |
+| 20% of peak | 63 | −170.42 | +35.96 | −134.46 |
+
+**REFUTED.** "% of peak" turns +5904 into −134. The `5% of balance` variant — the one that would
+have saved cycle 12 — scores **−349** across the book. They close 63 cycles instead of 36, but each
+banks so little that the losers swamp them. **The dead zone is real and cost three accounts; closing
+it costs more than it saves.** Fourth instance of the same error pattern (Lever A, Lever C, the
+"−15% clean gap", now this).
+
+#### ⚠️ The methodological problem this exposes — read before trusting ANY table above
+
+**Summing per-cycle P&L is the wrong objective for this strategy.** Three of these cycles took the
+account to **zero**. A sum of +5904 cannot be collected from a sequence that goes bankrupt partway
+through: once balance reaches zero the sequence ends and every later term is unreachable.
+
+That is the martingale signature — **positive expectancy per cycle, negative terminal wealth** — and
+the rule scoring best on the sum (15% of balance) is precisely the rule under which the account died
+three times.
+
+**Therefore the table above does not license "keep 15%".** It licenses a different measurement:
+
+> **A sequential, compounding replay with ruin as an absorbing state.** Start from a balance, size
+> each cycle off the *running* balance, apply outcomes in time order, **stop dead at zero**, and
+> compare **terminal wealth and survival rate** rather than a sum of independent cycles.
+
+Every parameter conclusion drawn this session — the 20–22% `ExitTargetPct` plateau included — rests
+on summed per-cycle P&L and inherits this flaw. **They must be re-scored against terminal wealth
+before any of them is adopted.** Recorded as the top open item.
+
+### 2026-09-09 (corrected) — `realised` vs `net_broker`, and what the data actually says
+
+**The bug.** `replay_quick_arm.load_cycles` sourced `logged_net` from the cycles CSV's **`realised`**
+column. On a broker **stop-out** `realised` is **0.00** while `net_broker` carries the damage
+(**−1918.02** for cycle 12); `realised` also excludes commission, so **all 73 cycles differ between
+the two columns**. Any comparison that priced fall-through cycles at `logged_net` was **valuing
+account-destroying cycles at zero**. Fixed at `replay_quick_arm.py:114` with a comment naming the
+trap; `ruin_replay.py` imports the same loader and inherits it.
+
+**The corrected result.** `ruin_replay.py` — sequential, compounding, **ruin absorbing**, 2000
+resampled orderings, $500 start:
+
+| give-back rule | sum of nets | terminal | ruined | **P(ruin)** |
+|---|---|---|---|---|
+| **15% of balance (current)** | **−946.38** | **0.00** | **YES** | **95.2%** |
+| 10% of balance | −2453.45 | 0.00 | YES | 95.2% |
+| 5% of balance | −570.69 | 0.00 | YES | 63.4% |
+| 50% of peak | −548.01 | 0.00 | YES | 63.4% |
+| 30% of peak | −360.55 | 0.00 | YES | 63.4% |
+| **20% of peak** | −324.39 | 0.00 | YES | **63.4%** |
+
+**Three retractions:**
+
+1. **"+5904.03" for the current settings was wrong.** True sum: **−946.38**.
+2. **"The give-back fix is refuted" was wrong.** On ruin probability the %-of-peak variants are
+   *better* — **63.4% vs 95.2%** — and lose less. That refutation rested on corrupted data.
+3. **The real finding is worse than either version.** **Every configuration tested loses money and
+   every one ruins.** Current settings ruin in **95.2%** of orderings. This is not a tuning problem;
+   no give-back setting rescues it.
+
+This is finally consistent with reality: the account died three times in two days. **The earlier
+positive totals were never real.**
+
+**Not affected by this bug:** the `ExitTargetPct` sweeps summed only rule-closed cycles and never
+read `logged_net`, so the 20–22% plateau is not corrupted by *this* — though it retains the separate
+flaw that excluding never-exited cycles flatters the slower setting.
+
+**Root cause of the error, for the standing rule:** a field name was trusted without checking which
+column fed it. Cross-verify the *source* of every number, not just its value.
+
+**Where this leaves the strategy.** With `RuinMoveUSD = 5.00`, `ExitTargetPct = 28.9%` and the
+current arms, the measured ruin probability over 73 real cycles is **95.2%**. Adopting the best
+give-back variant only moves it to **63.4%**. Neither is a viable configuration, and no combination
+tested so far produces a surviving account. **The next question is not which parameter to tune but
+whether any parameterisation of this strategy survives** — which is what the `--sweep` modes of
+`ruin_replay.py` exist to answer.
+
+### 2026-09-09 — CORRECTION: rung count DOES move the target. Operator was right.
+
+**Retracted:** ~~"the target distance depends on OUNCES, not on the number of positions — 3 × 0.99
+and 30 × 0.099 are both 297 oz and give an identical target."~~
+
+That is true **only when both baskets share the same average entry**, which is exactly what
+averaging changes. Positions opened at different times fill at different prices:
+
+```text
+target price  =  avg_entry  ±  (ExitTargetPct x balance) / ounces
+                 ^^^^^^^^^        <- this part is fixed by ounces
+                 ^^^^^^^^^ ...but THIS part MOVES as you add at new prices
+```
+
+`avg_entry` tracks price as the basket adds, so **the target price travels with it**. That is the
+purpose of the TREND/GRID add logic. A basket that cannot add has a target **frozen** while price
+runs away — which is cycle 12 precisely: **all three fills at the identical price 4417.305**, zero
+spread, target pinned at 4415.605 while price ran to 4423+.
+
+**Consequence:** the lot-tier cliff (Problem 1) is more serious than the earlier entry implied. It
+does not merely coarsen the grid — by preventing adds entirely it **freezes the target**, removing
+the mechanism the strategy relies on to recover.
+
+**A forward simulation of cycle 12 at lots 0.99 → 0.05 was attempted and its results are
+WITHDRAWN.** At the historical lot it failed to reproduce the historical cycle — it entered at
+4416.859 where the EA filled at 4417.305, and that 0.45 difference flipped a −1918 stop-out into a
++46 quick exit. A model that cannot reproduce the one case with a known answer cannot be trusted for
+counterfactuals, so no number from it is recorded here.
+
+**A trustworthy sizing test must:** anchor the first fill to the logged entry time and price;
+reproduce broker fills from the `bid`/`ask` columns the trades CSV already records; **validate
+against the historical outcome at the historical lot before any other lot is believed**; and run in
+`grid_replay.py`, which drives `grid_state.GridState` over ticks with an MT5-like broker, rather than
+in a throwaway script. **Problem 1 therefore remains unmeasured.**
+
+### 2026-09-09 — the win rate, and the break-even bar
+
+Recorded because the operator's reading of the wipes is largely right and deserves the numbers
+beside it.
+
+> **Operator's assessment:** the strategy performs very well when the trend is known; the account was
+> wiped because the *direction* was wrong — a trader's call, not a fault of the algorithm.
+
+Across all **73 logged cycles**:
+
+| | count | total | average |
+|---|---|---|---|
+| winners | **51 (70%)** | +5,751.88 | **+112.78** |
+| losers | 22 (30%) | −6,781.71 | **−308.26** |
+| | | **NET −1,029.83** | |
+
+**What supports the assessment.** Direction is entirely the operator's input — the EA never chooses
+it, it only manages the basket after `BUY`/`SELL`. A **70% win rate** is real and matches the
+independent Python finding of 71%. The wipes were adverse directional runs, which a basket with no
+stop loss cannot escape.
+
+**What qualifies it, as arithmetic.** The average loser is **2.73× the average winner**, so the
+break-even win rate is:
+
+```text
+p x 112.78 = (1 - p) x 308.26   ->   p = 308.26 / 421.04 = 73.2%
+```
+
+**Direction must be right 73.2% of the time merely to break even.** Observed is 70% — which is
+precisely why 73 cycles with a majority of winners still netted −1,029.83. The strategy is therefore
+not "sound apart from the direction calls"; it is sound **conditional on better than 73% directional
+accuracy on gold over ~40-second horizons**. That is the bar every proposed fix should be judged
+against.
+
+**Why the ratio is 2.73:1 — and what to aim at.** With no stop loss a losing basket runs until the
+broker closes it, while a winner stops at its target. Six of 73 cycles (8%) lost more than half the
+balance they opened with; the two largest, −3,993.58 and −1,918.02, were both `external` stop-outs.
+**Narrowing that asymmetry, not raising the win rate, is what the sizing and target work targets** —
+every point shaved off the 73.2% bar is worth more than a point of directional accuracy.
+
+Baseline preserved in [BASELINE_v1_TIERLOT.md](BASELINE_v1_TIERLOT.md); v1-vs-v2 sizing comparison in
+[README.md](README.md).
+
 ---
 
 ## 10. How to reproduce any figure here

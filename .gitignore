@@ -140,3 +140,8 @@ exness_session.txt
 # keeping even though the rows behind it are regenerable.
 analysis/tick_data/**/raw_ticks.csv
 analysis/tick_data/**/*.zip
+
+# Trade history exported by mt5/tools/export_history.py. CACHE, not source - regenerate any window
+# with that script. It is per-account trade data (entry/exit prices, P&L) and does not belong in the
+# repo; same reasoning as analysis/tick_data/**/raw_ticks.csv above.
+mt5/tools/out/

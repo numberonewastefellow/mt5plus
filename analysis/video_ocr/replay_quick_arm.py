@@ -111,7 +111,12 @@ def load_cycles(date: str) -> list[Cycle]:
                         target=float(r["target"]),
                         balance_open=float(r["balance_before"]),
                         logged_reason=r["close_reason"],
-                        logged_net=float(r["realised"]),
+                        # net_broker, NOT realised. On a broker STOP-OUT `realised` is 0.00 while
+                        # net_broker carries the actual damage (-1918.02 on 2026-09-09 cycle 12),
+                        # and `realised` excludes commission on every row. Using `realised` here
+                        # priced account-destroying cycles at ZERO and produced a +5904 "profit"
+                        # for a configuration that in reality wiped the account three times.
+                        logged_net=float(r["net_broker"]),
                     )
                 )
             except (KeyError, ValueError):

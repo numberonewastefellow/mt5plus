@@ -83,6 +83,7 @@ string RGS_AddModeName(const ENUM_RGS_ADD_MODE m)
 #define RGS_LBL_ACCOUNT           RGS_PFX "lbl_account"
 #define RGS_LBL_TRAIL             RGS_PFX "lbl_trail"
 #define RGS_LBL_MODE              RGS_PFX "lbl_mode"
+#define RGS_LBL_PREV              RGS_PFX "lbl_prev"
 #define RGS_LBL_LOT               RGS_PFX "lbl_lot"
 #define RGS_LBL_WARN              RGS_PFX "lbl_warn"
 #define RGS_BG                    RGS_PFX "bg"

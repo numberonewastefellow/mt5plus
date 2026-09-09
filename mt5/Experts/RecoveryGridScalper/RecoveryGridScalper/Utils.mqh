@@ -57,6 +57,25 @@ double RGS_TierLot(const double balance)
 //| step makes the cap CONSERVATIVE - it allows fewer positions than  |
 //| the budget strictly permits - which is the safe direction and the |
 //| reason it is left alone.                                         |
+//|                                                                  |
+//| *** THAT LAST PARAGRAPH IS TRUE FOR **GRID** ONLY. ***            |
+//| Corrected 2026-09-08, after the account was wiped in 2m10s.       |
+//| The staircase model assumes each new rung is DEEPER UNDERWATER    |
+//| than the last, so a full-depth basket loses the sum of a          |
+//| staircase. Two things break that live:                            |
+//|   1. Rungs are not 0.18 apart. In a fast move the 2s cooldown -   |
+//|      not AddStepUSD - sets the spacing; five batches landed        |
+//|      ~1 $/oz apart inside a $2 band in 10 seconds.                |
+//|   2. TREND adds on FAVOURABLE moves. There is then no staircase   |
+//|      at all: every ounce is underwater together on a reversal.    |
+//| Measured: with the lot cap removed, the 44% budget was breached   |
+//| at 68.6% and 82.3% of balance on the same afternoon.              |
+//|                                                                  |
+//| The budget is therefore NO LONGER the risk control. It is kept    |
+//| for parity with lot_position_engine.py, but every caller takes    |
+//| min(staircase, EXPOSURE CAP) - see RGS_MaxOuncesFor below, which  |
+//| is mode-independent because it bounds OUNCES HELD, and ounces do  |
+//| not care how they were acquired.                                  |
 //+------------------------------------------------------------------+
 #define RGS_RISK_STEP   0.18      // calibration step for the budget, NOT the live add step
 #define RGS_RISK_PCT    44.0      // observed median drawdown, % of the balance a cycle opened with
@@ -74,10 +93,53 @@ int RGS_GroupLadder(const double balance)
    return 3;
   }
 
+//+------------------------------------------------------------------+
+//| THE EXPOSURE CAP - the risk control, as of 2026-09-08.            |
+//|                                                                  |
+//| PURPOSE, in one sentence: hold few enough ounces that gold has to |
+//| move `ruin_move` dollars against the whole basket before the      |
+//| account is gone.                                                  |
+//|                                                                  |
+//|     max_ounces = balance / ruin_move                              |
+//|                                                                  |
+//| So `ruin_move` is the distance to RUIN, not a distance you        |
+//| survive: at exactly that move the balance is consumed. LARGER     |
+//| VALUE = SMALLER POSITIONS = SAFER. Safety comes from setting it   |
+//| far outside normal excursions - observed adverse excursions on    |
+//| 2026-09-08 were 0.45-1.97 $/oz, so at the 5.00 default the worst  |
+//| of them costs 39% of balance and the move that actually wiped the |
+//| account (1.234 $/oz) costs 24.7% instead of 94%.                  |
+//|                                                                  |
+//| WHY THIS AND NOT A LOT COUNT. MaxTotalLots is a fixed number of   |
+//| lots, so it means a different risk at every balance and every lot |
+//| tier; it was the only thing holding exposure down, and raising it |
+//| 1.00 -> 50.00 wiped the account in 2m10s. This scales with the    |
+//| balance and cannot be outgrown.                                   |
+//|                                                                  |
+//| IT ALSO SETS A MINIMUM VIABLE BALANCE. The broker's smallest lot  |
+//| is 0.01 = 1 oz, so trading needs balance >= ruin_move. At the 5.00 |
+//| default a $1 account is REFUSED - and that refusal is honest,     |
+//| because 1 oz on $1 has a ruin move of $1 and no setting can       |
+//| change that. To run a $1 account anyway, set RuinMoveUSD = 1.0    |
+//| and understand that a $1 move ends it.                            |
+//|                                                                  |
+//| Mode-independent ON PURPOSE: it bounds ounces held, and ounces do |
+//| not care whether GRID or TREND acquired them.                     |
+//+------------------------------------------------------------------+
+double RGS_MaxOuncesFor(const double balance,const double ruin_move)
+  {
+   if(balance <= 0.0 || ruin_move <= 0.0) return 0.0;
+   return balance/ruin_move;
+  }
+
 //--- Deepest grid whose full-depth drawdown stays inside RGS_RISK_PCT of balance.
 //--- Priced in whole BATCHES, so the answer is always a multiple of the batch size and
 //--- can never come back smaller than one batch when the budget affords a rung at all.
-int RGS_MaxPositionsFor(const double balance,const double lot)
+//---
+//--- `ruin_move > 0` additionally applies the exposure cap above and returns the SMALLER of
+//--- the two. The staircase half is kept only for parity with lot_position_engine.py; the
+//--- exposure cap is what actually binds. `ruin_move = 0` disables it (old behaviour).
+int RGS_MaxPositionsFor(const double balance,const double lot,const double ruin_move=0.0)
   {
    if(balance <= 0.0 || lot <= 0.0) return 0;
    int    g      = RGS_GroupLadder(balance);
@@ -87,14 +149,23 @@ int RGS_MaxPositionsFor(const double balance,const double lot)
    double k = budget/per;
    int    r = (int)MathFloor((-1.0+MathSqrt(1.0+8.0*k))/2.0);   // deepest affordable RUNG
    if(r < 0) r = 0;
-   return r*g;
+   int cap = r*g;
+
+   if(ruin_move > 0.0)
+     {
+      double max_oz  = RGS_MaxOuncesFor(balance,ruin_move);
+      int    exp_cap = (int)MathFloor(max_oz/(lot*RGS_OZ_PER_LOT)+1e-9);
+      if(exp_cap < cap) cap = exp_cap;
+      if(cap < 0) cap = 0;
+     }
+   return cap;
   }
 
 //--- The batch to open, never larger than the depth the budget can hold.
-int RGS_GroupFor(const double balance,const double lot)
+int RGS_GroupFor(const double balance,const double lot,const double ruin_move=0.0)
   {
    int g   = RGS_GroupLadder(balance);
-   int cap = RGS_MaxPositionsFor(balance,lot);
+   int cap = RGS_MaxPositionsFor(balance,lot,ruin_move);
    if(cap <= 0) return g;          // caller decides whether to refuse; it needs the real cap
    return (int)MathMax(1,MathMin(g,cap));
   }

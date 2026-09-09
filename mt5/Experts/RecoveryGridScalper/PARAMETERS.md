@@ -36,9 +36,16 @@ Most "why did it stop trading?" questions are this. See the next section.
 
 | ceiling | formula | set by |
 |---|---|---|
-| **depth cap** | risk budget: 44% of balance spread across the grid | `Utils.mqh` — derived, not an input |
-| **lot cap** | `MaxTotalLots ÷ lot` | **`MaxTotalLots`** |
-| **margin cap** | `equity × leverage ÷ price` ounces | your broker |
+| **exposure cap** | `balance ÷ RuinMoveUSD` ounces — **the risk control** | **`RuinMoveUSD`** |
+| depth cap | risk budget: 44% of balance across the grid, **then** min'd with the exposure cap | `Utils.mqh` — derived |
+| lot cap | `MaxTotalLots ÷ lot` — an absolute backstop only | `MaxTotalLots` |
+| margin cap | `equity × leverage ÷ price` ounces | your broker |
+
+> **The exposure cap is why the account is still here.** Before 2026-09-08 the depth cap was the
+> only sizing rule, and it let the basket reach a size where a **$1.3 move in gold wiped the whole
+> account at any balance**. On 2026-09-08 `MaxTotalLots` was raised 1.00 → 50.00 to stop position
+> rejections; that removed the only thing holding exposure down and the account went 1,274 → 3,913 →
+> **0 in 2 minutes 10 seconds**. See [LIVE_RUN_ANALYSIS.md](LIVE_RUN_ANALYSIS.md) §9.
 
 Worked from **2026-09-08 cycle 6** (SELL, balance 1058.42, lot 0.33):
 
@@ -77,6 +84,60 @@ RGS CYCLE 6 START SELL lot 0.33  balance 1058.42  batch 3  depth cap 18  lot cap
 (`1.99 > 1.00`, so even the first order is refused and you get
 `MaxTotalLots 1.00 reached, batch stopped at 0/3`). If you keep `MaxTotalLots = 1.00`, raise it or
 force a smaller `ManualLotInput` before the balance crosses these lines.
+
+---
+
+## `RuinMoveUSD` — the one number that decides whether a bad cycle is a loss or the end
+
+```text
+max_ounces = balance ÷ RuinMoveUSD
+```
+
+**Purpose:** hold few enough ounces that gold must move `RuinMoveUSD` dollars against the whole
+basket before the balance is gone. Safety comes from setting it far outside normal excursions —
+measured adverse excursions on 2026-09-08 were **0.45–1.97 $/oz**, so at the 5.00 default the worst
+of them costs 39% of balance rather than all of it.
+
+At the default, sizing across the ladder (contrast the "old cap" column — that is what wiped the
+account):
+
+| balance | lot | old cap | new cap | ounces | ruin $/oz | target $/oz |
+|---|---|---|---|---|---|---|
+| 5 | 0.01 | 6 | 1 | 1 | 5.00 | 1.44 |
+| 471 | 0.10 | 24 | 9 | 90 | 5.23 | 1.51 |
+| 1058 | 0.33 | 18 | 6 | 198 | 5.34 | 1.54 |
+| 1512 | 0.99 | 12 | 3 | 297 | 5.09 | 1.47 |
+| 3914 | 1.99 | 15 | 3 | 597 | 6.56 | 1.89 |
+| 8000 | 1.99 | 21 | 8 | 1592 | 5.03 | 1.45 |
+
+The ruin distance is now roughly constant at **5–7 $/oz** instead of 1.3–1.9.
+
+### You cannot tune this without also moving the target
+
+```text
+target move  =  ExitTargetPct × ruin move   =   0.289 × RuinMoveUSD
+```
+
+Because the target is a percentage of balance and ruin is balance ÷ ounces, **the target always
+sits 29% of the way to ruin.** Making the target easier to hit and making the account harder to
+lose are the same dial turned opposite ways. At `RuinMoveUSD = 5` the target needs ~1.45 $/oz; at
+1.31 (what the account died with) it needed 0.38 $/oz and gold only had to move 1.31 to end you.
+
+### Minimum viable balance
+
+The broker's smallest lot is 0.01 = **1 oz**, so trading needs `balance >= RuinMoveUSD`. At the
+default a **$1 account is refused**, and the EA says exactly what to do:
+
+```text
+RGS: REFUSED - the exposure cap allows 0.2 oz at balance 1.00 with RuinMoveUSD 5.00, but one
+0.01 lot position is 1 oz. Needs balance >= 5.00, or set RuinMoveUSD to 1.00 (a 1.00 move
+would then end the account).
+```
+
+That refusal is honest rather than an obstacle: 1 oz on a $1 balance **has** a ruin move of $1, and
+no setting changes it. To run a $1 account anyway, set `RuinMoveUSD = 1.0` and accept that a $1 move
+in gold ends it. On 2026-09-08 a $1 account did exactly that — grew to ~$7 over 13 cycles, then lost
+all of it on the 14th.
 
 ---
 
@@ -153,7 +214,8 @@ Two lessons the numbers make plain:
 | input | default | unit | what it does |
 |---|---|---|---|
 | `MinFreeMargin` | 0.20 | **DOLLARS, not percent** | Stop adding when free margin falls below this. The $0.20 default is effectively off. |
-| `MaxTotalLots` | 1.00 | lots | **Hard ceiling on open volume — usually the constraint that actually binds.** At 1.00 with lot 0.33 you get 3 positions; with 0.99 you get 1. See the tier cliff. |
+| **`RuinMoveUSD`** | **5.00** | **$/oz** | **The primary risk control.** Ounces are capped at `balance ÷ RuinMoveUSD`, so gold must move this far against the **whole** basket to consume the account. It is the distance to **ruin**, not one you survive — **bigger = smaller positions = safer**. See the section below. |
+| `MaxTotalLots` | 1.00 | lots | Absolute backstop on open volume. **No longer the risk control** — `RuinMoveUSD` is. Left in place as a hard ceiling; note it still steps hard with the lot tier. |
 | `EnableDailyLossKill` | false | on/off | Halt for the rest of the day after a loss. |
 | `DailyLossKillPct` | 50.0 | % of the day's opening balance | …the size of loss that triggers it. |
 | `DemoOnly` | true | on/off | Refuse to run on a live account. **Leave this on.** |
@@ -199,6 +261,28 @@ Each fires **once per transition**, not once per tick, so a single line means it
   the target can close it.
 * **Both at once** — nothing can close it but your hand (`P`). Sanity-check whether the target is
   even reachable: divide it by your ounces.
+
+#### Worked example — the two ways a cycle "should have exited" and didn't
+
+**A clean cycle has no fast exit at all.** 2026-09-08 cycle 1: balance 500, 100 oz, worst only
+−5.52. The quick arm needs the basket to have been down 15% of balance (−$75) first, so it never
+armed and **time decay never applied**. Only the target (1.445 $/oz) could close it — 44 seconds.
+This is by design: the gate is what stops the quick arm replacing the target on every cycle.
+
+**A gate that misses by a hair changes everything.** 2026-09-08 cycle 4: balance 718.13, 132 oz.
+
+```text
+quick GATE needs worst <= -107.72     actual worst -104.46   -> SHORT BY $3.26, never armed
+```
+
+Had it armed, the decayed threshold at 35 s was 0.182 $/oz × 132 oz = **$24.07** and the basket was
+at +25.15 — it would have closed there. Instead the give-back arm held it to 71 s and closed at
++39.82. **The slower path made 2.4× more here**, so a near-miss is not automatically bad — but it is
+unpredictable, and three such near-misses have now been measured ($0.17, $3.26, and ten of 31 cycles
+within $6 of the line).
+
+**How to tell which happened:** the panel's `mode` row. `quick: not armed` means the gate never
+opened — only the target and give-back can close that basket.
 
 ### Telling "blocked" from "exited early"
 

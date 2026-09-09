@@ -74,7 +74,22 @@ input int    AddCooldownSec = 2;      // Minimum seconds between adds
 //--- safety ---------------------------------------------------------
 input group  "Safety"
 input double MinFreeMargin  = 0.20;   // Stop adding below this free margin
-input double MaxTotalLots   = 1.00;   // Hard cap on open volume
+// THE EXPOSURE CAP - the primary risk control since 2026-09-08.
+//
+// Ounces are capped at balance/RuinMoveUSD, so gold must move this many dollars against the
+// WHOLE basket before the account is consumed. It is the distance to RUIN, not a distance you
+// survive: LARGER VALUE = SMALLER POSITIONS = SAFER.
+//
+// Why it exists: MaxTotalLots is a fixed lot count, so it encodes a different risk at every
+// balance and lot tier. It was the only thing holding exposure down, and raising it 1.00 -> 50.00
+// on 2026-09-08 wiped the account in 2 minutes 10 seconds - 29.85 lots (2,985 oz) on $3,913, where
+// a 1.234 $/oz reversal was fatal. This cap scales with the balance and cannot be outgrown.
+//
+// Note it sets a MINIMUM VIABLE BALANCE: the smallest lot is 0.01 = 1 oz, so trading needs
+// balance >= RuinMoveUSD. At 5.00 a $1 account is refused, and that refusal is honest - 1 oz on
+// $1 has a ruin move of $1 and no setting changes that. For a $1 account set this to 1.0.
+input double RuinMoveUSD    = 5.00;   // $/oz move that would wipe the account at full depth (bigger = safer)
+input double MaxTotalLots   = 1.00;   // Absolute backstop on open volume (NOT the risk control - see RuinMoveUSD)
 // A FRACTION OF BALANCE, like every other constant here - not a dollar amount. It was
 // `DailyLossKill = 0.50`, a flat $0.50, which on a $98 account halted trading after losing
 // 0.5% of it, and which commission alone could spend in two break-even cycles.
@@ -206,7 +221,7 @@ int OnInit()
                  ExitTargetPct,ExitGivebackPct,AddStepUSD,AddCooldownSec,
                  MinFreeMargin,MaxTotalLots,kill_pct,AutoRestart,
                  EnableQuickExit,EnableTimeDecay,QuickExitStartUSD,QuickExitFloorUSD,
-                 QuickExitDecaySec,QuickExitArmPct,AddMode,RealMarginPerLotUSD);
+                 QuickExitDecaySec,QuickExitArmPct,AddMode,RuinMoveUSD,RealMarginPerLotUSD);
 
    double bal=AccountInfoDouble(ACCOUNT_BALANCE);
    g_panel.SetMaxLots(MaxTotalLots);
@@ -214,17 +229,20 @@ int OnInit()
    if(ManualLotInput>0.0)
       ObjectSetString(ChartID(),RGS_EDT_LOT,OBJPROP_TEXT,DoubleToString(ManualLotInput,2));
 
-   // The banner names the ADD MODE and BOTH position ceilings. `depth cap` is the risk budget;
-   // `lot cap` is what MaxTotalLots actually permits at this lot size, and it is routinely the
-   // smaller of the two - on 2026-09-08 the depth cap read 18 while the lot cap allowed 3, and
-   // five of seven cycles stopped there with nothing in the log to say so.
+   // The banner names the ADD MODE and every position ceiling. `depth cap` already folds in the
+   // exposure cap (RGS_MaxPositionsFor takes the smaller); `lot cap` is what MaxTotalLots permits
+   // at this lot size. On 2026-09-08 the depth cap read 18 while the lot cap allowed 3, and five
+   // of seven cycles stopped there with nothing in the log to say so.
    double tier=RGS_TierLot(bal);
    int    lot_cap=(MaxTotalLots>0.0 && tier>0.0 ? (int)MathFloor(MaxTotalLots/tier+1e-9) : 0);
+   int    depth  =RGS_MaxPositionsFor(bal,tier,RuinMoveUSD);
    PrintFormat("RGS started on %s | mode %s | exit %.1f%% of balance, or %.1f%% give-back from "
                "peak | batch %d, depth cap %d, LOT CAP %d at this balance (the smaller one "
-               "binds) | add step %.3f + %ds | backstops: lots %.2f, free margin %.2f, kill %.2f",
+               "binds) | max %.0f oz at RuinMoveUSD %.2f $/oz | add step %.3f + %ds | "
+               "backstops: lots %.2f, free margin %.2f, kill %.2f",
                _Symbol,RGS_AddModeName(AddMode),ExitTargetPct,ExitGivebackPct,
-               RGS_GroupFor(bal,tier),RGS_MaxPositionsFor(bal,tier),lot_cap,
+               RGS_GroupFor(bal,tier,RuinMoveUSD),depth,lot_cap,
+               RGS_MaxOuncesFor(bal,RuinMoveUSD),RuinMoveUSD,
                AddStepUSD,AddCooldownSec,MaxTotalLots,MinFreeMargin,
                (kill_pct>0.0 ? kill_pct/100.0*bal : 0.0));
    RGS_WarnExposure(_Symbol,bal);
@@ -234,12 +252,13 @@ int OnInit()
    else if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
       Print("RGS: this EA is not allowed to trade - tick 'Allow Algo Trading' in its "
             "properties (right-click the chart -> Expert Advisors -> Properties).");
-   g_log.Note(0,StringFormat("EA start bal=%.2f target_pct=%.1f giveback_pct=%.1f "
-                             "batch=%d cap=%d step=%.3f cd=%d",
-                             bal,ExitTargetPct,ExitGivebackPct,
-                             RGS_GroupFor(bal,RGS_TierLot(bal)),
-                             RGS_MaxPositionsFor(bal,RGS_TierLot(bal)),
-                             AddStepUSD,AddCooldownSec));
+   g_log.Note(0,StringFormat("EA start bal=%.2f mode=%s target_pct=%.1f giveback_pct=%.1f "
+                             "batch=%d cap=%d step=%.3f cd=%d ruin_move=%.2f max_oz=%.0f "
+                             "max_lots=%.2f",
+                             bal,RGS_AddModeName(AddMode),ExitTargetPct,ExitGivebackPct,
+                             RGS_GroupFor(bal,tier,RuinMoveUSD),depth,
+                             AddStepUSD,AddCooldownSec,RuinMoveUSD,
+                             RGS_MaxOuncesFor(bal,RuinMoveUSD),MaxTotalLots));
    g_ready=true;
    EventSetTimer(1);          // panel refresh even on a quiet feed
    return(INIT_SUCCEEDED);
@@ -300,8 +319,10 @@ void RefreshPanel()
       warn="ALGO TRADING OFF - clicks will not trade";
    // While IDLE there is no cycle, so show what the CURRENT balance would size a cycle at -
    // otherwise the panel reads 0/0 and the operator cannot see what a click would do.
-   int cap  =(g_engine.State()==RGS_RUNNING ? g_engine.DepthCap() : RGS_MaxPositionsFor(bal,tier));
-   int grp  =(g_engine.State()==RGS_RUNNING ? g_engine.Group()    : RGS_GroupFor(bal,tier));
+   int cap  =(g_engine.State()==RGS_RUNNING ? g_engine.DepthCap()
+                                            : RGS_MaxPositionsFor(bal,tier,RuinMoveUSD));
+   int grp  =(g_engine.State()==RGS_RUNNING ? g_engine.Group()
+                                            : RGS_GroupFor(bal,tier,RuinMoveUSD));
    double tg=(g_engine.State()==RGS_RUNNING ? g_engine.CloseTarget() : ExitTargetPct/100.0*bal);
    // The give-back MUST come from the engine, not be recomputed here. The engine measures it
    // against the cycle's OPENING balance; recomputing it from the LIVE balance gave a different
@@ -313,7 +334,8 @@ void RefreshPanel()
    g_panel.Update(st,g_engine.CycleId(),g_engine.IsBuy(),n,lots,net,
                   tg,tier,warn,cap,grp,g_engine.BestPnl(),
                   gb,g_engine.MarginPerLot(),
-                  (g_engine.AddMode()==RGS_MODE_TREND?"TREND":"GRID"),g_engine.QuickPerOz());
+                  (g_engine.AddMode()==RGS_MODE_TREND?"TREND":"GRID"),g_engine.QuickPerOz(),
+                  g_engine.PrevSummary());
   }
 
 //+------------------------------------------------------------------+
